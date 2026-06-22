@@ -27,7 +27,7 @@
           stdout      session.jsonl   测试断言
                            │
                            ▼
-                      qoder replay
+                      flash replay
 ```
 
 ---
@@ -586,7 +586,7 @@ impl EventSink for JsonlSink {
 }
 ```
 
-为什么不用 channel/actor:用 `Mutex<File>` + `await` 的好处是**每次 `emit().await` 返回时,这一行保证已写完**,不需要任何额外的 flush/drain/shutdown 逻辑。同进程里跑完 `qoder run` 立刻做 snapshot 比较不会有竞态。只有并发量上升到锁竞争可测量影响延迟时(几十个并行 tool call,当前 v1 只有 Bash 不会发生)才值得升级成 actor。
+为什么不用 channel/actor:用 `Mutex<File>` + `await` 的好处是**每次 `emit().await` 返回时,这一行保证已写完**,不需要任何额外的 flush/drain/shutdown 逻辑。同进程里跑完 `flash run` 立刻做 snapshot 比较不会有竞态。只有并发量上升到锁竞争可测量影响延迟时(几十个并行 tool call,当前 v1 只有 Bash 不会发生)才值得升级成 actor。
 
 **ConsoleSink** —— `std::sync::Mutex` 包 `Stdout`:
 
@@ -673,10 +673,7 @@ assert!(answer_contains(&events, "Controller"));
 # 8. CLI
 
 ```bash
-qoder run --mode yolo|default
-qoder replay session.jsonl
-qoder eval
-qoder doctor
+flash --mode yolo|default "your query here"
 ```
 
 ---
