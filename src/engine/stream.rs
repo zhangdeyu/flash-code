@@ -88,6 +88,13 @@ pub async fn stream_model(
                 }
             }
             ProviderEvent::ToolUseDelta { .. } => {}
+            ProviderEvent::Usage(usage) => {
+                sink.emit(Event::Usage {
+                    session_id: session_id.to_owned(),
+                    usage,
+                })
+                .await;
+            }
             ProviderEvent::ToolUseComplete {
                 call_id,
                 name,

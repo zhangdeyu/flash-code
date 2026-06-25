@@ -1,4 +1,3 @@
-pub mod console;
 pub mod jsonl;
 pub mod memory;
 

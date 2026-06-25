@@ -1,20 +1,20 @@
 pub mod capability;
+pub mod deepseek;
 pub mod error;
 pub mod event;
-pub mod openai;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
 pub use capability::Capability;
 pub use error::ProviderError;
-pub use event::{ProviderEvent, StopReason};
+pub use event::{ProviderEvent, StopReason, Usage};
 
 use crate::protocol::{Prompt, ToolSpec};
 
 /// LLM provider trait.
 ///
-/// V1's only production implementation is `OpenAiProvider`. The trait exists
+/// V1's only production implementation is `DeepSeekProvider`. The trait exists
 /// for testing (MockProvider) and is intentionally minimal.
 #[async_trait]
 pub trait Provider: Send + Sync {
@@ -33,9 +33,10 @@ pub trait Provider: Send + Sync {
     async fn complete_once(&self, prompt: &Prompt) -> Result<String, ProviderError>;
 }
 
-/// Build the OpenAI tools array from `ToolSpec` list.
+/// Build the OpenAI-compatible tools array from `ToolSpec` list. DeepSeek's
+/// function-calling shape is identical to OpenAI's, so the same encoding works.
 #[must_use]
-pub fn tool_specs_to_openai(specs: &[ToolSpec]) -> Vec<serde_json::Value> {
+pub fn tool_specs_to_deepseek(specs: &[ToolSpec]) -> Vec<serde_json::Value> {
     specs
         .iter()
         .map(|s| {

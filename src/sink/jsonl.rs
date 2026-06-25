@@ -1,31 +1,38 @@
 use async_trait::async_trait;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::protocol::Event;
 use crate::sink::EventSink;
 
-/// Writes events as JSONL (one JSON object per line) to a file.
+/// Writes events as JSONL (one JSON object per line) to any `AsyncWrite` target.
 ///
-/// Uses `tokio::sync::Mutex<tokio::fs::File>` because the critical section
-/// contains `write_all(...).await` — the guard crosses an await point, so
-/// `std::sync::Mutex` would not compile (its guard is not `Send`).
+/// Uses `tokio::sync::Mutex<Box<dyn AsyncWrite + Send + Unpin>>` because the
+/// critical section contains `.await` calls (write + flush), so the guard must
+/// be `Send`. Each `emit` flushes after writing so downstream pipe consumers
+/// (e.g. `jq`) see events immediately rather than in block-buffered chunks.
 pub struct JsonlSink {
-    file: tokio::sync::Mutex<tokio::fs::File>,
+    out: tokio::sync::Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
 }
 
 impl JsonlSink {
-    #[must_use]
-    pub fn new(file: tokio::fs::File) -> Self {
+    /// Wrap any async writer (file, stdout, in-memory buffer, ...).
+    pub fn new<W: AsyncWrite + Send + Unpin + 'static>(writer: W) -> Self {
         Self {
-            file: tokio::sync::Mutex::new(file),
+            out: tokio::sync::Mutex::new(Box::new(writer)),
         }
+    }
+
+    /// Convenience: write JSONL to process stdout. Production default.
+    #[must_use]
+    pub fn stdout() -> Self {
+        Self::new(tokio::io::stdout())
     }
 }
 
 #[async_trait]
 impl EventSink for JsonlSink {
     async fn emit(&self, event: Event) {
-        // Unknown events are never written — they only appear on the read side
+        // Unknown events are read-side only; never serialized back out.
         if matches!(event, Event::Unknown(_)) {
             return;
         }
@@ -38,9 +45,14 @@ impl EventSink for JsonlSink {
             }
         };
 
-        let mut file = self.file.lock().await;
-        if let Err(e) = file.write_all(format!("{line}\n").as_bytes()).await {
+        let mut out = self.out.lock().await;
+        if let Err(e) = out.write_all(format!("{line}\n").as_bytes()).await {
             eprintln!("jsonl write failed: {e}");
+            return;
+        }
+        // Flush per event so pipe consumers see lines without block buffering.
+        if let Err(e) = out.flush().await {
+            eprintln!("jsonl flush failed: {e}");
         }
     }
 }
@@ -86,5 +98,34 @@ mod tests {
         let content = tokio::fs::read_to_string(&path).await.expect("read");
         assert!(content.is_empty());
     }
+
+    #[tokio::test]
+    async fn flushes_each_event() {
+        // Use an in-memory Vec to verify writes land synchronously per emit.
+        let buf: Vec<u8> = Vec::new();
+        let cursor = std::io::Cursor::new(buf);
+        // tokio::io::AsyncWrite is impl'd on tokio's wrappers; for the test we
+        // use a tokio::fs::File via a temp path (cursor's Vec doesn't impl AsyncWrite directly).
+        let tmp = tempfile::NamedTempFile::new().expect("temp");
+        let path = tmp.path().to_owned();
+        let _ = cursor;
+
+        let file = tokio::fs::File::create(&path).await.expect("open");
+        let sink = JsonlSink::new(file);
+
+        sink.emit(Event::SessionStarted {
+            session_id: "s1".into(),
+        })
+        .await;
+
+        // Without explicit flush, this read may return empty under block buffering.
+        // With per-emit flush, content should already be on disk.
+        let content = tokio::fs::read_to_string(&path).await.expect("read");
+        assert!(
+            content.contains("session_started"),
+            "event not flushed: {content:?}"
+        );
+
+        drop(sink);
+    }
 }
-// JsonlSink: JSONL file output

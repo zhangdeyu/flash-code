@@ -7,29 +7,32 @@ use serde::Deserialize;
 
 use crate::protocol::{ContentBlock, Message, Prompt, Role};
 use crate::provider::{
-    tool_specs_to_openai, Capability, Provider, ProviderError, ProviderEvent, StopReason,
+    tool_specs_to_deepseek, Capability, Provider, ProviderError, ProviderEvent, StopReason, Usage,
 };
 
-pub struct OpenAiProvider {
+pub struct DeepSeekProvider {
     api_key: String,
     base_url: String,
     model: String,
+    reasoning_effort: String,
     capability: Capability,
     client: reqwest::Client,
 }
 
-impl OpenAiProvider {
+impl DeepSeekProvider {
     #[must_use]
     pub fn new(
         api_key: String,
         base_url: String,
         model: String,
+        reasoning_effort: String,
         capability: Capability,
     ) -> Self {
         Self {
             api_key,
             base_url,
             model,
+            reasoning_effort,
             capability,
             client: reqwest::Client::new(),
         }
@@ -45,24 +48,32 @@ impl OpenAiProvider {
         streaming: bool,
         max_output_override: Option<usize>,
     ) -> serde_json::Value {
-        let messages = prompt_to_openai_messages(prompt);
+        let messages = prompt_to_deepseek_messages(prompt);
+        // NOTE: DeepSeek thinking mode silently ignores temperature / top_p / presence_penalty /
+        // frequency_penalty. Do NOT add them — they look effective but do nothing, which is the
+        // worst kind of footgun. If sampling control is ever needed, disable thinking first.
         let mut body = serde_json::json!({
             "model": self.model,
             "messages": messages,
             "stream": streaming,
+            "thinking": { "type": "enabled" },
+            "reasoning_effort": self.reasoning_effort,
         });
+        if streaming {
+            body["stream_options"] = serde_json::json!({ "include_usage": true });
+        }
         if let Some(max) = max_output_override {
             body["max_tokens"] = serde_json::json!(max);
         }
         if !prompt.tools.is_empty() {
-            body["tools"] = serde_json::Value::Array(tool_specs_to_openai(&prompt.tools));
+            body["tools"] = serde_json::Value::Array(tool_specs_to_deepseek(&prompt.tools));
         }
         body
     }
 }
 
 #[async_trait]
-impl Provider for OpenAiProvider {
+impl Provider for DeepSeekProvider {
     fn capability(&self) -> &Capability {
         &self.capability
     }
@@ -120,7 +131,14 @@ impl Provider for OpenAiProvider {
             .await
             .map_err(|e| ProviderError::Transient(e.to_string()))?;
 
-        Ok(body["choices"][0]["message"]["content"]
+        let message = &body["choices"][0]["message"];
+        let content = message["content"].as_str().unwrap_or_default();
+        if !content.is_empty() {
+            return Ok(content.to_owned());
+        }
+        // Thinking mode may leave content empty when answer fits entirely in reasoning_content
+        // (compaction prompts are short and tool-free, so this fallback keeps summaries non-empty).
+        Ok(message["reasoning_content"]
             .as_str()
             .unwrap_or_default()
             .to_owned())
@@ -140,11 +158,22 @@ fn flatten_text(blocks: &[ContentBlock]) -> String {
         .join("\n")
 }
 
-fn message_role_blocks_to_openai(msg: &Message) -> String {
+fn flatten_reasoning(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Reasoning { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn message_role_blocks_to_deepseek(msg: &Message) -> String {
     flatten_text(&msg.content)
 }
 
-fn assistant_to_openai(msg: &Message) -> serde_json::Value {
+fn assistant_to_deepseek(msg: &Message) -> serde_json::Value {
     let mut text = String::new();
     let mut tool_calls: Vec<serde_json::Value> = Vec::new();
     for b in &msg.content {
@@ -169,20 +198,25 @@ fn assistant_to_openai(msg: &Message) -> serde_json::Value {
                     }
                 }));
             }
-            // Reasoning: input side dropped per §11.5.2
-            ContentBlock::Reasoning { .. } => {}
             _ => {}
         }
     }
     let mut obj = serde_json::json!({"role": "assistant", "content": text});
-    if !tool_calls.is_empty() {
+    // DeepSeek thinking-mode contract:
+    // - tool_call 轮次:必须回传 reasoning_content,否则 400
+    // - 非 tool_call 轮次:服务端忽略 reasoning_content
+    // 因此只在有 tool_calls 时回传,既满足硬约束又避免浪费上下文 token。
+    let has_tool_calls = !tool_calls.is_empty();
+    if has_tool_calls {
+        let reasoning = flatten_reasoning(&msg.content);
+        obj["reasoning_content"] = serde_json::Value::String(reasoning);
         obj["tool_calls"] = serde_json::Value::Array(tool_calls);
     }
     obj
 }
 
 /// Each tool_result block becomes a separate `role: tool` message.
-fn tool_message_to_openai_many(msg: &Message) -> Vec<serde_json::Value> {
+fn tool_message_to_deepseek_many(msg: &Message) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     for b in &msg.content {
         if let ContentBlock::ToolResult {
@@ -201,31 +235,31 @@ fn tool_message_to_openai_many(msg: &Message) -> Vec<serde_json::Value> {
 }
 
 #[must_use]
-pub fn prompt_to_openai_messages(prompt: &Prompt) -> Vec<serde_json::Value> {
+pub fn prompt_to_deepseek_messages(prompt: &Prompt) -> Vec<serde_json::Value> {
     let mut messages: Vec<serde_json::Value> = Vec::new();
     for sys in &prompt.system {
         messages.push(serde_json::json!({
             "role": "system",
-            "content": message_role_blocks_to_openai(sys),
+            "content": message_role_blocks_to_deepseek(sys),
         }));
     }
     for msg in &prompt.messages {
         match msg.role {
             Role::System => messages.push(serde_json::json!({
                 "role": "system",
-                "content": message_role_blocks_to_openai(msg),
+                "content": message_role_blocks_to_deepseek(msg),
             })),
             Role::User => messages.push(serde_json::json!({
                 "role": "user",
-                "content": message_role_blocks_to_openai(msg),
+                "content": message_role_blocks_to_deepseek(msg),
             })),
-            Role::Assistant => messages.push(assistant_to_openai(msg)),
-            Role::Tool => messages.extend(tool_message_to_openai_many(msg)),
+            Role::Assistant => messages.push(assistant_to_deepseek(msg)),
+            Role::Tool => messages.extend(tool_message_to_deepseek_many(msg)),
             Role::Summary => messages.push(serde_json::json!({
                 "role": "user",
                 "content": format!(
                     "<COMPACTION_SUMMARY>\n{}",
-                    message_role_blocks_to_openai(msg)
+                    message_role_blocks_to_deepseek(msg)
                 ),
             })),
         }
@@ -276,6 +310,39 @@ struct ChatChunk {
     choices: Vec<ChoiceDelta>,
     #[serde(default)]
     error: Option<ErrorPayload>,
+    #[serde(default)]
+    usage: Option<UsagePayload>,
+}
+
+#[derive(Deserialize, Default)]
+struct UsagePayload {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Deserialize, Default)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
+}
+
+impl From<UsagePayload> for Usage {
+    fn from(p: UsagePayload) -> Self {
+        Self {
+            prompt_tokens: p.prompt_tokens,
+            completion_tokens: p.completion_tokens,
+            total_tokens: p.total_tokens,
+            reasoning_tokens: p
+                .completion_tokens_details
+                .and_then(|d| d.reasoning_tokens),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -406,6 +473,11 @@ fn sse_to_events(
                         state.done = true;
                         return Some((Err(mapped), state));
                     }
+                    if let Some(u) = chunk.usage {
+                        state
+                            .pending
+                            .push_back(Ok(ProviderEvent::Usage(u.into())));
+                    }
                     for choice in chunk.choices {
                         if let Some(text) = choice.delta.content {
                             if !text.is_empty() {
@@ -507,7 +579,7 @@ mod tests {
         let r2 =
             ContentBlock::tool_result("c2", vec![ContentBlock::text("b")], true).unwrap();
         let msg = Message::tool_results(vec![r1, r2]);
-        let out = tool_message_to_openai_many(&msg);
+        let out = tool_message_to_deepseek_many(&msg);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0]["tool_call_id"], "c1");
         assert_eq!(out[1]["tool_call_id"], "c2");
@@ -523,10 +595,66 @@ mod tests {
                 input: serde_json::json!({"command": "ls"}),
             },
         ]);
-        let v = assistant_to_openai(&msg);
+        let v = assistant_to_deepseek(&msg);
         assert_eq!(v["role"], "assistant");
         assert!(v["tool_calls"].is_array());
         assert_eq!(v["tool_calls"][0]["id"], "c1");
+    }
+
+    #[test]
+    fn assistant_with_tool_call_but_no_reasoning_still_includes_field() {
+        // Hard contract: DeepSeek returns 400 if a tool_call assistant turn omits
+        // reasoning_content on replay. Even if upstream streamed no reasoning, we must
+        // send the key explicitly.
+        let msg = Message::assistant(vec![ContentBlock::ToolUse {
+            call_id: "c1".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+        }]);
+        let v = assistant_to_deepseek(&msg);
+        assert!(
+            v.get("reasoning_content").is_some(),
+            "tool_call assistant must include reasoning_content key"
+        );
+        assert!(v["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn assistant_without_tool_call_drops_reasoning() {
+        // DeepSeek ignores reasoning_content on non-tool turns. Don't waste context tokens.
+        let msg = Message::assistant(vec![
+            ContentBlock::Reasoning {
+                text: "internal thought".into(),
+                signature: None,
+            },
+            ContentBlock::text("final answer"),
+        ]);
+        let v = assistant_to_deepseek(&msg);
+        assert!(
+            v.get("reasoning_content").is_none(),
+            "non-tool assistant must NOT include reasoning_content"
+        );
+        assert_eq!(v["content"], "final answer");
+    }
+
+    #[test]
+    fn assistant_with_reasoning_replays_reasoning_content() {
+        let msg = Message::assistant(vec![
+            ContentBlock::Reasoning {
+                text: "thinking step".into(),
+                signature: None,
+            },
+            ContentBlock::text("final answer"),
+            ContentBlock::ToolUse {
+                call_id: "c1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            },
+        ]);
+        let v = assistant_to_deepseek(&msg);
+        assert_eq!(v["reasoning_content"], "thinking step");
+        assert_eq!(v["content"], "final answer");
+        assert!(v["tool_calls"].is_array());
     }
 
     #[test]
@@ -536,7 +664,7 @@ mod tests {
             tools: vec![],
             messages: vec![Message::summary("prior summary text".into())],
         };
-        let v = prompt_to_openai_messages(&prompt);
+        let v = prompt_to_deepseek_messages(&prompt);
         assert_eq!(v[0]["role"], "user");
         assert!(v[0]["content"]
             .as_str()
@@ -549,6 +677,40 @@ mod tests {
         let body = r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#;
         let e = map_http_error(reqwest::StatusCode::BAD_REQUEST, body);
         assert!(matches!(e, ProviderError::ContextOverflow(_)));
+    }
+
+    #[test]
+    fn usage_payload_parses_with_reasoning_tokens() {
+        let body = r#"{
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 42,
+                "completion_tokens": 17,
+                "total_tokens": 59,
+                "completion_tokens_details": { "reasoning_tokens": 11 }
+            }
+        }"#;
+        let chunk: ChatChunk = serde_json::from_str(body).expect("parse");
+        let usage: Usage = chunk.usage.expect("usage present").into();
+        assert_eq!(usage.prompt_tokens, 42);
+        assert_eq!(usage.completion_tokens, 17);
+        assert_eq!(usage.total_tokens, 59);
+        assert_eq!(usage.reasoning_tokens, Some(11));
+    }
+
+    #[test]
+    fn usage_payload_parses_without_reasoning_details() {
+        let body = r#"{
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 3,
+                "total_tokens": 8
+            }
+        }"#;
+        let chunk: ChatChunk = serde_json::from_str(body).expect("parse");
+        let usage: Usage = chunk.usage.expect("usage present").into();
+        assert_eq!(usage.reasoning_tokens, None);
     }
 
     #[test]

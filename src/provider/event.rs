@@ -10,6 +10,16 @@ pub enum StopReason {
     Other,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Usage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    /// DeepSeek thinking mode reports reasoning tokens under
+    /// `completion_tokens_details.reasoning_tokens`. Absent for non-thinking responses.
+    pub reasoning_tokens: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub enum ProviderEvent {
     TextDelta(String),
@@ -31,6 +41,10 @@ pub enum ProviderEvent {
         name: String,
         input: serde_json::Value,
     },
+
+    /// Token usage reported by the provider. With `stream_options.include_usage = true`,
+    /// DeepSeek emits this in the final chunk before `[DONE]`.
+    Usage(Usage),
 
     Done {
         stop_reason: StopReason,

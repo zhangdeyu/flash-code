@@ -1,4 +1,5 @@
 use flash_code::protocol::{Compaction, CompactionTrigger, ContentBlock, Event, Message};
+use flash_code::provider::Usage;
 
 #[test]
 fn message_appended_round_trips() {
@@ -59,6 +60,25 @@ fn tool_start_round_trips() {
     let json = serde_json::to_string(&event).expect("serialize");
     let back: Event = serde_json::from_str(&json).expect("deserialize");
     assert!(matches!(back, Event::ToolStart { .. }));
+}
+
+#[test]
+fn usage_event_round_trips() {
+    let event = Event::Usage {
+        session_id: "s1".into(),
+        usage: Usage {
+            prompt_tokens: 100,
+            completion_tokens: 200,
+            total_tokens: 300,
+            reasoning_tokens: Some(150),
+        },
+    };
+    let json = serde_json::to_value(&event).expect("serialize");
+    assert_eq!(json["type"], "usage");
+    assert_eq!(json["usage"]["prompt_tokens"], 100);
+    assert_eq!(json["usage"]["reasoning_tokens"], 150);
+    let back: Event = serde_json::from_value(json).expect("deserialize");
+    assert!(matches!(back, Event::Usage { .. }));
 }
 
 #[test]

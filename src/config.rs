@@ -5,10 +5,11 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 use crate::provider::Capability;
 
-const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-const DEFAULT_MODEL: &str = "gpt-4o";
+const DEFAULT_BASE_URL: &str = "https://api.deepseek.com/v1";
+const DEFAULT_MODEL: &str = "deepseek-v4-pro";
 const DEFAULT_MAX_CONTEXT: usize = 128_000;
-const DEFAULT_MAX_OUTPUT: usize = 16_384;
+const DEFAULT_MAX_OUTPUT: usize = 8_192;
+const DEFAULT_REASONING_EFFORT: &str = "max";
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -26,8 +27,8 @@ pub struct Config {
     #[serde(default = "default_max_output")]
     pub max_output: usize,
 
-    #[serde(default)]
-    pub supports_reasoning: bool,
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
 }
 
 fn default_base_url() -> String {
@@ -41,6 +42,9 @@ fn default_max_context() -> usize {
 }
 fn default_max_output() -> usize {
     DEFAULT_MAX_OUTPUT
+}
+fn default_reasoning_effort() -> String {
+    DEFAULT_REASONING_EFFORT.to_owned()
 }
 
 impl Config {
@@ -56,6 +60,14 @@ impl Config {
                 "api_key is empty in ~/.flash/config.toml".into(),
             ));
         }
+        match config.reasoning_effort.as_str() {
+            "high" | "max" => {}
+            other => {
+                return Err(Error::Config(format!(
+                    "invalid reasoning_effort = \"{other}\"; expected \"high\" or \"max\""
+                )));
+            }
+        }
         Ok(config)
     }
 
@@ -70,7 +82,6 @@ impl Config {
         Capability {
             max_context: self.max_context,
             max_output: self.max_output,
-            supports_reasoning: self.supports_reasoning,
         }
     }
 }

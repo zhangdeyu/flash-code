@@ -2,6 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::compaction::Compaction;
 use super::message::Message;
+use crate::provider::Usage;
 
 /// All events emitted during a session.
 #[derive(Debug, Clone, Serialize)]
@@ -20,6 +21,12 @@ pub enum Event {
     },
     AssistantMessageEnd {
         session_id: String,
+    },
+
+    /// Token usage for the last assistant turn (DeepSeek `stream_options.include_usage`).
+    Usage {
+        session_id: String,
+        usage: Usage,
     },
 
     ToolStart {
@@ -101,6 +108,7 @@ enum KnownEvent {
     AssistantMessageStart { session_id: String },
     AssistantToken { session_id: String, text: String },
     AssistantMessageEnd { session_id: String },
+    Usage { session_id: String, usage: Usage },
 
     ToolStart {
         session_id: String,
@@ -165,6 +173,7 @@ impl From<KnownEvent> for Event {
             KnownEvent::AssistantMessageEnd { session_id } => {
                 Self::AssistantMessageEnd { session_id }
             }
+            KnownEvent::Usage { session_id, usage } => Self::Usage { session_id, usage },
             KnownEvent::ToolStart {
                 session_id,
                 call_id,
