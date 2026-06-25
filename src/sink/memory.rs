@@ -94,6 +94,7 @@ fn extract_whitelisted(tool: &str, input: &serde_json::Value) -> BTreeMap<String
 }
 
 /// Project a sequence of events into structural snapshot entries.
+#[must_use]
 pub fn to_snapshot(events: &[Event]) -> Vec<SnapshotEntry> {
     events
         .iter()

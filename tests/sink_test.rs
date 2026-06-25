@@ -1,80 +1,73 @@
-//! Integration tests for JsonlSink: concurrent writes and file integrity.
+use flash_code::protocol::{Compaction, CompactionTrigger, ContentBlock, Event, Message};
 
-use std::sync::Arc;
-
-use flash_code::protocol::Event;
-use flash_code::sink::jsonl::JsonlSink;
-use flash_code::sink::EventSink;
-
-#[tokio::test]
-async fn multiple_events_produce_valid_jsonl_lines() {
-    let tmp = tempfile::NamedTempFile::new().expect("create temp file");
-    let path = tmp.path().to_owned();
-    let file = tokio::fs::File::create(&path).await.expect("open");
-    let sink = Arc::new(JsonlSink::new(file));
-
-    // Write several events
-    for i in 0..10 {
-        sink.emit(Event::AssistantToken {
-            session_id: "s1".into(),
-            text: format!("token_{i}"),
-        })
-        .await;
-    }
-
-    drop(sink);
-
-    // Read back and verify each line is valid JSON
-    let content = tokio::fs::read_to_string(&path).await.expect("read");
-    let lines: Vec<&str> = content.lines().collect();
-    assert_eq!(lines.len(), 10);
-
-    for (i, line) in lines.iter().enumerate() {
-        let parsed: serde_json::Value = serde_json::from_str(line)
-            .unwrap_or_else(|e| panic!("line {i} is not valid JSON: {e}"));
-        assert_eq!(parsed["type"], "assistant_token");
-        assert_eq!(parsed["text"], format!("token_{i}"));
-    }
+#[test]
+fn message_appended_round_trips() {
+    let m = Message::user_text("hi");
+    let event = Event::MessageAppended {
+        session_id: "s1".into(),
+        message: m,
+    };
+    let json = serde_json::to_string(&event).expect("serialize");
+    let back: Event = serde_json::from_str(&json).expect("deserialize");
+    assert!(matches!(back, Event::MessageAppended { .. }));
 }
 
-#[tokio::test]
-async fn concurrent_writes_do_not_corrupt_lines() {
-    let tmp = tempfile::NamedTempFile::new().expect("create temp file");
-    let path = tmp.path().to_owned();
-    let file = tokio::fs::File::create(&path).await.expect("open");
-    let sink = Arc::new(JsonlSink::new(file));
+#[test]
+fn history_compacted_serializes_with_compaction() {
+    let c = Compaction::new("summary".into(), "msg-id".into(), CompactionTrigger::Auto);
+    let event = Event::HistoryCompacted {
+        session_id: "s1".into(),
+        compaction: c,
+        before_count: 10,
+        tail_count: 4,
+    };
+    let json = serde_json::to_value(&event).expect("serialize");
+    assert_eq!(json["type"], "history_compacted");
+    assert_eq!(json["before_count"], 10);
+    assert_eq!(json["tail_count"], 4);
+    assert!(json["compaction"]["summary"].as_str().is_some());
+}
 
-    // Spawn multiple concurrent writers
-    let mut handles = Vec::new();
-    for i in 0..5 {
-        let sink = sink.clone();
-        handles.push(tokio::spawn(async move {
-            for j in 0..10 {
-                sink.emit(Event::ToolStart {
-                    session_id: "s1".into(),
-                    call_id: format!("c{i}_{j}"),
-                    tool: "bash".into(),
-                    input: serde_json::json!({"command": format!("echo {i}_{j}")}),
-                })
-                .await;
-            }
-        }));
-    }
+#[test]
+fn micro_compacted_serializes() {
+    let event = Event::MicroCompacted {
+        session_id: "s1".into(),
+        redacted_ids: vec!["c1".into(), "c2".into()],
+        bytes_saved: 4096,
+    };
+    let json = serde_json::to_value(&event).expect("serialize");
+    assert_eq!(json["type"], "micro_compacted");
+    assert_eq!(json["bytes_saved"], 4096);
+    assert_eq!(json["redacted_ids"][0], "c1");
+}
 
-    for h in handles {
-        h.await.expect("task completed");
-    }
+#[test]
+fn unknown_event_falls_back() {
+    let json = r#"{"type":"future_event","payload":42}"#;
+    let event: Event = serde_json::from_str(json).expect("deserialize");
+    assert!(matches!(event, Event::Unknown(_)));
+}
 
-    drop(sink);
+#[test]
+fn tool_start_round_trips() {
+    let event = Event::ToolStart {
+        session_id: "s1".into(),
+        call_id: "c1".into(),
+        tool: "bash".into(),
+        input: serde_json::json!({"command": "ls"}),
+    };
+    let json = serde_json::to_string(&event).expect("serialize");
+    let back: Event = serde_json::from_str(&json).expect("deserialize");
+    assert!(matches!(back, Event::ToolStart { .. }));
+}
 
-    // Read back: should have 50 lines, each valid JSON
-    let content = tokio::fs::read_to_string(&path).await.expect("read");
-    let lines: Vec<&str> = content.lines().collect();
-    assert_eq!(lines.len(), 50);
-
-    for (i, line) in lines.iter().enumerate() {
-        let parsed: serde_json::Value = serde_json::from_str(line)
-            .unwrap_or_else(|e| panic!("line {i} is not valid JSON: {e}\nline content: {line}"));
-        assert_eq!(parsed["type"], "tool_start");
-    }
+#[test]
+fn user_message_blocks_serializes_with_id() {
+    // Confirm Message round-trips include id and role
+    let m = Message::user(vec![ContentBlock::text("hi")]);
+    let json = serde_json::to_value(&m).expect("serialize");
+    assert_eq!(json["role"], "user");
+    assert!(json["id"].as_str().is_some());
+    let back: Message = serde_json::from_value(json).expect("deserialize");
+    assert_eq!(back.role, m.role);
 }

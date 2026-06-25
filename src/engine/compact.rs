@@ -1,106 +1,272 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 use crate::error::Result;
-use crate::protocol::{Event, Message, Prompt, Role};
-use crate::provider::Provider;
+use crate::protocol::{
+    estimate_message_tokens, Compaction, CompactionTrigger, ContentBlock, Event, History,
+    Message, MessageId, Prompt, Role,
+};
+use crate::provider::{Capability, Provider};
 use crate::sink::EventSink;
 
-const COMPACT_THRESHOLD: usize = 8000;
-const KEEP_LAST_TURNS: usize = 2;
+const DEFAULT_SUMMARY_PROMPT: &str = "You are a conversation summarization assistant. Your job is to compress the older
+portion of an ongoing conversation between a user and a coding agent into a concise
+summary, while preserving everything needed for the agent to continue the work.
 
-const COMPACT_SYSTEM_PROMPT: &str = "\
-You are a conversation summarizer. Summarize the conversation history below into \
-a concise paragraph that preserves key decisions, tool results, and context needed \
-to continue the conversation. Be factual and brief.";
+Input format:
+- A series of messages tagged with role (user / assistant / tool).
+- May begin with a <previous-summary> block: this is a summary from an earlier
+  compaction. Treat it as already-condensed context to merge into your new summary,
+  not as new content to summarize again.
 
-/// Compress old messages if token estimate exceeds threshold.
-///
-/// Only `messages` is compressed. System messages and tool specs are never touched.
-/// Emits a `HistoryCompacted` event for replay consistency.
-pub async fn maybe_compact(
-    messages: Vec<Message>,
-    provider: &dyn Provider,
-    session_id: &str,
-    sink: Arc<dyn EventSink>,
-) -> Result<Vec<Message>> {
-    if estimate_tokens(&messages) < COMPACT_THRESHOLD {
-        return Ok(messages);
+Output a single paragraph (or short bulleted list) that captures:
+1. User's explicit goals and constraints
+2. Key decisions made and rationale
+3. Files / commands / data referenced
+4. Errors encountered and how they were resolved
+5. Outstanding TODOs or open questions
+
+Be factual and dense. Do not editorialize. Do not add information not present in
+the input. Do not include role tags or formatting from the input.";
+
+#[async_trait]
+pub trait CompactionPolicy: Send + Sync {
+    fn should_compact(&self, history: &History, capability: &Capability) -> bool;
+
+    fn select_tail(&self, history: &History) -> Option<MessageId>;
+
+    fn select_tail_overflow(&self, history: &History) -> Option<MessageId>;
+
+    fn summary_prompt(&self) -> &str {
+        DEFAULT_SUMMARY_PROMPT
+    }
+}
+
+pub struct DefaultPolicy {
+    pub keep_last_turns: usize,
+    pub max_tail_tokens: usize,
+    pub reserved_tokens: usize,
+    pub overflow_keep_last_turns: usize,
+}
+
+impl Default for DefaultPolicy {
+    fn default() -> Self {
+        Self {
+            keep_last_turns: 2,
+            max_tail_tokens: 20_000,
+            reserved_tokens: 20_000,
+            overflow_keep_last_turns: 1,
+        }
+    }
+}
+
+fn estimate_last_turn_tokens(history: &History) -> usize {
+    let n = history.raw_messages().len();
+    if n == 0 {
+        return 2_000;
+    }
+    let start = n.saturating_sub(3);
+    history.raw_messages()[start..]
+        .iter()
+        .map(estimate_message_tokens)
+        .sum()
+}
+
+fn select_tail_with_limit(
+    history: &History,
+    target_turns: usize,
+    max_tokens: usize,
+) -> Option<MessageId> {
+    let messages = history.raw_messages();
+    if messages.len() < 3 {
+        return None;
     }
 
-    let before = messages.len();
-    // Keep the last N*2 messages (user+assistant pairs)
-    let split_at = messages.len().saturating_sub(KEEP_LAST_TURNS * 2);
-    let (to_compact, keep) = messages.split_at(split_at);
+    let user_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == Role::User)
+        .map(|(i, _)| i)
+        .collect();
 
-    let summary = provider
-        .complete_once(&Prompt {
-            system: vec![Message {
-                role: Role::System,
-                content: COMPACT_SYSTEM_PROMPT.into(),
-                tool_call_id: None,
-                is_error: false,
-            }],
-            tools: vec![],
-            messages: vec![Message::user(serialize_for_compaction(to_compact))],
-        })
-        .await?;
+    if user_indices.len() <= target_turns {
+        return None;
+    }
 
-    let mut out = vec![Message::user(format!("[history summary]\n{summary}"))];
-    out.extend_from_slice(keep);
+    let mut candidate_idx = user_indices[user_indices.len() - target_turns];
 
-    sink.emit(Event::HistoryCompacted {
-        session_id: session_id.into(),
-        before_count: before,
-        after_count: out.len(),
-        summary: summary.clone(),
-    })
-    .await;
+    loop {
+        let tail_tokens: usize = messages[candidate_idx..]
+            .iter()
+            .map(estimate_message_tokens)
+            .sum();
+        if tail_tokens <= max_tokens {
+            break;
+        }
+        match user_indices.iter().find(|&&i| i > candidate_idx) {
+            Some(&next) => candidate_idx = next,
+            None => return None,
+        }
+    }
 
-    Ok(out)
+    if candidate_idx >= messages.len() - 1 {
+        return None;
+    }
+
+    Some(messages[candidate_idx].id.clone())
 }
 
-/// Rough token estimate: ~4 chars per token (a common heuristic).
-fn estimate_tokens(messages: &[Message]) -> usize {
-    messages.iter().map(|m| m.content.len() / 4).sum()
+#[async_trait]
+impl CompactionPolicy for DefaultPolicy {
+    fn should_compact(&self, history: &History, capability: &Capability) -> bool {
+        let current = history.estimate_tokens();
+        let next_turn_growth = estimate_last_turn_tokens(history);
+        let usable = capability.max_context.saturating_sub(self.reserved_tokens);
+        current + next_turn_growth > usable
+    }
+
+    fn select_tail(&self, history: &History) -> Option<MessageId> {
+        select_tail_with_limit(history, self.keep_last_turns, self.max_tail_tokens)
+    }
+
+    fn select_tail_overflow(&self, history: &History) -> Option<MessageId> {
+        select_tail_with_limit(
+            history,
+            self.overflow_keep_last_turns,
+            self.max_tail_tokens / 2,
+        )
+    }
 }
 
-/// Serialize messages for the compaction prompt.
+fn render_blocks_as_text(blocks: &[ContentBlock]) -> String {
+    let mut out = String::new();
+    for b in blocks {
+        match b {
+            ContentBlock::Text { text } => {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(text);
+            }
+            ContentBlock::ToolUse { name, input, .. } => {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&format!(
+                    "[tool_use {name}] {}",
+                    serde_json::to_string(input).unwrap_or_default()
+                ));
+            }
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                let inner = render_blocks_as_text(content);
+                out.push_str(&format!(
+                    "[tool_result{}] {inner}",
+                    if *is_error { " error" } else { "" }
+                ));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn serialize_for_compaction(messages: &[Message]) -> String {
     messages
         .iter()
-        .map(|m| format!("[{:?}] {}", m.role, m.content))
+        .map(|m| {
+            let content = render_blocks_as_text(&m.content);
+            if m.role == Role::Summary {
+                format!("<previous-summary>\n{content}\n</previous-summary>")
+            } else {
+                let role = format!("{:?}", m.role).to_lowercase();
+                format!("[{role}] {content}")
+            }
+        })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n\n")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn estimate_tokens_basic() {
-        let messages = vec![
-            Message::user("hello world"), // 11 chars → 2 tokens
-        ];
-        assert_eq!(estimate_tokens(&messages), 2);
-    }
-
-    #[test]
-    fn below_threshold_returns_unchanged() {
-        let messages = vec![Message::user("short message")];
-        // Run synchronously by checking threshold directly
-        assert!(estimate_tokens(&messages) < COMPACT_THRESHOLD);
-    }
-
-    #[test]
-    fn serialize_for_compaction_format() {
-        let messages = vec![
-            Message::user("hello"),
-            Message::assistant("hi there"),
-        ];
-        let result = serialize_for_compaction(&messages);
-        assert!(result.contains("[User] hello"));
-        assert!(result.contains("[Assistant] hi there"));
-    }
+async fn run_summary(
+    history: &History,
+    tail_id: &MessageId,
+    policy: &dyn CompactionPolicy,
+    provider: &dyn Provider,
+) -> Result<String> {
+    let to_compact = history.messages_before(tail_id);
+    let body = serialize_for_compaction(&to_compact);
+    let prompt = Prompt {
+        system: vec![Message::system_text(policy.summary_prompt())],
+        tools: vec![],
+        messages: vec![Message::user_text(body)],
+    };
+    let s = provider.complete_once(&prompt).await?;
+    Ok(s)
 }
-// maybe_compact: history compression
+
+pub async fn maybe_compact(
+    history: &mut History,
+    policy: &dyn CompactionPolicy,
+    provider: &dyn Provider,
+    capability: &Capability,
+    sink: Arc<dyn EventSink>,
+    session_id: &str,
+) -> Result<bool> {
+    if !policy.should_compact(history, capability) {
+        return Ok(false);
+    }
+    let Some(tail_id) = policy.select_tail(history) else {
+        return Ok(false);
+    };
+
+    let summary = run_summary(history, &tail_id, policy, provider).await?;
+    let c = Compaction::new(summary, tail_id, CompactionTrigger::Auto);
+    let before = history.raw_messages().len();
+    history.record_compaction(c.clone())?;
+    let tail_count = history.to_prompt_messages().len().saturating_sub(1);
+
+    sink.emit(Event::HistoryCompacted {
+        session_id: session_id.to_owned(),
+        compaction: c,
+        before_count: before,
+        tail_count,
+    })
+    .await;
+
+    Ok(true)
+}
+
+pub async fn overflow_compact(
+    history: &mut History,
+    policy: &dyn CompactionPolicy,
+    provider: &dyn Provider,
+    sink: Arc<dyn EventSink>,
+    session_id: &str,
+) -> Result<()> {
+    let Some(tail_id) = policy.select_tail_overflow(history) else {
+        return Err(crate::error::Error::ContextOverflow);
+    };
+
+    let summary = run_summary(history, &tail_id, policy, provider)
+        .await
+        .map_err(|_| crate::error::Error::ContextOverflow)?;
+
+    let c = Compaction::new(summary, tail_id, CompactionTrigger::Overflow);
+    let before = history.raw_messages().len();
+    history.record_compaction(c.clone())?;
+    let tail_count = history.to_prompt_messages().len().saturating_sub(1);
+
+    sink.emit(Event::HistoryCompacted {
+        session_id: session_id.to_owned(),
+        compaction: c,
+        before_count: before,
+        tail_count,
+    })
+    .await;
+    Ok(())
+}

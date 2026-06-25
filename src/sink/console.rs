@@ -54,8 +54,24 @@ fn render_human_readable(event: &Event) -> String {
         Event::ApprovalRequired { command, .. } => format!("[approval] required: {command}"),
         Event::ApprovalGranted { call_id, .. } => format!("[approval] granted {call_id}"),
         Event::ApprovalRejected { call_id, .. } => format!("[approval] rejected {call_id}"),
-        Event::HistoryCompacted { before_count, after_count, .. } => {
-            format!("[compact] {before_count} -> {after_count} messages")
+        Event::HistoryCompacted {
+            before_count,
+            tail_count,
+            ..
+        } => {
+            format!("[compact] {before_count} raw -> {tail_count} tail (+ summary)")
+        }
+        Event::MicroCompacted {
+            redacted_ids,
+            bytes_saved,
+            ..
+        } => format!(
+            "[micro-compact] redacted {} tool_results, saved {} bytes",
+            redacted_ids.len(),
+            bytes_saved
+        ),
+        Event::MessageAppended { message, .. } => {
+            format!("[message] role={:?} id={}", message.role, message.id)
         }
         Event::Cancelled { reason, .. } => format!("[cancelled] {reason}"),
         Event::Error { message, .. } => format!("[error] {message}"),

@@ -1,18 +1,18 @@
+use std::io::{BufRead, Write};
 use std::sync::Arc;
 
 use clap::Parser;
-use tokio::sync::mpsc;
 
 use flash_code::config::Config;
-use flash_code::engine::ApprovalMode;
-use flash_code::protocol::Event;
+use flash_code::engine::{const_approval, yolo_approval, ApprovalCallback, DefaultPolicy};
+use flash_code::protocol::{ContentBlock, Event};
 use flash_code::provider::openai::OpenAiProvider;
-use flash_code::session::Session;
+use flash_code::session::{AgentConfig, Session};
 use flash_code::sink::console::ConsoleSink;
 use flash_code::sink::EventSink;
 use flash_code::tool::bash::BashTool;
+use flash_code::tool::{ApprovalMode, ToolRegistry};
 
-/// flash-code: an AI coding agent powered by OpenAI-compatible models.
 #[derive(Parser)]
 #[command(name = "flash", version, about)]
 struct Cli {
@@ -22,6 +22,24 @@ struct Cli {
 
     /// The query to send to the agent.
     query: String,
+}
+
+fn stdin_approval() -> ApprovalCallback {
+    Arc::new(|call, _ctx| {
+        let summary = call.input.get("command").and_then(|v| v.as_str()).map_or_else(
+            || serde_json::to_string(&call.input).unwrap_or_default(),
+            ToOwned::to_owned,
+        );
+        Box::pin(async move {
+            eprintln!("\n[approval] {summary}");
+            eprint!("approve? [y/N] ");
+            let _ = std::io::stderr().flush();
+            let mut line = String::new();
+            let stdin = std::io::stdin();
+            let _ = stdin.lock().read_line(&mut line);
+            matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+        })
+    })
 }
 
 #[tokio::main]
@@ -46,10 +64,14 @@ async fn main() {
         }
     };
 
-    let provider = OpenAiProvider::new(config.api_key, config.base_url, config.model);
+    let capability = config.capability();
+    let provider = OpenAiProvider::new(
+        config.api_key,
+        config.base_url,
+        config.model,
+        capability,
+    );
 
-    // JSONL to stdout via stderr-based approach: write JSONL to a temp file
-    // For v1, just use ConsoleSink (human-readable to stderr)
     let sink: Arc<dyn EventSink> = Arc::new(ConsoleSink::new());
 
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -58,22 +80,37 @@ async fn main() {
     })
     .await;
 
-    let mut session = Session::new(session_id, vec![], sink);
+    let mut session = Session::new(session_id, sink);
 
-    let tools: Vec<Box<dyn flash_code::tool::Tool>> = vec![Box::new(BashTool)];
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(BashTool));
 
-    // For v1 yolo mode, approval_rx is unused but required by the API
-    let (_approval_tx, mut approval_rx) = mpsc::channel::<bool>(1);
+    let approval = match mode {
+        ApprovalMode::Yolo => yolo_approval(),
+        ApprovalMode::Default => stdin_approval(),
+    };
+    let _ = const_approval; // suppress unused warning
 
-    // Set up Ctrl-C handler
-    let cancel = session.cancel.clone();
+    let policy = DefaultPolicy::default();
+    let cfg = AgentConfig {
+        approval_mode: mode,
+        ..AgentConfig::default()
+    };
+
+    // Ctrl-C handler
+    let cancel_handle = session.cancel_root.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            cancel.cancel();
+            cancel_handle.cancel();
         }
     });
 
-    if let Err(e) = session.send(cli.query, mode, &provider, &tools, &mut approval_rx).await {
+    let user_input = vec![ContentBlock::text(cli.query)];
+
+    if let Err(e) = session
+        .send(user_input, &provider, &registry, &policy, approval, &cfg)
+        .await
+    {
         eprintln!("error: {e}");
         std::process::exit(1);
     }

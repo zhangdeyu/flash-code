@@ -1,82 +1,93 @@
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::engine::run_loop::{run_loop, ApprovalMode};
+use crate::engine::{run_loop, ApprovalCallback, CompactionPolicy, RunContext};
 use crate::error::Result;
-use crate::protocol::Message;
+use crate::protocol::{ContentBlock, History, Message};
 use crate::provider::Provider;
 use crate::sink::EventSink;
-use crate::tool::Tool;
+use crate::system_prompt::{build_system_prompt, EnvironmentSnapshot, STATIC_TEMPLATE};
+use crate::tool::{ApprovalMode, ToolRegistry};
 
-/// Holds state across multiple user turns within a single session.
-///
-/// `history` persists across `send()` calls — it is not a local variable of
-/// `run_loop`, so it survives Done/Cancelled returns.
+pub struct AgentConfig {
+    pub approval_mode: ApprovalMode,
+    pub cwd: PathBuf,
+    pub tool_timeout: Duration,
+    pub tool_max_output_bytes: usize,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            approval_mode: ApprovalMode::Default,
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            tool_timeout: Duration::from_secs(120),
+            tool_max_output_bytes: 64 * 1024,
+        }
+    }
+}
+
 pub struct Session {
     pub session_id: String,
     pub system: Vec<Message>,
-    pub history: Vec<Message>,
-    pub cancel: CancellationToken,
+    pub history: History,
+    pub cancel_root: CancellationToken,
     pub sink: Arc<dyn EventSink>,
 }
 
 impl Session {
-    /// Create a new session with the given system messages and event sink.
     #[must_use]
-    pub fn new(
-        session_id: String,
-        system: Vec<Message>,
-        sink: Arc<dyn EventSink>,
-    ) -> Self {
+    pub fn new(session_id: String, sink: Arc<dyn EventSink>) -> Self {
         Self {
             session_id,
-            system,
-            history: Vec::new(),
-            cancel: CancellationToken::new(),
+            system: Vec::new(),
+            history: History::new(),
+            cancel_root: CancellationToken::new(),
             sink,
         }
     }
 
-    /// Send a user message and run the agent loop until Done or Cancelled.
-    ///
-    /// On each call:
-    /// 1. Push the user message into history
-    /// 2. Reset the cancellation token (previous cancel doesn't affect this turn)
-    /// 3. Run the agent loop
+    /// Send a user message and run the agent loop.
     pub async fn send(
         &mut self,
-        user_input: String,
-        mode: ApprovalMode,
+        user_input: Vec<ContentBlock>,
         provider: &dyn Provider,
-        tools: &[Box<dyn Tool>],
-        approval_rx: &mut mpsc::Receiver<bool>,
+        registry: &ToolRegistry,
+        compaction_policy: &dyn CompactionPolicy,
+        approval_callback: ApprovalCallback,
+        config: &AgentConfig,
     ) -> Result<()> {
-        self.history.push(Message::user(user_input));
-        self.cancel = CancellationToken::new();
-        run_loop(self, mode, provider, tools, approval_rx).await
+        let cancel = self.cancel_root.child_token();
+
+        let env = EnvironmentSnapshot::capture(config.cwd.clone());
+        self.system = build_system_prompt(STATIC_TEMPLATE, &env, registry);
+
+        let ctx = RunContext {
+            session_id: self.session_id.clone(),
+            approval_mode: config.approval_mode,
+            cwd: config.cwd.clone(),
+            tool_timeout: config.tool_timeout,
+            tool_max_output_bytes: config.tool_max_output_bytes,
+            cancel,
+            sink: self.sink.clone(),
+        };
+
+        run_loop(
+            self,
+            user_input,
+            provider,
+            registry,
+            compaction_policy,
+            approval_callback,
+            &ctx,
+        )
+        .await
+    }
+
+    pub fn cancel_current(&self) {
+        self.cancel_root.cancel();
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::sink::memory::MemorySink;
-
-    #[test]
-    fn new_session_has_empty_history() {
-        let sink = Arc::new(MemorySink::new());
-        let session = Session::new("s1".into(), vec![], sink);
-        assert!(session.history.is_empty());
-        assert_eq!(session.session_id, "s1");
-    }
-
-    #[test]
-    fn cancel_token_is_not_cancelled_initially() {
-        let sink = Arc::new(MemorySink::new());
-        let session = Session::new("s1".into(), vec![], sink);
-        assert!(!session.cancel.is_cancelled());
-    }
-}
-// Session: holds state across turns

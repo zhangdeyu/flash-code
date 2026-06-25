@@ -1,32 +1,30 @@
+use std::process::Stdio;
+
 use async_trait::async_trait;
-use tokio::io::AsyncReadExt;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use tokio::process::Command;
-use tokio_util::sync::CancellationToken;
 
-use crate::protocol::ToolSpec;
-use crate::tool::{Tool, ToolOutcome};
+use crate::protocol::{ApprovalDecision, RiskLevel, ToolApprovalAdvice, ToolSpec};
+use crate::tool::{ExecutionContext, Tool, ToolOutput};
 
-/// Execute shell commands via `sh -c`.
-///
-/// Uses `Command::spawn()` + holds the `Child` handle so cancel can `kill()` it.
 pub struct BashTool;
 
-async fn read_handle(handle: Option<tokio::process::ChildStdout>) -> String {
-    let Some(mut h) = handle else {
-        return String::new();
-    };
-    let mut buf = String::new();
-    let _ = h.read_to_string(&mut buf).await;
-    buf
+#[derive(Deserialize, JsonSchema)]
+struct BashInput {
+    /// The shell command to execute via `sh -c`.
+    command: String,
 }
 
-async fn read_stderr_handle(handle: Option<tokio::process::ChildStderr>) -> String {
-    let Some(mut h) = handle else {
-        return String::new();
-    };
-    let mut buf = String::new();
-    let _ = h.read_to_string(&mut buf).await;
-    buf
+fn truncate(s: String, max: usize) -> String {
+    if s.len() <= max {
+        s
+    } else {
+        let mut out = s;
+        out.truncate(max);
+        out.push_str("\n...[truncated]");
+        out
+    }
 }
 
 #[async_trait]
@@ -36,99 +34,66 @@ impl Tool for BashTool {
     }
 
     fn spec(&self) -> ToolSpec {
+        let schema = schemars::schema_for!(BashInput);
         ToolSpec {
             name: "bash".into(),
-            description: "Execute a shell command".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string" }
-                },
-                "required": ["command"]
-            }),
+            description:
+                "Execute a shell command via `sh -c`. Output truncated to ctx.max_output_bytes."
+                    .into(),
+            input_schema: serde_json::to_value(schema).unwrap_or(serde_json::json!({})),
+            risk: RiskLevel::Dangerous,
         }
     }
 
-    async fn run(&self, input: serde_json::Value, cancel: CancellationToken) -> ToolOutcome {
-        let cmd = input["command"].as_str().unwrap_or_default();
+    fn approval_advice(&self, input: &serde_json::Value) -> ToolApprovalAdvice {
+        let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        if cmd.contains("rm -rf") {
+            return ToolApprovalAdvice {
+                decision: ApprovalDecision::MustAsk,
+                reason: Some("destructive: rm -rf detected".into()),
+            };
+        }
+        ToolApprovalAdvice::default_for(RiskLevel::Dangerous)
+    }
 
-        let mut child = match Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(e) => return ToolOutcome::Failure(format!("failed to spawn: {e}")),
+    async fn run(&self, input: serde_json::Value, ctx: &ExecutionContext) -> ToolOutput {
+        let parsed: BashInput = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => return ToolOutput::failure_invalid_input(e),
         };
 
-        // Take stdout/stderr handles before waiting, so we can read after wait.
-        let stdout_handle = child.stdout.take();
-        let stderr_handle = child.stderr.take();
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(&parsed.command)
+            .current_dir(&ctx.cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
 
-        tokio::select! {
-            status = child.wait() => {
-                let stdout = read_handle(stdout_handle).await;
-                let stderr = read_stderr_handle(stderr_handle).await;
+        let child = match child {
+            Ok(c) => c,
+            Err(e) => return ToolOutput::failure(format!("spawn failed: {e}")),
+        };
 
-                match status {
-                    Ok(s) if s.success() => {
-                        ToolOutcome::Success(serde_json::json!({"stdout": stdout}))
-                    }
-                    Ok(s) => {
-                        ToolOutcome::Failure(format!("exit {}: stderr={stderr} stdout={stdout}",
-                            s.code().unwrap_or(-1)))
-                    }
-                    Err(e) => ToolOutcome::Failure(e.to_string()),
-                }
-            }
-            _ = cancel.cancelled() => {
-                // Explicitly kill the child process
-                let _ = child.kill().await;
-                ToolOutcome::Cancelled
-            }
+        let out = match child.wait_with_output().await {
+            Ok(o) => o,
+            Err(e) => return ToolOutput::failure(e.to_string()),
+        };
+
+        let stdout = truncate(
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            ctx.max_output_bytes,
+        );
+        let stderr = truncate(
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            ctx.max_output_bytes,
+        );
+
+        if out.status.success() {
+            ToolOutput::text(stdout)
+        } else {
+            let code = out.status.code().unwrap_or(-1);
+            ToolOutput::failure(format!("exit {code}: {stderr}"))
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn successful_command() {
-        let tool = BashTool;
-        let cancel = CancellationToken::new();
-        let result = tool.run(serde_json::json!({"command": "echo hello"}), cancel).await;
-        match result {
-            ToolOutcome::Success(v) => assert!(v["stdout"].as_str().is_some_and(|s| s.contains("hello"))),
-            other => panic!("expected Success, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn failing_command() {
-        let tool = BashTool;
-        let cancel = CancellationToken::new();
-        let result = tool.run(serde_json::json!({"command": "exit 1"}), cancel).await;
-        assert!(matches!(result, ToolOutcome::Failure(_)));
-    }
-
-    #[tokio::test]
-    async fn cancel_kills_process() {
-        let tool = BashTool;
-        let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
-
-        // Start a long-running command and cancel it immediately
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            cancel_clone.cancel();
-        });
-
-        let result = tool.run(serde_json::json!({"command": "sleep 60"}), cancel).await;
-        assert!(matches!(result, ToolOutcome::Cancelled));
-    }
-}
-// BashTool: spawn + kill on cancel

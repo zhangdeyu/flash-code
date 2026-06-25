@@ -1,170 +1,241 @@
-use tokio::sync::mpsc;
-
-use crate::engine::approval::{ask_approval, ApprovalOutcome};
-use crate::engine::compact::maybe_compact;
-use crate::engine::execute::execute_all_parallel;
-use crate::engine::stream::stream_model;
+use crate::engine::approval::ApprovalCallback;
+use crate::engine::compact::{maybe_compact, overflow_compact, CompactionPolicy};
+use crate::engine::execute::{run_tool_phase, ToolPhaseOutcome};
+use crate::engine::loop_transition::LoopTransition;
+use crate::engine::run_context::RunContext;
+use crate::engine::stream::{stream_model, StreamError};
 use crate::error::{Error, Result};
-use crate::protocol::{Event, Message, Prompt};
-use crate::provider::Provider;
+use crate::protocol::{ContentBlock, Event, Message, Prompt, ToolCall};
+use crate::provider::{Provider, ProviderError, StopReason};
 use crate::session::Session;
-use crate::tool::Tool;
+use crate::tool::ToolRegistry;
 
-/// Approval mode for tool execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalMode {
-    /// Auto-approve all tool calls.
-    Yolo,
-    /// Require user approval for each tool call (default).
-    Default,
+pub const MAX_TURNS: usize = 50;
+
+fn extract_tool_uses(blocks: &[ContentBlock]) -> Vec<ToolCall> {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse {
+                call_id,
+                name,
+                input,
+            } => Some(ToolCall {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
-const MAX_TURNS: usize = 50;
+async fn finalize_cancelled(ctx: &RunContext, reason: &str) -> Result<()> {
+    ctx.sink
+        .emit(Event::Cancelled {
+            session_id: ctx.session_id.clone(),
+            reason: reason.to_owned(),
+        })
+        .await;
+    Ok(())
+}
 
-/// The main agent loop. Implements the state machine described in init.md §3.
-///
-/// Three cancellation scenarios are handled:
-/// 1. During streaming → history not polluted, just return
-/// 2. While awaiting approval → backfill tool_results to keep history consistent
-/// 3. During tool execution → tool naturally returns Cancelled outcome
+async fn emit_message_appended(ctx: &RunContext, message: Message) {
+    ctx.sink
+        .emit(Event::MessageAppended {
+            session_id: ctx.session_id.clone(),
+            message,
+        })
+        .await;
+}
+
+async fn emit_micro_if_any(session: &Session, ctx: &RunContext) {
+    let (_, r) = session.history.project_with_micro();
+    if !r.redacted_ids.is_empty() {
+        ctx.sink
+            .emit(Event::MicroCompacted {
+                session_id: ctx.session_id.clone(),
+                redacted_ids: r.redacted_ids,
+                bytes_saved: r.bytes_saved,
+            })
+            .await;
+    }
+}
+
 pub async fn run_loop(
     session: &mut Session,
-    mode: ApprovalMode,
+    user_input: Vec<ContentBlock>,
     provider: &dyn Provider,
-    tools: &[Box<dyn Tool>],
-    approval_rx: &mut mpsc::Receiver<bool>,
+    registry: &ToolRegistry,
+    compaction_policy: &dyn CompactionPolicy,
+    approval_callback: ApprovalCallback,
+    ctx: &RunContext,
 ) -> Result<()> {
-    let sink = session.sink.clone();
+    let user_id = session.history.push_user(user_input);
+    let user_msg = session
+        .history
+        .raw_messages()
+        .iter()
+        .find(|m| m.id == user_id)
+        .cloned()
+        .expect("user message just pushed");
+    emit_message_appended(ctx, user_msg).await;
+
+    let mut transition = LoopTransition::Initial;
     let mut turns = 0_usize;
+    let mut max_output_override: Option<usize> = None;
 
     loop {
-        if session.cancel.is_cancelled() {
-            sink.emit(Event::Cancelled {
-                session_id: session.session_id.clone(),
-                reason: "before model call".into(),
-            })
-            .await;
-            return Ok(());
+        if ctx.cancel.is_cancelled() {
+            return finalize_cancelled(ctx, "before model call").await;
         }
-        if turns >= MAX_TURNS {
-            sink.emit(Event::Error {
-                session_id: session.session_id.clone(),
-                message: "max turns exceeded".into(),
-            })
-            .await;
-            return Err(Error::MaxTurnsExceeded);
-        }
-        turns += 1;
 
-        // Compress history if needed (only `messages`, not system/tools)
-        session.history = maybe_compact(
-            session.history.clone(),
+        // ---- 1. compaction (degrades on failure) ----
+        if let Err(e) = maybe_compact(
+            &mut session.history,
+            compaction_policy,
             provider,
-            &session.session_id,
-            sink.clone(),
-        )
-        .await?;
-
-        let prompt = Prompt {
-            system: session.system.clone(),
-            tools: tools.iter().map(|t| t.spec()).collect(),
-            messages: session.history.clone(),
-        };
-
-        // Cancel scenario 1: stream_model handles cancel internally
-        let (assistant_msg, tool_calls) = match stream_model(
-            &prompt,
-            provider,
-            &session.cancel,
-            &session.session_id,
-            sink.clone(),
+            provider.capability(),
+            ctx.sink.clone(),
+            &ctx.session_id,
         )
         .await
         {
-            Ok(result) => result,
-            Err(Error::Cancelled) => {
-                sink.emit(Event::Cancelled {
-                    session_id: session.session_id.clone(),
-                    reason: "model streaming".into(),
+            ctx.sink
+                .emit(Event::Error {
+                    session_id: ctx.session_id.clone(),
+                    message: format!("compaction skipped: {e}"),
                 })
                 .await;
-                return Ok(()); // history is clean, can resume
-            }
-            Err(e) => return Err(e),
-        };
-        session.history.push(assistant_msg);
-
-        if tool_calls.is_empty() {
-            return Ok(()); // Done — assistant produced final answer
         }
 
-        let outcome = match mode {
-            ApprovalMode::Yolo => ApprovalOutcome::Approved,
-            ApprovalMode::Default => {
-                ask_approval(
-                    &tool_calls,
-                    &session.cancel,
-                    &session.session_id,
-                    approval_rx,
-                    sink.clone(),
-                )
-                .await
-            }
+        emit_micro_if_any(session, ctx).await;
+
+        // ---- 2. assemble prompt + stream ----
+        let prompt = Prompt {
+            system: session.system.clone(),
+            tools: registry.specs(),
+            messages: session.history.to_prompt_messages(),
         };
 
-        match outcome {
-            ApprovalOutcome::Approved => {
-                let results = execute_all_parallel(
-                    &tool_calls,
-                    tools,
-                    &session.cancel,
-                    &session.session_id,
-                    sink.clone(),
+        let _ = max_output_override; // kept for future use if provider needs it
+
+        let stream_result = stream_model(
+            &prompt,
+            provider,
+            &ctx.cancel,
+            &ctx.session_id,
+            ctx.sink.clone(),
+        )
+        .await;
+
+        let (assistant_blocks, stop_reason) = match stream_result {
+            Ok(r) => r,
+            Err(StreamError::Provider(ProviderError::ContextOverflow(_)))
+                if !matches!(transition, LoopTransition::OverflowRetried) =>
+            {
+                overflow_compact(
+                    &mut session.history,
+                    compaction_policy,
+                    provider,
+                    ctx.sink.clone(),
+                    &ctx.session_id,
                 )
-                .await;
-                session.history.extend(results);
+                .await?;
+                transition = LoopTransition::OverflowRetried;
+                continue;
             }
-            ApprovalOutcome::Rejected => {
-                for call in &tool_calls {
-                    sink.emit(Event::ApprovalRejected {
-                        session_id: session.session_id.clone(),
-                        call_id: call.call_id.clone(),
-                    })
-                    .await;
+            Err(StreamError::Provider(e)) if e.is_retryable() && !matches!(
+                transition,
+                LoopTransition::TransientRetried
+            ) =>
+            {
+                if let ProviderError::RateLimited {
+                    retry_after: Some(d),
+                    ..
+                } = &e
+                {
+                    tokio::time::sleep(*d).await;
                 }
-                session.history.extend(tool_calls.iter().map(|c| {
-                    Message::tool_result(
-                        c.call_id.clone(),
-                        "user rejected this tool call".to_owned(),
-                        true,
-                    )
-                }));
-                continue; // Let model see rejection and decide next step
+                transition = LoopTransition::TransientRetried;
+                continue;
             }
-            ApprovalOutcome::Cancelled => {
-                // Cancel scenario 2: backfill tool_results to keep history valid
-                for call in &tool_calls {
-                    sink.emit(Event::ToolCancelled {
-                        session_id: session.session_id.clone(),
-                        call_id: call.call_id.clone(),
-                    })
-                    .await;
-                }
-                session.history.extend(tool_calls.iter().map(|c| {
-                    Message::tool_result(
-                        c.call_id.clone(),
-                        "cancelled by user before execution".to_owned(),
-                        true,
-                    )
-                }));
-                sink.emit(Event::Cancelled {
-                    session_id: session.session_id.clone(),
-                    reason: "awaiting approval".into(),
+            Err(StreamError::Cancelled) => {
+                return finalize_cancelled(ctx, "model streaming").await;
+            }
+            Err(StreamError::Provider(e)) => return Err(Error::Provider(e)),
+        };
+
+        // ---- 3. MaxTokens 升级重试一次 ----
+        if stop_reason == StopReason::MaxTokens
+            && !matches!(transition, LoopTransition::MaxTokensRetried)
+        {
+            max_output_override = Some(provider.capability().max_output * 4);
+            transition = LoopTransition::MaxTokensRetried;
+            continue;
+        }
+        max_output_override = None;
+
+        // ---- 4. push assistant ----
+        let asst_id = session.history.push_assistant(assistant_blocks.clone());
+        let asst_msg = session
+            .history
+            .raw_messages()
+            .iter()
+            .find(|m| m.id == asst_id)
+            .cloned()
+            .expect("assistant message just pushed");
+        emit_message_appended(ctx, asst_msg).await;
+
+        // ---- 5. terminal? ----
+        let tool_calls = extract_tool_uses(&assistant_blocks);
+        if tool_calls.is_empty() {
+            return Ok(());
+        }
+
+        // ---- 6. turn count (only when entering tool phase) ----
+        turns += 1;
+        if turns >= MAX_TURNS {
+            ctx.sink
+                .emit(Event::Error {
+                    session_id: ctx.session_id.clone(),
+                    message: "max turns exceeded".into(),
                 })
                 .await;
-                return Ok(());
+            return Err(Error::MaxTurnsExceeded);
+        }
+
+        // ---- 7. tool phase ----
+        let outcome = run_tool_phase(&tool_calls, registry, &approval_callback, ctx).await;
+        match outcome {
+            ToolPhaseOutcome::Executed(results) => {
+                let tool_id = session.history.push_tool_results(results)?;
+                let tool_msg = session
+                    .history
+                    .raw_messages()
+                    .iter()
+                    .find(|m| m.id == tool_id)
+                    .cloned()
+                    .expect("tool message just pushed");
+                emit_message_appended(ctx, tool_msg).await;
+                transition = LoopTransition::ToolResultReturn;
+            }
+            ToolPhaseOutcome::AllRejected(results) => {
+                let tool_id = session.history.push_tool_results(results)?;
+                let tool_msg = session
+                    .history
+                    .raw_messages()
+                    .iter()
+                    .find(|m| m.id == tool_id)
+                    .cloned()
+                    .expect("tool message just pushed");
+                emit_message_appended(ctx, tool_msg).await;
+                transition = LoopTransition::ToolResultReturn;
+            }
+            ToolPhaseOutcome::Cancelled(partial) => {
+                let _ = session.history.push_tool_results(partial);
+                return finalize_cancelled(ctx, "tool execution").await;
             }
         }
     }
 }
-// Main agent loop

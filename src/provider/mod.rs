@@ -1,38 +1,40 @@
+pub mod capability;
+pub mod error;
+pub mod event;
 pub mod openai;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
-use crate::error::Result;
+pub use capability::Capability;
+pub use error::ProviderError;
+pub use event::{ProviderEvent, StopReason};
+
 use crate::protocol::{Prompt, ToolSpec};
 
-/// Events produced by a streaming model call.
-#[derive(Debug, Clone)]
-pub enum ModelEvent {
-    /// A text token from the assistant.
-    Token(String),
-    /// The model requests a tool call.
-    ToolUse {
-        call_id: String,
-        name: String,
-        input: serde_json::Value,
-    },
-    /// The model has finished generating.
-    Done,
-}
-
-/// Trait abstracting an LLM provider.
+/// LLM provider trait.
 ///
-/// Two methods:
-/// - `stream`: streaming chat completion with tool support (main path)
-/// - `complete_once`: single non-streaming completion (used only for history compaction)
+/// V1's only production implementation is `OpenAiProvider`. The trait exists
+/// for testing (MockProvider) and is intentionally minimal.
 #[async_trait]
 pub trait Provider: Send + Sync {
-    async fn stream(&self, prompt: &Prompt) -> BoxStream<'_, ModelEvent>;
-    async fn complete_once(&self, prompt: &Prompt) -> Result<String>;
+    fn capability(&self) -> &Capability;
+
+    fn model_id(&self) -> &str;
+
+    /// Streaming inference. The first error (connection/auth) is the outer Result.
+    /// Mid-stream errors are stream elements.
+    async fn stream(
+        &self,
+        prompt: &Prompt,
+    ) -> Result<BoxStream<'_, Result<ProviderEvent, ProviderError>>, ProviderError>;
+
+    /// Non-streaming one-shot. Used by compaction (tools forced to []).
+    async fn complete_once(&self, prompt: &Prompt) -> Result<String, ProviderError>;
 }
 
-/// Build the tools array in OpenAI format from our `ToolSpec` list.
+/// Build the OpenAI tools array from `ToolSpec` list.
+#[must_use]
 pub fn tool_specs_to_openai(specs: &[ToolSpec]) -> Vec<serde_json::Value> {
     specs
         .iter()
@@ -47,22 +49,4 @@ pub fn tool_specs_to_openai(specs: &[ToolSpec]) -> Vec<serde_json::Value> {
             })
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tool_specs_to_openai_format() {
-        let specs = vec![ToolSpec {
-            name: "bash".into(),
-            description: "Run a command".into(),
-            input_schema: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
-        }];
-        let result = tool_specs_to_openai(&specs);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["type"], "function");
-        assert_eq!(result[0]["function"]["name"], "bash");
-    }
 }
