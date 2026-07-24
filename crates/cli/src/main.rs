@@ -1,0 +1,180 @@
+use std::collections::BTreeMap;
+use std::env;
+use std::path::{Path, PathBuf};
+
+use flash_core::{
+    append_user_message, create_session, discover_workspace_root, init_workspace, replay_events,
+    Config, ConfigOverrides,
+};
+
+fn main() {
+    if let Err(error) = run(env::args().skip(1).collect()) {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run(args: Vec<String>) -> Result<(), CliError> {
+    match args.first().map(String::as_str) {
+        None => {
+            print_help();
+            Ok(())
+        }
+        Some("--version" | "-V") => {
+            println!("flash {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some("init") => init(),
+        Some("doctor") => doctor(),
+        Some("run") => run_task(&args[1..]),
+        Some("replay") => replay(&args[1..]),
+        Some("resume") => resume(&args[1..]),
+        Some("tui") => {
+            println!("TUI is planned for 0.4. Use `flash run \"<task>\"` for 0.1-0.3.");
+            Ok(())
+        }
+        Some("help" | "--help" | "-h") => {
+            print_help();
+            Ok(())
+        }
+        Some(command) => Err(CliError::Usage(format!("unknown command `{command}`"))),
+    }
+}
+
+fn init() -> Result<(), CliError> {
+    let root = discover_workspace_root(None)?;
+    let workspace = init_workspace(&root)?;
+    println!("initialized {}", workspace.root.display());
+    Ok(())
+}
+
+fn doctor() -> Result<(), CliError> {
+    let root = discover_workspace_root(None)?;
+    init_workspace(&root)?;
+    let config = load_config(&root, &ConfigOverrides::default())?;
+    println!("workspace_root: {}", root.display());
+    println!("provider: {}", config.provider_default);
+    println!("model: {}", config.deepseek_model);
+    if env::var(&config.deepseek_api_key_env).is_ok() {
+        println!("api_key_env: {} present", config.deepseek_api_key_env);
+    } else {
+        println!("api_key_env: {} missing", config.deepseek_api_key_env);
+    }
+    Ok(())
+}
+
+fn run_task(args: &[String]) -> Result<(), CliError> {
+    let Some(task) = args.first() else {
+        return Err(CliError::Usage(
+            "usage: flash run \"fix the failing tests\"".to_string(),
+        ));
+    };
+    let root = discover_workspace_root(None)?;
+    let session = create_session(&root)?;
+    append_user_message(&session, task)?;
+    println!("session: {}", session.id);
+    println!("stored: {}", session.path.display());
+    println!("0.1 runtime stored the task. DeepSeek agent loop starts in 0.2.");
+    Ok(())
+}
+
+fn replay(args: &[String]) -> Result<(), CliError> {
+    let Some(path) = args.first() else {
+        return Err(CliError::Usage(
+            "usage: flash replay .flash/sessions/session_xxx/events.jsonl".to_string(),
+        ));
+    };
+    for line in replay_events(Path::new(path))? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn resume(args: &[String]) -> Result<(), CliError> {
+    let Some(session_id) = args.first() else {
+        return Err(CliError::Usage(
+            "usage: flash resume session_xxx".to_string(),
+        ));
+    };
+    let root = discover_workspace_root(None)?;
+    let session = flash_core::storage::load_session(&root, session_id)?;
+    println!("resumed {}", session.id);
+    Ok(())
+}
+
+fn load_config(root: &Path, overrides: &ConfigOverrides) -> Result<Config, CliError> {
+    let user_config = user_config_path();
+    let workspace_config = root.join(".flash").join("config.toml");
+    Config::load(
+        user_config.as_deref(),
+        Some(&workspace_config),
+        &env_map(),
+        overrides,
+    )
+    .map_err(CliError::Config)
+}
+
+fn user_config_path() -> Option<PathBuf> {
+    env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".config")
+            .join("flash-code")
+            .join("config.toml")
+    })
+}
+
+fn env_map() -> BTreeMap<String, String> {
+    env::vars().collect()
+}
+
+fn print_help() {
+    println!(concat!(
+        "flash 0.1\n\n",
+        "Usage:\n",
+        "  flash init\n",
+        "  flash doctor\n",
+        "  flash run \"<task>\"\n",
+        "  flash replay <events.jsonl>\n",
+        "  flash resume <session_id>\n\n",
+        "In 0.4, running `flash` without a subcommand will enter the TUI.\n"
+    ));
+}
+
+#[derive(Debug)]
+enum CliError {
+    Config(flash_core::config::ConfigError),
+    Storage(flash_core::storage::StorageError),
+    Workspace(flash_core::WorkspaceError),
+    Usage(String),
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(error) => write!(formatter, "{error}"),
+            Self::Storage(error) => write!(formatter, "{error}"),
+            Self::Workspace(error) => write!(formatter, "{error}"),
+            Self::Usage(message) => write!(formatter, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for CliError {}
+
+impl From<flash_core::config::ConfigError> for CliError {
+    fn from(error: flash_core::config::ConfigError) -> Self {
+        Self::Config(error)
+    }
+}
+
+impl From<flash_core::storage::StorageError> for CliError {
+    fn from(error: flash_core::storage::StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl From<flash_core::WorkspaceError> for CliError {
+    fn from(error: flash_core::WorkspaceError) -> Self {
+        Self::Workspace(error)
+    }
+}

@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/provider",
+    "crates/cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.lints.rust]
+future-incompatible = "warn"
+nonstandard-style = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = 10 }
+redundant-clone = { level = "deny", priority = 9 }
