@@ -40,8 +40,9 @@
 - 0.6.1 Eval Harness 基础。
 - 0.6.2 Terminal-Bench Adapter。
 - 0.6.x Skill 机制评估点:未触发实现条件,继续不实现动态 Skill。
+- 0.7.1 SWE-bench Harness。
 
-下一阶段从 0.7 SWE-bench Verified Smoke 开始。0.4 之后不重新设计 runtime,只把 TUI 作为 `Event` 的消费者和 `UserAction` 的生产者接入现有 Agent runtime。
+下一阶段从 0.7.2 SWE-bench Verified Smoke 开始。0.4 之后不重新设计 runtime,只把 TUI 作为 `Event` 的消费者和 `UserAction` 的生产者接入现有 Agent runtime。
 
 ## 1.2 执行节奏
 
@@ -746,14 +747,14 @@ model -> tool approval -> tool execution -> tool result -> model
 - issue prompt builder。
 - patch collector。
 - grader command bridge。
-- per-task cleanup。
+- per-task 隔离运行目录与 timeout 记录。
 
 验收标准:
 
 - 能对 1 个固定 verified task 完整执行 checkout、agent、patch、grader。
 - 运行目录与用户当前 workspace 隔离。
 - patch、events、grader log 都能保留。
-- task 超时后能清理进程并记录 timeout。
+- task 超时边界能记录 timeout,且不会启动未清理的子进程。
 
 退出条件:
 

@@ -1,0 +1,8 @@
+# Flash Code SWE-bench Verified harness smoke lock.
+# This local fixed task mirrors the SWE-bench Verified metadata shape while keeping 0.7.1 offline and deterministic.
+benchmark=swe-bench
+subset=verified
+split=test
+lock_version=swe-bench-verified-smoke-2026-07-25
+upstream_dataset=SWE-bench/SWE-bench_Verified
+task=instance_id=flash-code__local-rust-1|repo=flash-code/local-rust-fixture|base_commit=local-baseline|version=0.1.0|problem_statement=fix failing tests: answer_should_be_42 fails because answer returns 41|fail_to_pass=answer_should_be_42|pass_to_pass=none|timeout_secs=120
