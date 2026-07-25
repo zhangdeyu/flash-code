@@ -42,8 +42,9 @@
 - 0.6.x Skill 机制评估点:未触发实现条件,继续不实现动态 Skill。
 - 0.7.1 SWE-bench Harness。
 - 0.7.2 SWE-bench Verified Smoke。
+- 0.7.x SubAgent / Task / AskUser 评估点:未触发实现条件,继续不实现复杂交互工具。
 
-下一阶段从 0.7.x SubAgent / Task / AskUser 评估点开始。0.4 之后不重新设计 runtime,只把 TUI 作为 `Event` 的消费者和 `UserAction` 的生产者接入现有 Agent runtime。
+下一阶段从 0.8 回归评测与报告开始。0.4 之后不重新设计 runtime,只把 TUI 作为 `Event` 的消费者和 `UserAction` 的生产者接入现有 Agent runtime。
 
 ## 1.2 执行节奏
 
@@ -789,6 +790,8 @@ model -> tool approval -> tool execution -> tool result -> model
 目标:只有单 Agent loop、基础 event 状态和 approval 已经不足时,再评估更复杂的交互协议。
 
 这不是默认实现迭代,而是 0.7 后的评估门。
+
+当前结论:0.6 Terminal-Bench smoke 和 0.7 SWE-bench Verified smoke 均可由单 Agent loop、现有 event replay、approval 和基础 TUI 状态支撑,暂不实现 `Task*`、`AskUserQuestion` 或只读 `Agent`。后续只有触发条件出现时,才按 11.1 -> 11.2 -> 11.3 的顺序重新评估。
 
 触发条件:
 
