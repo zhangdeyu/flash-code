@@ -1,0 +1,8 @@
+# Flash Code Terminal-Bench smoke subset lock.
+# This lock intentionally pins the adapter smoke surface before external Harbor/Docker task expansion.
+benchmark=terminal-bench
+subset=smoke
+lock_version=terminal-bench-smoke-2026-07-25
+adapter_format=harbor-task
+upstream_reference=harbor-framework/terminal-bench
+task=id=terminal-bench-smoke/local-rust-fix|instruction=fix failing tests|fixture=local-rust|timeout_secs=120

@@ -161,6 +161,7 @@ fn run_task(args: &[String]) -> Result<(), CliError> {
 fn eval(args: &[String]) -> Result<(), CliError> {
     match args.first().map(String::as_str) {
         Some("fixture") => eval_fixture(&args[1..]),
+        Some("terminal-bench") => eval_terminal_bench(&args[1..]),
         Some(command) => Err(CliError::Usage(format!("unknown eval command `{command}`"))),
         None => Err(CliError::Usage(
             "usage: flash eval fixture --task fix-rust".to_string(),
@@ -196,6 +197,40 @@ fn eval_fixture(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
+fn eval_terminal_bench(args: &[String]) -> Result<(), CliError> {
+    let subset = parse_subset_arg(args)?;
+    if subset != "smoke" {
+        return Err(CliError::Usage(
+            "usage: flash eval terminal-bench --subset smoke".to_string(),
+        ));
+    }
+    let root = discover_workspace_root(None)?;
+    init_workspace(&root)?;
+    let run = flash_eval::run_terminal_bench_smoke(&root)?;
+    let passed = run.results.iter().filter(|result| result.passed).count();
+    println!("benchmark: terminal-bench");
+    println!("subset: {}", run.subset);
+    println!("lock_version: {}", run.lock_version);
+    println!("passed: {passed}/{}", run.results.len());
+    println!("eval_run: {}", run.path.display());
+    println!("report: {}", run.path.join("report.md").display());
+    println!("result: {}", run.path.join("result.json").display());
+    for result in run.results {
+        println!(
+            "task: {} pass={} commands={} tokens={}/{}",
+            result.task_id,
+            result.passed,
+            result.command_count,
+            result.input_tokens,
+            result.output_tokens
+        );
+        if let Some(events_path) = result.events_path {
+            println!("events: {}", events_path.display());
+        }
+    }
+    Ok(())
+}
+
 fn parse_task_arg(args: &[String]) -> Result<String, CliError> {
     let Some(flag_index) = args.iter().position(|arg| arg == "--task") else {
         return Err(CliError::Usage(
@@ -205,6 +240,17 @@ fn parse_task_arg(args: &[String]) -> Result<String, CliError> {
     args.get(flag_index + 1)
         .cloned()
         .ok_or_else(|| CliError::Usage("usage: flash eval fixture --task fix-rust".to_string()))
+}
+
+fn parse_subset_arg(args: &[String]) -> Result<String, CliError> {
+    let Some(flag_index) = args.iter().position(|arg| arg == "--subset") else {
+        return Err(CliError::Usage(
+            "usage: flash eval terminal-bench --subset smoke".to_string(),
+        ));
+    };
+    args.get(flag_index + 1).cloned().ok_or_else(|| {
+        CliError::Usage("usage: flash eval terminal-bench --subset smoke".to_string())
+    })
 }
 
 fn replay(args: &[String]) -> Result<(), CliError> {
@@ -265,6 +311,7 @@ fn print_help() {
         "  flash doctor\n",
         "  flash run \"<task>\"\n",
         "  flash eval fixture --task fix-rust\n",
+        "  flash eval terminal-bench --subset smoke\n",
         "  flash replay <events.jsonl>\n",
         "  flash resume <session_id>\n\n",
         "Running `flash` without a subcommand enters the TUI.\n"

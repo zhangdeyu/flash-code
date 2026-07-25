@@ -30,11 +30,23 @@ pub struct EvalResult {
     pub task_id: String,
     pub passed: bool,
     pub duration_ms: u128,
+    pub command_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
     pub session_id: Option<String>,
     pub events_path: Option<PathBuf>,
     pub workspace_path: PathBuf,
     pub failure_kind: Option<EvalFailureKind>,
     pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalBenchRun {
+    pub run_id: String,
+    pub path: PathBuf,
+    pub subset: String,
+    pub lock_version: String,
+    pub results: Vec<EvalResult>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,12 +127,45 @@ pub fn local_fixture_task(task_id: &str) -> Result<EvalTask, EvalError> {
     }
 }
 
+pub fn terminal_bench_smoke_tasks() -> Result<Vec<EvalTask>, EvalError> {
+    parse_terminal_bench_smoke_lock(include_str!("../fixtures/terminal_bench_smoke.lock"))
+}
+
 pub fn run_fixture_eval(root: &Path, task: EvalTask) -> Result<EvalResult, EvalError> {
     let run = create_eval_run(root)?;
     let result = run_task_in_eval_run(&run, &task)?;
     write_result_json(&run, &result)?;
     write_report_markdown(&run, &result)?;
     Ok(result)
+}
+
+pub fn run_terminal_bench_smoke(root: &Path) -> Result<TerminalBenchRun, EvalError> {
+    let run = create_eval_run(root)?;
+    let lock_content = include_str!("../fixtures/terminal_bench_smoke.lock");
+    fs::write(run.path.join("terminal_bench_smoke.lock"), lock_content)?;
+    let tasks = parse_terminal_bench_smoke_lock(lock_content)?;
+    let mut results = Vec::new();
+    for task in tasks {
+        let task_run = EvalRun {
+            id: format!("{}_{}", run.id, sanitize_id(&task.id)),
+            path: run.path.join("tasks").join(sanitize_id(&task.id)),
+        };
+        fs::create_dir_all(&task_run.path)?;
+        let result = run_task_in_eval_run(&task_run, &task)?;
+        write_result_json(&task_run, &result)?;
+        write_report_markdown(&task_run, &result)?;
+        results.push(result);
+    }
+    let terminal_run = TerminalBenchRun {
+        run_id: run.id,
+        path: run.path,
+        subset: "smoke".to_string(),
+        lock_version: terminal_bench_lock_value(lock_content, "lock_version")
+            .unwrap_or_else(|| "unknown".to_string()),
+        results,
+    };
+    write_terminal_bench_summary(&terminal_run)?;
+    Ok(terminal_run)
 }
 
 fn create_eval_run(root: &Path) -> Result<EvalRun, EvalError> {
@@ -142,6 +187,9 @@ fn run_task_in_eval_run(run: &EvalRun, task: &EvalTask) -> Result<EvalResult, Ev
             task_id: task.id.clone(),
             passed: false,
             duration_ms: started.elapsed().as_millis(),
+            command_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
             session_id: None,
             events_path: None,
             workspace_path,
@@ -169,6 +217,9 @@ fn run_task_in_eval_run(run: &EvalRun, task: &EvalTask) -> Result<EvalResult, Ev
                 task_id: task.id.clone(),
                 passed: false,
                 duration_ms: started.elapsed().as_millis(),
+                command_count: 0,
+                input_tokens: 0,
+                output_tokens: 0,
                 session_id: None,
                 events_path: None,
                 workspace_path,
@@ -182,6 +233,7 @@ fn run_task_in_eval_run(run: &EvalRun, task: &EvalTask) -> Result<EvalResult, Ev
         .join("sessions")
         .join(&agent_run.session_id)
         .join("events.jsonl");
+    let metrics = read_event_metrics(&events_path)?;
     let grader = run_grader(&workspace_path, run)?;
     let passed =
         agent_run.outcome == Outcome::Succeeded && grader.status == ToolExitStatus::Success;
@@ -205,12 +257,77 @@ fn run_task_in_eval_run(run: &EvalRun, task: &EvalTask) -> Result<EvalResult, Ev
         task_id: task.id.clone(),
         passed,
         duration_ms: started.elapsed().as_millis(),
+        command_count: metrics.command_count,
+        input_tokens: metrics.input_tokens,
+        output_tokens: metrics.output_tokens,
         session_id: Some(agent_run.session_id),
         events_path: Some(events_path),
         workspace_path,
         failure_kind,
         failure_reason,
     })
+}
+
+fn parse_terminal_bench_smoke_lock(content: &str) -> Result<Vec<EvalTask>, EvalError> {
+    let mut tasks = Vec::new();
+    for line in content.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') || !line.starts_with("task=") {
+            continue;
+        }
+        let body = line.trim_start_matches("task=");
+        let mut id = String::new();
+        let mut instruction = String::new();
+        let mut fixture = String::new();
+        let mut timeout_secs = 120_u64;
+        for part in body.split('|') {
+            let Some((key, value)) = part.split_once('=') else {
+                continue;
+            };
+            match key {
+                "id" => id = value.to_string(),
+                "instruction" => instruction = value.to_string(),
+                "fixture" => fixture = value.to_string(),
+                "timeout_secs" => {
+                    timeout_secs = value.parse().map_err(|_| {
+                        EvalError::InvalidTask(format!(
+                            "invalid terminal-bench smoke timeout `{value}`"
+                        ))
+                    })?;
+                }
+                _ => {}
+            }
+        }
+        if id.is_empty() || instruction.is_empty() {
+            return Err(EvalError::InvalidTask(
+                "terminal-bench smoke task requires id and instruction".to_string(),
+            ));
+        }
+        if fixture != "local-rust" {
+            return Err(EvalError::InvalidTask(format!(
+                "unsupported terminal-bench smoke fixture `{fixture}`"
+            )));
+        }
+        tasks.push(EvalTask {
+            id,
+            instruction,
+            kind: EvalTaskKind::LocalRustFixture,
+            timeout_secs,
+        });
+    }
+    if tasks.is_empty() {
+        return Err(EvalError::InvalidTask(
+            "terminal-bench smoke lock contains no tasks".to_string(),
+        ));
+    }
+    Ok(tasks)
+}
+
+fn terminal_bench_lock_value(content: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=");
+    content
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix(&needle).map(str::to_string))
 }
 
 fn setup_rust_fixture(root: &Path) -> Result<(), EvalError> {
@@ -295,6 +412,9 @@ fn write_result_json(run: &EvalRun, result: &EvalResult) -> Result<(), EvalError
             "\"task_id\":\"{}\",",
             "\"passed\":{},",
             "\"duration_ms\":{},",
+            "\"command_count\":{},",
+            "\"input_tokens\":{},",
+            "\"output_tokens\":{},",
             "\"session_id\":\"{}\",",
             "\"events_path\":\"{}\",",
             "\"workspace_path\":\"{}\",",
@@ -305,6 +425,9 @@ fn write_result_json(run: &EvalRun, result: &EvalResult) -> Result<(), EvalError
         escape_json(&result.task_id),
         result.passed,
         result.duration_ms,
+        result.command_count,
+        result.input_tokens,
+        result.output_tokens,
         escape_json(&session_id),
         escape_json(&events_path),
         escape_json(&result.workspace_path.display().to_string()),
@@ -335,6 +458,9 @@ fn write_report_markdown(run: &EvalRun, result: &EvalResult) -> Result<(), EvalE
             "| task id | {} |\n",
             "| passed | {} |\n",
             "| duration ms | {} |\n",
+            "| command count | {} |\n",
+            "| input tokens | {} |\n",
+            "| output tokens | {} |\n",
             "| session id | {} |\n",
             "| events path | {} |\n",
             "| failure kind | {} |\n",
@@ -343,6 +469,9 @@ fn write_report_markdown(run: &EvalRun, result: &EvalResult) -> Result<(), EvalE
         result.task_id,
         result.passed,
         result.duration_ms,
+        result.command_count,
+        result.input_tokens,
+        result.output_tokens,
         session_id,
         events_path,
         failure_kind,
@@ -350,6 +479,145 @@ fn write_report_markdown(run: &EvalRun, result: &EvalResult) -> Result<(), EvalE
     );
     fs::write(run.path.join("report.md"), content)?;
     Ok(())
+}
+
+fn write_terminal_bench_summary(run: &TerminalBenchRun) -> Result<(), EvalError> {
+    let passed = run.results.iter().filter(|result| result.passed).count();
+    let total = run.results.len();
+    let mut json_tasks = String::new();
+    for (index, result) in run.results.iter().enumerate() {
+        if index > 0 {
+            json_tasks.push(',');
+        }
+        json_tasks.push_str(&format!(
+            concat!(
+                "{{",
+                "\"task_id\":\"{}\",",
+                "\"passed\":{},",
+                "\"duration_ms\":{},",
+                "\"command_count\":{},",
+                "\"input_tokens\":{},",
+                "\"output_tokens\":{},",
+                "\"failure_kind\":\"{}\",",
+                "\"failure_reason\":\"{}\"",
+                "}}"
+            ),
+            escape_json(&result.task_id),
+            result.passed,
+            result.duration_ms,
+            result.command_count,
+            result.input_tokens,
+            result.output_tokens,
+            escape_json(
+                result
+                    .failure_kind
+                    .map(EvalFailureKind::as_str)
+                    .unwrap_or("none")
+            ),
+            escape_json(result.failure_reason.as_deref().unwrap_or("none"))
+        ));
+    }
+    let result_json = format!(
+        concat!(
+            "{{",
+            "\"benchmark\":\"terminal-bench\",",
+            "\"subset\":\"{}\",",
+            "\"lock_version\":\"{}\",",
+            "\"passed\":{},",
+            "\"total\":{},",
+            "\"tasks\":[{}]",
+            "}}\n"
+        ),
+        escape_json(&run.subset),
+        escape_json(&run.lock_version),
+        passed,
+        total,
+        json_tasks
+    );
+    fs::write(run.path.join("result.json"), result_json)?;
+
+    let mut report = format!(
+        concat!(
+            "# Terminal-Bench Smoke Report\n\n",
+            "| Field | Value |\n",
+            "|---|---|\n",
+            "| subset | {} |\n",
+            "| lock version | {} |\n",
+            "| passed | {}/{} |\n\n",
+            "| Task | Pass | Duration ms | Commands | Tokens | Failure |\n",
+            "|---|---:|---:|---:|---:|---|\n"
+        ),
+        run.subset, run.lock_version, passed, total
+    );
+    for result in &run.results {
+        report.push_str(&format!(
+            "| {} | {} | {} | {} | {}/{} | {} |\n",
+            result.task_id,
+            result.passed,
+            result.duration_ms,
+            result.command_count,
+            result.input_tokens,
+            result.output_tokens,
+            result
+                .failure_kind
+                .map(EvalFailureKind::as_str)
+                .unwrap_or("none")
+        ));
+    }
+    fs::write(run.path.join("report.md"), report)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EventMetrics {
+    command_count: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+fn read_event_metrics(events_path: &Path) -> Result<EventMetrics, EvalError> {
+    let content = fs::read_to_string(events_path)?;
+    let mut metrics = EventMetrics {
+        command_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+    };
+    for line in content.lines() {
+        if line.contains("\"type\":\"tool_started\"") {
+            metrics.command_count += 1;
+        }
+        if line.contains("\"type\":\"usage_recorded\"") {
+            metrics.input_tokens += find_json_number(line, "input_tokens")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            metrics.output_tokens += find_json_number(line, "output_tokens")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+        }
+    }
+    Ok(metrics)
+}
+
+fn find_json_number(content: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":");
+    let start = content.find(&needle)? + needle.len();
+    let rest = &content[start..];
+    let end = rest
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+fn sanitize_id(id: &str) -> String {
+    id.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn escape_json(input: &str) -> String {
@@ -399,6 +667,28 @@ mod tests {
         assert!(eval_dir.join("report.md").exists());
         assert!(eval_dir.join("grader.stdout.txt").exists());
         assert!(eval_dir.join("grader.stderr.txt").exists());
+    }
+
+    #[test]
+    fn terminal_bench_smoke_should_write_summary_and_task_results() {
+        let root = temp_dir("terminal_bench_smoke");
+        fs::create_dir_all(&root).unwrap();
+
+        let run = run_terminal_bench_smoke(&root).unwrap();
+
+        assert_eq!(run.subset, "smoke");
+        assert_eq!(run.results.len(), 1);
+        assert!(run.path.join("terminal_bench_smoke.lock").exists());
+        assert!(run.path.join("result.json").exists());
+        assert!(run.path.join("report.md").exists());
+        assert!(run.results[0].events_path.as_ref().unwrap().exists());
+    }
+
+    #[test]
+    fn terminal_bench_smoke_lock_should_have_fixed_task_subset() {
+        let tasks = terminal_bench_smoke_tasks().unwrap();
+
+        assert_eq!(tasks[0].id, "terminal-bench-smoke/local-rust-fix");
     }
 
     #[test]
