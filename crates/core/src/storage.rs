@@ -464,6 +464,183 @@ mod tests {
     }
 
     #[test]
+    fn event_schema_should_match_golden() {
+        let root = temp_dir("event_schema_golden");
+        let session = test_session(&root, "session_golden");
+
+        append_event(
+            &session,
+            Event::SessionStarted {
+                session_id: "session_golden".to_string(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &session,
+            Event::UserMessageAppended {
+                message_id: "msg_user".to_string(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &session,
+            Event::ModelRequestStarted {
+                request_id: "req_1".to_string(),
+                model: "deepseek-test".to_string(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &session,
+            Event::ReasoningDelta {
+                text: "think\nstep".to_string(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &session,
+            Event::AssistantDelta {
+                text: "hello".to_string(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &session,
+            Event::AssistantMessageCompleted {
+                message_id: "msg_assistant".to_string(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &session,
+            Event::ToolCallRequested {
+                call_id: "call_1".to_string(),
+                name: "Read".to_string(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &session,
+            Event::ApprovalRequired {
+                call_id: "call_1".to_string(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &session,
+            Event::ApprovalResolved {
+                call_id: "call_1".to_string(),
+                approved: true,
+            },
+        )
+        .unwrap();
+        append_event(
+            &session,
+            Event::ToolStarted {
+                call_id: "call_1".to_string(),
+                name: "Read".to_string(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &session,
+            Event::ToolOutputDelta {
+                call_id: "call_1".to_string(),
+                stream: "stdout".to_string(),
+                text: "file text".to_string(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &session,
+            Event::ToolFinished {
+                call_id: "call_1".to_string(),
+                status: ToolResultStatus::Success,
+            },
+        )
+        .unwrap();
+        append_event(
+            &session,
+            Event::UsageRecorded {
+                input_tokens: 11,
+                output_tokens: 22,
+            },
+        )
+        .unwrap();
+        append_event(
+            &session,
+            Event::Error {
+                message: "boom".to_string(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &session,
+            Event::SessionFinished {
+                outcome: crate::protocol::Outcome::Succeeded,
+            },
+        )
+        .unwrap();
+
+        let actual = fs::read_to_string(session.path.join("events.jsonl")).unwrap();
+
+        assert_eq!(
+            normalize_json_string_field(&actual, "timestamp", "<timestamp>"),
+            include_str!("../tests/golden/events_v1.jsonl")
+        );
+    }
+
+    #[test]
+    fn message_schema_should_match_golden() {
+        let root = temp_dir("message_schema_golden");
+        let session = test_session(&root, "session_messages");
+
+        append_user_message(&session, "hello \"world\"").unwrap();
+        append_assistant_message(
+            &session,
+            "I will read",
+            &[("call_1".to_string(), "Read".to_string())],
+        )
+        .unwrap();
+        append_tool_result_message(&session, "call_1", ToolResultStatus::Success, "done").unwrap();
+
+        let actual = fs::read_to_string(session.path.join("messages.jsonl")).unwrap();
+        let normalized = normalize_json_string_field(&actual, "id", "<message_id>");
+        let normalized = normalize_json_string_field(&normalized, "created_at", "<timestamp>");
+
+        assert_eq!(
+            normalized,
+            include_str!("../tests/golden/messages_v1.jsonl")
+        );
+    }
+
+    #[test]
+    fn streaming_events_should_not_commit_interrupted_assistant_message() {
+        let root = temp_dir("interrupted_turn");
+        fs::create_dir_all(&root).unwrap();
+        let session = create_session(&root).unwrap();
+
+        append_event(
+            &session,
+            Event::AssistantDelta {
+                text: "partial answer".to_string(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &session,
+            Event::Error {
+                message: "cancelled".to_string(),
+            },
+        )
+        .unwrap();
+
+        let messages = fs::read_to_string(session.path.join("messages.jsonl")).unwrap();
+
+        assert!(messages.is_empty());
+    }
+
+    #[test]
     fn load_session_should_reject_workspace_mismatch() {
         let root = temp_dir("resume_a");
         let other = temp_dir("resume_b");
@@ -482,6 +659,50 @@ mod tests {
         let error = load_session(&other, &session_id).unwrap_err();
 
         assert!(matches!(error, StorageError::WorkspaceMismatch { .. }));
+    }
+
+    #[test]
+    fn create_session_should_not_require_or_write_index_json() {
+        let root = temp_dir("no_index");
+        fs::create_dir_all(&root).unwrap();
+
+        create_session(&root).unwrap();
+
+        assert!(!root
+            .join(".flash")
+            .join("sessions")
+            .join("index.json")
+            .exists());
+    }
+
+    fn test_session(root: &Path, id: &str) -> Session {
+        let path = root.join(".flash").join("sessions").join(id);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("events.jsonl"), "").unwrap();
+        fs::write(path.join("messages.jsonl"), "").unwrap();
+        Session {
+            id: id.to_string(),
+            workspace_root: root.to_path_buf(),
+            path,
+        }
+    }
+
+    fn normalize_json_string_field(content: &str, key: &str, replacement: &str) -> String {
+        let needle = format!("\"{key}\":\"");
+        let mut normalized = String::with_capacity(content.len());
+        let mut rest = content;
+        while let Some(start) = rest.find(&needle) {
+            normalized.push_str(&rest[..start + needle.len()]);
+            normalized.push_str(replacement);
+            rest = &rest[start + needle.len()..];
+            let Some(end) = rest.find('"') else {
+                normalized.push_str(rest);
+                return normalized;
+            };
+            rest = &rest[end..];
+        }
+        normalized.push_str(rest);
+        normalized
     }
 
     fn temp_dir(name: &str) -> PathBuf {

@@ -245,6 +245,70 @@ mod tests {
         assert_eq!(config.approval_mode, ApprovalMode::Yolo);
     }
 
+    #[test]
+    fn load_should_apply_full_precedence_for_model_and_approval_mode() {
+        let dir = temp_dir("config_full_precedence");
+        let user = dir.join("user.toml");
+        let workspace = dir.join("workspace.toml");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &user,
+            concat!(
+                "[providers.deepseek]\n",
+                "default_model = \"user-model\"\n",
+                "[agent]\n",
+                "approval_mode = \"human\"\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &workspace,
+            concat!(
+                "[provider]\n",
+                "model = \"workspace-model\"\n",
+                "[agent]\n",
+                "approval_mode = \"confirm\"\n"
+            ),
+        )
+        .unwrap();
+        let env = BTreeMap::from([
+            ("FLASH_MODEL".to_string(), "env-model".to_string()),
+            ("FLASH_APPROVAL_MODE".to_string(), "yolo".to_string()),
+        ]);
+        let overrides = ConfigOverrides {
+            model: Some("cli-model".to_string()),
+            approval_mode: Some(ApprovalMode::Human),
+        };
+
+        let config = Config::load(Some(&user), Some(&workspace), &env, &overrides).unwrap();
+
+        assert_eq!(
+            (config.deepseek_model, config.approval_mode),
+            ("cli-model".to_string(), ApprovalMode::Human)
+        );
+    }
+
+    #[test]
+    fn load_should_keep_defaults_when_no_sources_are_present() {
+        let config =
+            Config::load(None, None, &BTreeMap::new(), &ConfigOverrides::default()).unwrap();
+
+        assert_eq!(
+            (
+                config.provider_default,
+                config.deepseek_model,
+                config.approval_mode,
+                config.max_turns,
+            ),
+            (
+                "deepseek".to_string(),
+                "deepseek-v4-flash".to_string(),
+                ApprovalMode::Confirm,
+                50,
+            )
+        );
+    }
+
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
