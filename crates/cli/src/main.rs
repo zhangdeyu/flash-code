@@ -1,8 +1,9 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
 
-use flash_agent::{AgentOptions, AgentRuntime, SmokeProvider};
+use flash_agent::{AgentOptions, AgentRuntime, ApprovalController, ApprovalRequest, SmokeProvider};
 use flash_core::{
     discover_workspace_root, init_workspace, replay_events, Config, ConfigOverrides, Event,
     PermissionPolicy,
@@ -44,12 +45,17 @@ fn tui() -> Result<(), CliError> {
 struct CliTaskRunner;
 
 impl flash_tui::TaskRunner for CliTaskRunner {
+    fn permission_mode(&mut self, workspace_root: &Path) -> String {
+        load_config(workspace_root, &ConfigOverrides::default())
+            .map(|config| format!("{:?}", config.approval_mode))
+            .unwrap_or_else(|_| "unknown".to_string())
+    }
+
     fn run_task(
         &mut self,
         workspace_root: &Path,
         task: &str,
-        observer: &mut dyn FnMut(&Event),
-        should_cancel: &mut dyn FnMut() -> bool,
+        controller: &mut dyn flash_tui::RunController,
     ) -> Result<flash_tui::TuiRun, String> {
         let config = load_config(workspace_root, &ConfigOverrides::default())
             .map_err(|error| error.to_string())?;
@@ -65,14 +71,41 @@ impl flash_tui::TaskRunner for CliTaskRunner {
                 max_prompt_bytes: 200_000,
             },
         );
-        let mut runtime_observer = |event: &Event| observer(event);
+        let controller_cell = RefCell::new(controller);
+        let mut runtime_observer = |event: &Event| controller_cell.borrow_mut().on_event(event);
+        let mut runtime_approval = CliApprovalController {
+            controller: &controller_cell,
+        };
         let run = runtime
-            .run_task_controlled(workspace_root, task, &mut runtime_observer, should_cancel)
+            .run_task_with_controls(
+                workspace_root,
+                task,
+                &mut runtime_observer,
+                || controller_cell.borrow_mut().should_cancel(),
+                &mut runtime_approval,
+            )
             .map_err(|error| error.to_string())?;
         Ok(flash_tui::TuiRun {
             session_id: run.session_id,
             outcome: run.outcome.as_str().to_string(),
         })
+    }
+}
+
+struct CliApprovalController<'cell, 'controller> {
+    controller: &'cell RefCell<&'controller mut dyn flash_tui::RunController>,
+}
+
+impl ApprovalController for CliApprovalController<'_, '_> {
+    fn approve(&mut self, request: &ApprovalRequest) -> bool {
+        self.controller
+            .borrow_mut()
+            .approve(&flash_tui::ApprovalPrompt {
+                call_id: request.call_id.clone(),
+                name: request.name.clone(),
+                input: request.input.clone(),
+                risk: format!("{:?}", request.risk),
+            })
     }
 }
 

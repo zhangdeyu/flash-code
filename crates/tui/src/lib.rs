@@ -3,19 +3,37 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use flash_core::storage::load_session;
 use flash_core::{discover_workspace_root, init_workspace, Event};
 
 const DEFAULT_WIDTH: usize = 100;
 const DEFAULT_HEIGHT: usize = 32;
 
 pub trait TaskRunner {
+    fn permission_mode(&mut self, workspace_root: &Path) -> String;
+
     fn run_task(
         &mut self,
         workspace_root: &Path,
         task: &str,
-        observer: &mut dyn FnMut(&Event),
-        should_cancel: &mut dyn FnMut() -> bool,
+        controller: &mut dyn RunController,
     ) -> Result<TuiRun, String>;
+}
+
+pub trait RunController {
+    fn on_event(&mut self, event: &Event);
+
+    fn approve(&mut self, prompt: &ApprovalPrompt) -> bool;
+
+    fn should_cancel(&mut self) -> bool;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalPrompt {
+    pub call_id: String,
+    pub name: String,
+    pub input: String,
+    pub risk: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +46,12 @@ pub fn run_current_workspace(runner: &mut impl TaskRunner) -> Result<(), TuiErro
     let root = discover_workspace_root(None)?;
     init_workspace(&root)?;
     let mut state = AppState::load(&root)?;
+    state.permission_mode = runner.permission_mode(&root);
     let mut stdout = io::stdout();
+
+    if let Some(session_id) = std::env::var_os("FLASH_TUI_RESUME") {
+        state.resume_session(&root, &session_id.to_string_lossy());
+    }
 
     if let Some(task) = std::env::var_os("FLASH_TUI_TASK") {
         run_task_for_state(
@@ -85,7 +108,12 @@ fn input_loop(
                 if !state.input.is_empty() {
                     let task = state.input.clone();
                     state.input.clear();
-                    run_task_for_state(workspace_root, state, runner, &task, stdout)?;
+                    if let Some(session_id) = task.strip_prefix("resume ") {
+                        state.resume_session(workspace_root, session_id.trim());
+                        render_frame(stdout, state)?;
+                    } else {
+                        run_task_for_state(workspace_root, state, runner, &task, stdout)?;
+                    }
                 }
             }
             8 | 127 => {
@@ -112,28 +140,82 @@ fn run_task_for_state(
 ) -> Result<(), TuiError> {
     state.start_task(task);
     render_frame(stdout, state)?;
-    let mut render_error = None;
-    let mut should_cancel = || std::env::var_os("FLASH_TUI_CANCEL_AFTER_START").is_some();
+    let mut controller = UiRunController {
+        state,
+        stdout,
+        render_error: None,
+    };
     let run = runner
-        .run_task(
-            workspace_root,
-            task,
-            &mut |event| {
-                state.push_event(event);
-                if let Err(error) = render_frame(stdout, state) {
-                    render_error = Some(error);
-                }
-            },
-            &mut should_cancel,
-        )
+        .run_task(workspace_root, task, &mut controller)
         .map_err(TuiError::Runner)?;
-    if let Some(error) = render_error {
+    if let Some(error) = controller.render_error {
         return Err(error);
     }
-    state.finish_task(&run);
-    render_frame(stdout, state)?;
-    state.reload_sessions(workspace_root)?;
+    controller.state.finish_task(&run);
+    render_frame(controller.stdout, controller.state)?;
+    controller.state.reload_sessions(workspace_root)?;
     Ok(())
+}
+
+struct UiRunController<'a, W> {
+    state: &'a mut AppState,
+    stdout: &'a mut W,
+    render_error: Option<TuiError>,
+}
+
+impl<W> RunController for UiRunController<'_, W>
+where
+    W: Write,
+{
+    fn on_event(&mut self, event: &Event) {
+        self.state.push_event(event);
+        if let Err(error) = render_frame(self.stdout, self.state) {
+            self.render_error = Some(error);
+        }
+    }
+
+    fn approve(&mut self, prompt: &ApprovalPrompt) -> bool {
+        self.state.set_pending_approval(prompt);
+        if let Err(error) = render_frame(self.stdout, self.state) {
+            self.render_error = Some(error);
+            return false;
+        }
+        approval_from_env().unwrap_or_else(read_approval_from_stdin)
+    }
+
+    fn should_cancel(&mut self) -> bool {
+        std::env::var_os("FLASH_TUI_CANCEL_AFTER_START").is_some()
+    }
+}
+
+fn approval_from_env() -> Option<bool> {
+    std::env::var_os("FLASH_TUI_APPROVE").map(|value| {
+        matches!(
+            value.to_string_lossy().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "y" | "approve"
+        )
+    })
+}
+
+fn read_approval_from_stdin() -> bool {
+    if !io::stdin().is_terminal() {
+        return false;
+    }
+    let mut stdin = io::stdin();
+    let mut buffer = [0_u8; 1];
+    loop {
+        let Ok(read) = stdin.read(&mut buffer) else {
+            return false;
+        };
+        if read == 0 {
+            return false;
+        }
+        match buffer[0] {
+            b'y' | b'Y' => return true,
+            b'n' | b'N' | 3 | 27 => return false,
+            _ => {}
+        }
+    }
 }
 
 struct TerminalGuard {
@@ -177,6 +259,8 @@ pub struct AppState {
     input: String,
     status: RunStatus,
     current_session_id: Option<String>,
+    pending_approval: Option<ApprovalPrompt>,
+    permission_mode: String,
 }
 
 impl AppState {
@@ -200,6 +284,8 @@ impl AppState {
             input: String::new(),
             status: RunStatus::Idle,
             current_session_id: None,
+            pending_approval: None,
+            permission_mode: "unknown".to_string(),
         })
     }
 
@@ -214,12 +300,15 @@ impl AppState {
             input: String::new(),
             status: RunStatus::Idle,
             current_session_id: None,
+            pending_approval: None,
+            permission_mode: "unknown".to_string(),
         }
     }
 
     fn start_task(&mut self, task: &str) {
         self.status = RunStatus::Running;
         self.current_session_id = None;
+        self.pending_approval = None;
         self.transcript.clear();
         self.transcript.push(TranscriptLine {
             kind: TranscriptKind::Input,
@@ -234,6 +323,7 @@ impl AppState {
             "cancelled" => RunStatus::Cancelled,
             _ => RunStatus::Failed,
         };
+        self.pending_approval = None;
     }
 
     fn cancel(&mut self) {
@@ -248,6 +338,20 @@ impl AppState {
         if let Some(line) = event_to_transcript(event) {
             self.transcript.push(line);
         }
+        if matches!(event, Event::ApprovalResolved { .. }) {
+            self.pending_approval = None;
+        }
+    }
+
+    fn set_pending_approval(&mut self, prompt: &ApprovalPrompt) {
+        self.pending_approval = Some(prompt.clone());
+        self.transcript.push(TranscriptLine {
+            kind: TranscriptKind::Approval,
+            text: format!(
+                "pending {} {} risk={}",
+                prompt.name, prompt.call_id, prompt.risk
+            ),
+        });
     }
 
     fn reload_sessions(&mut self, workspace_root: &Path) -> Result<(), TuiError> {
@@ -260,6 +364,34 @@ impl AppState {
         });
         self.sessions = sessions;
         Ok(())
+    }
+
+    fn resume_session(&mut self, workspace_root: &Path, session_id: &str) {
+        match load_session(workspace_root, session_id) {
+            Ok(session) => match load_transcript(&session.path.join("events.jsonl")) {
+                Ok(transcript) => {
+                    self.current_session_id = Some(session.id);
+                    self.status = RunStatus::Idle;
+                    self.pending_approval = None;
+                    self.transcript = transcript;
+                }
+                Err(error) => self.replace_with_error(format!("resume failed: {error}")),
+            },
+            Err(error) => self.replace_with_error(format!("resume failed: {error}")),
+        }
+    }
+
+    fn push_error(&mut self, message: String) {
+        self.status = RunStatus::Failed;
+        self.transcript.push(TranscriptLine {
+            kind: TranscriptKind::Error,
+            text: message,
+        });
+    }
+
+    fn replace_with_error(&mut self, message: String) {
+        self.transcript.clear();
+        self.push_error(message);
     }
 }
 
@@ -334,6 +466,19 @@ pub fn render_to_string(state: &AppState, width: usize, height: usize) -> String
                 .unwrap_or_default()
         ),
     ));
+    lines.push(row(
+        width,
+        &format!("Permission: {}", state.permission_mode),
+    ));
+    if let Some(prompt) = &state.pending_approval {
+        lines.push(row(
+            width,
+            &format!(
+                "Approval: {} {} risk={}  y approve / n reject",
+                prompt.name, prompt.call_id, prompt.risk
+            ),
+        ));
+    }
     lines.push(horizontal(width));
     lines.push(row(width, "Sessions"));
 
@@ -816,6 +961,48 @@ mod tests {
     }
 
     #[test]
+    fn resume_session_should_load_transcript_for_current_workspace() {
+        let root = temp_dir("resume_current");
+        fs::create_dir_all(&root).unwrap();
+        let session = create_session(&root).unwrap();
+        append_event(
+            &session,
+            Event::AssistantDelta {
+                text: "hello resume".to_string(),
+            },
+        )
+        .unwrap();
+        let mut state = AppState::load(&root).unwrap();
+
+        state.resume_session(&root, &session.id);
+
+        assert_eq!(state.current_session_id, Some(session.id));
+    }
+
+    #[test]
+    fn resume_session_should_render_workspace_mismatch_error() {
+        let root = temp_dir("resume_a");
+        let other = temp_dir("resume_b");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let session = create_session(&root).unwrap();
+        let other_session = other.join(".flash/sessions").join(&session.id);
+        fs::create_dir_all(&other_session).unwrap();
+        fs::copy(
+            session.path.join("session.json"),
+            other_session.join("session.json"),
+        )
+        .unwrap();
+        fs::write(other_session.join("events.jsonl"), "").unwrap();
+        let mut state = AppState::load(&other).unwrap();
+
+        state.resume_session(&other, &session.id);
+
+        assert_eq!(state.status, RunStatus::Failed);
+        assert!(state.transcript[0].text.contains("session belongs to"));
+    }
+
+    #[test]
     fn render_to_string_should_include_tool_approval_and_error() {
         let events = [
             r#"{"event":{"type":"assistant_delta","text":"working"}}"#,
@@ -942,6 +1129,26 @@ mod tests {
         assert_eq!(state.transcript[0].text, "new task");
     }
 
+    #[test]
+    fn run_task_for_state_should_render_pending_approval_and_approved_status() {
+        let root = temp_dir("run_task_for_state_approval");
+        fs::create_dir_all(&root).unwrap();
+        let mut state = AppState::load(&root).unwrap();
+        let mut runner = ApprovalRunner;
+        let mut output = Vec::new();
+
+        run_task_for_state(
+            &root,
+            &mut state,
+            &mut runner,
+            "needs approval",
+            &mut output,
+        )
+        .unwrap();
+
+        assert_eq!(state.status, RunStatus::Succeeded);
+    }
+
     struct FakeRunner;
 
     impl TaskRunner for FakeRunner {
@@ -949,22 +1156,25 @@ mod tests {
             &mut self,
             _workspace_root: &Path,
             _task: &str,
-            observer: &mut dyn FnMut(&Event),
-            _should_cancel: &mut dyn FnMut() -> bool,
+            controller: &mut dyn RunController,
         ) -> Result<TuiRun, String> {
-            observer(&Event::ReasoningDelta {
+            controller.on_event(&Event::ReasoningDelta {
                 text: "thinking live".to_string(),
             });
-            observer(&Event::AssistantDelta {
+            controller.on_event(&Event::AssistantDelta {
                 text: "done live".to_string(),
             });
-            observer(&Event::SessionFinished {
+            controller.on_event(&Event::SessionFinished {
                 outcome: Outcome::Succeeded,
             });
             Ok(TuiRun {
                 session_id: "session_fake".to_string(),
                 outcome: "succeeded".to_string(),
             })
+        }
+
+        fn permission_mode(&mut self, _workspace_root: &Path) -> String {
+            "confirm".to_string()
         }
     }
 
@@ -975,21 +1185,57 @@ mod tests {
             &mut self,
             _workspace_root: &Path,
             _task: &str,
-            observer: &mut dyn FnMut(&Event),
-            should_cancel: &mut dyn FnMut() -> bool,
+            controller: &mut dyn RunController,
         ) -> Result<TuiRun, String> {
-            observer(&Event::ModelRequestStarted {
+            controller.on_event(&Event::ModelRequestStarted {
                 request_id: "request_1".to_string(),
                 model: "smoke".to_string(),
             });
-            let _cancel_requested = should_cancel();
-            observer(&Event::SessionFinished {
+            let _cancel_requested = controller.should_cancel();
+            controller.on_event(&Event::SessionFinished {
                 outcome: Outcome::Cancelled,
             });
             Ok(TuiRun {
                 session_id: "session_cancel".to_string(),
                 outcome: "cancelled".to_string(),
             })
+        }
+
+        fn permission_mode(&mut self, _workspace_root: &Path) -> String {
+            "confirm".to_string()
+        }
+    }
+
+    struct ApprovalRunner;
+
+    impl TaskRunner for ApprovalRunner {
+        fn run_task(
+            &mut self,
+            _workspace_root: &Path,
+            _task: &str,
+            controller: &mut dyn RunController,
+        ) -> Result<TuiRun, String> {
+            let approved = controller.approve(&ApprovalPrompt {
+                call_id: "call_approve".to_string(),
+                name: "Bash".to_string(),
+                input: "cargo test".to_string(),
+                risk: "Execute".to_string(),
+            });
+            controller.on_event(&Event::ApprovalResolved {
+                call_id: "call_approve".to_string(),
+                approved,
+            });
+            controller.on_event(&Event::SessionFinished {
+                outcome: Outcome::Succeeded,
+            });
+            Ok(TuiRun {
+                session_id: "session_approve".to_string(),
+                outcome: "succeeded".to_string(),
+            })
+        }
+
+        fn permission_mode(&mut self, _workspace_root: &Path) -> String {
+            "confirm".to_string()
         }
     }
 
@@ -1001,6 +1247,8 @@ mod tests {
             input: String::new(),
             status: RunStatus::Idle,
             current_session_id: None,
+            pending_approval: None,
+            permission_mode: "confirm".to_string(),
         }
     }
 

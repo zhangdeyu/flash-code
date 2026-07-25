@@ -13,6 +13,7 @@ Current default behavior:
 - `flash`: enters the TUI shell for the current workspace.
 - `flash tui`: enters the same TUI shell explicitly.
 - `flash run "<task>"`: runs one headless Agent task for automation and evaluation.
+- `flash resume <session_id>`: validates the current workspace before resuming.
 
 Current planning document:
 

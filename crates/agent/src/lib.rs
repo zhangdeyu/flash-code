@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use flash_core::{
     append_assistant_message, append_event, append_tool_result_message, append_user_message,
     create_session, ContentBlock, Event, Message, Outcome, PermissionDecision, PermissionPolicy,
-    Role, ToolContext, ToolExitStatus, ToolRegistry, ToolResultStatus,
+    Role, ToolContext, ToolExitStatus, ToolRegistry, ToolResultStatus, ToolRisk,
 };
 use flash_provider::{
     ChatProvider, ChatRequest, ProviderError, ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
@@ -27,6 +27,26 @@ struct NoopObserver;
 
 impl EventObserver for NoopObserver {
     fn on_event(&mut self, _event: &Event) {}
+}
+
+pub trait ApprovalController {
+    fn approve(&mut self, request: &ApprovalRequest) -> bool;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRequest {
+    pub call_id: String,
+    pub name: String,
+    pub input: String,
+    pub risk: ToolRisk,
+}
+
+struct RejectingApproval;
+
+impl ApprovalController for RejectingApproval {
+    fn approve(&mut self, _request: &ApprovalRequest) -> bool {
+        false
+    }
 }
 
 pub struct AgentRuntime<P> {
@@ -77,11 +97,33 @@ where
         workspace_root: &Path,
         task: &str,
         observer: &mut O,
-        mut should_cancel: C,
+        should_cancel: C,
     ) -> Result<AgentRun, AgentError>
     where
         O: EventObserver,
         C: FnMut() -> bool,
+    {
+        self.run_task_with_controls(
+            workspace_root,
+            task,
+            observer,
+            should_cancel,
+            &mut RejectingApproval,
+        )
+    }
+
+    pub fn run_task_with_controls<O, C, A>(
+        &mut self,
+        workspace_root: &Path,
+        task: &str,
+        observer: &mut O,
+        mut should_cancel: C,
+        approval: &mut A,
+    ) -> Result<AgentRun, AgentError>
+    where
+        O: EventObserver,
+        C: FnMut() -> bool,
+        A: ApprovalController,
     {
         let session = create_session(workspace_root)?;
         let user = append_user_message(&session, task)?;
@@ -207,7 +249,8 @@ where
                         outcome: Outcome::Cancelled,
                     });
                 }
-                let message = self.execute_tool_call(&session, &context, &call, observer)?;
+                let message =
+                    self.execute_tool_call(&session, &context, &call, observer, approval)?;
                 history.push(message);
             }
         }
@@ -333,6 +376,7 @@ where
         context: &ToolContext,
         call: &ToolCall,
         observer: &mut impl EventObserver,
+        approval: &mut impl ApprovalController,
     ) -> Result<Message, AgentError> {
         let Some(tool) = self.tools.get(&call.name) else {
             emit_event(
@@ -359,10 +403,8 @@ where
             .map_err(AgentError::Storage);
         };
 
-        let decision = self
-            .options
-            .permission_policy
-            .decide(tool.risk(&call.input));
+        let risk = tool.risk(&call.input);
+        let decision = self.options.permission_policy.decide(risk);
         match decision {
             PermissionDecision::Allow => {
                 emit_event(
@@ -409,7 +451,82 @@ where
                     }
                 }
             }
-            PermissionDecision::Ask | PermissionDecision::Deny => {
+            PermissionDecision::Ask => {
+                emit_event(
+                    session,
+                    Event::ApprovalRequired {
+                        call_id: call.call_id.clone(),
+                    },
+                    observer,
+                )?;
+                let approved = approval.approve(&ApprovalRequest {
+                    call_id: call.call_id.clone(),
+                    name: call.name.clone(),
+                    input: call.input.clone(),
+                    risk,
+                });
+                emit_event(
+                    session,
+                    Event::ApprovalResolved {
+                        call_id: call.call_id.clone(),
+                        approved,
+                    },
+                    observer,
+                )?;
+                if approved {
+                    emit_event(
+                        session,
+                        Event::ToolStarted {
+                            call_id: call.call_id.clone(),
+                            name: call.name.clone(),
+                        },
+                        observer,
+                    )?;
+                    return match tool.call(&call.input, context) {
+                        Ok(output) => self.commit_tool_output(session, call, output, observer),
+                        Err(error) => {
+                            emit_event(
+                                session,
+                                Event::Error {
+                                    message: error.message.clone(),
+                                },
+                                observer,
+                            )?;
+                            emit_event(
+                                session,
+                                Event::ToolFinished {
+                                    call_id: call.call_id.clone(),
+                                    status: ToolResultStatus::Error,
+                                },
+                                observer,
+                            )?;
+                            append_tool_result_message(
+                                session,
+                                &call.call_id,
+                                ToolResultStatus::Error,
+                                &error.message,
+                            )
+                            .map_err(AgentError::Storage)
+                        }
+                    };
+                }
+                emit_event(
+                    session,
+                    Event::ToolFinished {
+                        call_id: call.call_id.clone(),
+                        status: ToolResultStatus::Rejected,
+                    },
+                    observer,
+                )?;
+                append_tool_result_message(
+                    session,
+                    &call.call_id,
+                    ToolResultStatus::Rejected,
+                    "tool call rejected by permission policy",
+                )
+                .map_err(AgentError::Storage)
+            }
+            PermissionDecision::Deny => {
                 emit_event(
                     session,
                     Event::ApprovalRequired {
@@ -964,6 +1081,70 @@ mod tests {
     }
 
     #[test]
+    fn run_task_with_controls_should_execute_approved_tool_call() {
+        let root = temp_dir("tool_approved");
+        fs::create_dir_all(&root).unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ExecuteTool)).unwrap();
+        let mut runtime = AgentRuntime::new(
+            ExecuteToolProvider,
+            registry,
+            AgentOptions {
+                model: "smoke".to_string(),
+                max_turns: 1,
+                permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Confirm),
+                max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
+            },
+        );
+        let mut observer = NoopObserver;
+        let mut approval = ApprovingApproval;
+
+        let run = runtime
+            .run_task_with_controls(&root, "execute", &mut observer, || false, &mut approval)
+            .unwrap();
+
+        let events = fs::read_to_string(
+            root.join(".flash")
+                .join("sessions")
+                .join(run.session_id)
+                .join("events.jsonl"),
+        )
+        .unwrap();
+        assert!(events.contains("\"approved\":true"));
+    }
+
+    #[test]
+    fn run_task_should_require_approval_for_destructive_tool_even_in_yolo() {
+        let root = temp_dir("destructive_yolo");
+        fs::create_dir_all(&root).unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DestructiveTool)).unwrap();
+        let mut runtime = AgentRuntime::new(
+            DestructiveToolProvider,
+            registry,
+            AgentOptions {
+                model: "smoke".to_string(),
+                max_turns: 1,
+                permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Yolo),
+                max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
+            },
+        );
+
+        let run = runtime.run_task(&root, "destructive").unwrap();
+
+        let events = fs::read_to_string(
+            root.join(".flash")
+                .join("sessions")
+                .join(run.session_id)
+                .join("events.jsonl"),
+        )
+        .unwrap();
+        assert!(events.contains("\"type\":\"approval_required\""));
+    }
+
+    #[test]
     fn run_task_should_write_cancelled_result_when_tool_cancels() {
         let root = temp_dir("tool_cancelled");
         fs::create_dir_all(&root).unwrap();
@@ -1183,6 +1364,21 @@ mod tests {
         }
     }
 
+    struct DestructiveToolProvider;
+
+    impl ChatProvider for DestructiveToolProvider {
+        fn chat(&mut self, _request: ChatRequest) -> Result<Vec<ProviderEvent>, ProviderError> {
+            Ok(vec![
+                ProviderEvent::ToolCallComplete(ToolCall {
+                    call_id: "call_destructive".to_string(),
+                    name: "destructive".to_string(),
+                    input: String::new(),
+                }),
+                ProviderEvent::Done(StopReason::ToolUse),
+            ])
+        }
+    }
+
     struct FakeTool;
 
     impl Tool for FakeTool {
@@ -1247,6 +1443,14 @@ mod tests {
         }
     }
 
+    struct ApprovingApproval;
+
+    impl ApprovalController for ApprovingApproval {
+        fn approve(&mut self, _request: &ApprovalRequest) -> bool {
+            true
+        }
+    }
+
     struct CancelTool;
 
     impl Tool for CancelTool {
@@ -1264,6 +1468,22 @@ mod tests {
                 stderr: "cancelled".to_string(),
                 status: ToolExitStatus::Cancelled,
             })
+        }
+    }
+
+    struct DestructiveTool;
+
+    impl Tool for DestructiveTool {
+        fn name(&self) -> &str {
+            "destructive"
+        }
+
+        fn risk(&self, _input: &str) -> ToolRisk {
+            ToolRisk::Destructive
+        }
+
+        fn call(&self, _input: &str, _context: &ToolContext) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::success("destructive ran"))
         }
     }
 
