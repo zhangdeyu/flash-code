@@ -13,12 +13,39 @@
 | 0.1 | 协议、存储、CLI 骨架 | 项目可启动,session 可落盘和 replay |
 | 0.2 | DeepSeek Headless Agent MVP | `flash run` 能完成最小模型-工具闭环 |
 | 0.3 | 代码修改能力 | Agent 能读、改、测一个真实 workspace |
+| 0.3.x | 工具协议收敛 | Agent 可见工具稳定为 `Read/Edit/Write/Glob/Grep/ListFiles/Bash` |
 | 0.4 | TUI MVP | `flash` 默认进入 TUI,并复用同一 runtime |
 | 0.5 | 内部自动化测试体系 | 核心协议、存储、工具、TUI 有防退化测试 |
 | 0.6 | Terminal-Bench Smoke | 接入主公开基准的小样本评测 |
+| 0.6.x | Skill 机制评估点 | 仅在评测或真实工作流证明需要时引入 |
 | 0.7 | SWE-bench Verified Smoke | 接入真实 issue 修复类评测 |
+| 0.7.x | SubAgent / Task / AskUser 评估点 | 仅在单 Agent loop 和 TUI 状态模型不足时引入 |
 | 0.8 | 回归评测与报告 | 形成 release 前防退化机制 |
 | 1.0 | 日常可用版本 | TUI、CLI、session、评测路径完整可用 |
+
+## 1.1 当前状态
+
+已完成并推送:
+
+- 0.1 协议、存储、CLI 骨架。
+- 0.2 Headless Agent loop。
+- 0.3 代码修改能力。
+- 0.3.x 工具协议收敛。
+
+下一阶段从 0.4 TUI MVP 开始。0.4 之后不重新设计 runtime,只把 TUI 作为 `Event` 的消费者和 `UserAction` 的生产者接入现有 Agent runtime。
+
+## 1.2 执行节奏
+
+每个迭代按同一节奏执行:
+
+1. 更新或确认本阶段设计边界。
+2. 实现最小可运行功能。
+3. 补齐本阶段测试和验收记录。
+4. 跑全局验收门槛。
+5. 更新文档。
+6. commit 并 push 到 `origin/feature/init`。
+
+每个迭代必须产出 `docs/acceptance_<version>.md`,记录实际执行的命令、关键输出和验收标准映射。
 
 ## 2. 全局验收门槛
 
@@ -33,7 +60,7 @@
 
 ## 2.1 Agent 可见工具协议
 
-v1 暴露给 Agent 的工具保持少而稳定:
+v1 暴露给 Agent 的工具保持少而稳定。公开给模型的工具名与 DeepSeek 无关,provider adapter 只负责把通用 tool spec 转成 DeepSeek tool calls 格式。
 
 | 工具 | 作用 | 默认风险 |
 |---|---|---|
@@ -64,6 +91,13 @@ v1 暴露给 Agent 的工具保持少而稳定:
 | `TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList` | 需要任务状态模型、TUI 展示和 resume 语义 |
 | `Agent` | 属于 SubAgent,会引入独立上下文、权限继承和事件归属 |
 | `AskUserQuestion` | 需要同时定义 TUI、CLI、headless eval 下的交互行为 |
+
+后置工具的评估原则:
+
+- 先用 `events.jsonl` 和 TUI 本地状态表达进度,不足时再引入 `Task*`。
+- 先用单 Agent loop 完成 Terminal-Bench/SWE-bench smoke,不足时再引入 `Agent`。
+- 先用 approval 和失败状态处理歧义,确实需要模型主动询问用户时再引入 `AskUserQuestion`。
+- 后置工具一旦引入,也必须保持 provider-agnostic,不能绑定 DeepSeek。
 
 允许暂缓:
 
@@ -294,6 +328,116 @@ model -> tool approval -> tool execution -> tool result -> model
 - 用户可以只用 `flash` 完成一次简单代码修改任务。
 - TUI 没有引入独立业务逻辑分支。
 
+## 6.1 0.4.1 TUI Shell 与事件渲染
+
+目标:先把 TUI 外壳和事件渲染做稳,不急着承载完整交互。
+
+范围:
+
+- 建立 `tui` crate。
+- 接入 ratatui/crossterm 或同等 Rust TUI 基础栈。
+- 建立 TUI app state。
+- 从已有 `events.jsonl` 渲染 transcript。
+- 支持退出、滚动、reasoning 展开/折叠。
+
+交付:
+
+- `flash` 无参数进入 TUI。
+- `flash tui` 进入同一个 TUI。
+- TUI 可以打开当前 workspace 的最近 session。
+- transcript 区域能展示 user、assistant、tool、error。
+- reasoning 可折叠展示。
+- tool output 可折叠展示。
+- error 状态有独立样式。
+
+验收标准:
+
+- `flash --help`、`flash run`、`flash replay`、`flash doctor` 仍保持 CLI 行为。
+- 无参数 `flash` 和 `flash tui` 都进入 alternate screen。
+- 退出后 terminal raw mode 和 cursor 状态恢复。
+- 使用 0.3.x 产生的 `events.jsonl` 可以重建 transcript。
+- snapshot 覆盖空状态、普通输出、reasoning、tool output、error。
+- 窄宽度终端下文本不互相覆盖。
+- 本阶段不直接调用 Provider 或 Tool。
+
+退出条件:
+
+- TUI 可以稳定作为 replay viewer 使用。
+- TUI shell 不影响 headless `flash run`。
+
+## 6.2 0.4.2 TUI Session 与输入流
+
+目标:TUI 可以创建任务、输入消息、展示 live event,但仍复用同一个 Agent runtime。
+
+范围:
+
+- TUI input box。
+- TUI 内创建新 session。
+- TUI 订阅 Agent runtime 事件流。
+- 展示 streaming text/reasoning。
+- 展示 tool call lifecycle。
+- 支持 cancel。
+
+交付:
+
+- 新建任务输入框。
+- 当前 session 状态栏。
+- live transcript。
+- tool call 状态:requested、started、completed、failed、rejected。
+- cancel 按键。
+- 运行中、成功、失败、取消四种状态。
+
+验收标准:
+
+- TUI 发起任务和 `flash run` 使用同一 `AgentRuntime` 入口。
+- streaming text/reasoning 先写 event,再由 TUI 渲染。
+- cancel 后 session 状态为 canceled 或 failed,不会写入半截 assistant message。
+- tool result 在 TUI 和 replay 中展示一致。
+- TUI crash 或主动退出后,已写入 events 仍可 replay。
+- headless eval 不依赖 TUI 模块。
+
+退出条件:
+
+- 用户可以在 TUI 中完成一个只读任务。
+- 运行中取消不会破坏 session 文件。
+
+## 6.3 0.4.3 TUI Approval 与 Resume
+
+目标:TUI 承载真实代码修改所需的人机确认和 session 恢复。
+
+范围:
+
+- approval modal 或 inline panel。
+- approve/reject 输入。
+- destructive 命令强制确认。
+- workspace session 列表。
+- resume 同 workspace session。
+- 跨 workspace resume 拒绝。
+
+交付:
+
+- approval UI。
+- session list。
+- session detail/replay。
+- resume action。
+- workspace mismatch 错误展示。
+- 权限模式展示:confirm/yolo/human。
+
+验收标准:
+
+- `Edit`、`Write`、`Bash` 需要确认时,TUI 能渲染待审批项。
+- 审批结果写入 `approval_resolved` event。
+- destructive 命令在任何模式下都必须显式确认。
+- `human` 模式下 TUI 只展示建议操作,不执行写入或命令。
+- TUI session 列表通过扫描 `.flash/sessions/*/session.json` 生成,不依赖 `index.json`。
+- 在 B workspace resume A workspace session 会拒绝并展示明确错误。
+- TUI 中完成一次小型 Rust fixture 修复,最终测试通过且 diff 可见。
+
+退出条件:
+
+- 用户可以只用 `flash` 完成一次简单代码修改任务。
+- TUI 与 CLI 在权限、存储、replay 上行为一致。
+
 ## 7. 0.5 内部自动化测试体系
 
 目标:核心功能具备稳定防退化能力,先把内部质量体系打牢。
@@ -337,6 +481,79 @@ model -> tool approval -> tool execution -> tool result -> model
 - 每次改协议、存储、tool loop 都能被自动化测试捕捉主要退化。
 - 可以放心接入公开 benchmark smoke。
 
+## 7.1 0.5.1 协议与存储测试加固
+
+目标:把最容易影响 replay/resume 的稳定协议先锁住。
+
+交付:
+
+- event schema golden tests。
+- message schema golden tests。
+- session storage integration tests。
+- config precedence tests。
+- workspace root detection tests。
+
+验收标准:
+
+- 新增 event 字段必须兼容旧 golden 或显式更新 golden。
+- session scan 不依赖 `index.json`。
+- 跨 workspace resume 拒绝有测试。
+- interrupted turn 不写入 `messages.jsonl` 有测试。
+- 配置优先级测试覆盖 default、user、workspace、env、CLI args。
+
+退出条件:
+
+- 修改 core/storage 时,主要兼容性问题能被测试捕捉。
+
+## 7.2 0.5.2 Tool 与 Permission 测试加固
+
+目标:把文件修改、命令执行和权限边界锁住。
+
+交付:
+
+- tool registry tests。
+- path guard tests。
+- command risk tests。
+- permission mode tests。
+- artifact truncation tests。
+
+验收标准:
+
+- `Read/Edit/Write/Glob/Grep/ListFiles/Bash` 都有成功和失败测试。
+- 旧工具名兼容测试继续保留。
+- workspace 外路径、路径穿越、symlink 越界都被拒绝。
+- destructive command classification 有测试。
+- `confirm`、`yolo`、`human` 行为有测试。
+- 长 stdout/stderr 写 artifact 有测试。
+
+退出条件:
+
+- 工具协议变更不能静默破坏权限和 workspace 边界。
+
+## 7.3 0.5.3 Agent 与 TUI 测试加固
+
+目标:把端到端 loop 和 TUI 关键状态纳入 CI。
+
+交付:
+
+- deterministic mock provider scenarios。
+- Agent loop integration tests。
+- TUI snapshot tests。
+- fixture workspace smoke tests。
+- CI workflow 或本地等价脚本。
+
+验收标准:
+
+- mock provider 覆盖成功、unknown tool、tool failure、max_turns、cancel。
+- 小型 Rust fixture 修复测试稳定通过。
+- TUI snapshot 覆盖空状态、streaming、approval、tool output、error。
+- CI 不要求真实 DeepSeek API key。
+- 一条本地命令能跑完整内部测试门槛。
+
+退出条件:
+
+- 0.6 公开 benchmark 接入前,内部退化检查已稳定。
+
 ## 8. 0.6 Terminal-Bench Smoke
 
 目标:接入主公开基准的小样本,验证真实终端任务的端到端能力。
@@ -377,6 +594,56 @@ model -> tool approval -> tool execution -> tool result -> model
 - 可以用 Terminal-Bench smoke 发现真实能力短板。
 - 公开基准接入没有污染日常 CLI/TUI runtime。
 
+## 8.1 0.6.1 Eval Harness 基础
+
+目标:先建立通用评测运行框架,Terminal-Bench 只是第一个 adapter。
+
+交付:
+
+- `eval` crate 或 `flash eval` 模块。
+- `EvalTask` / `EvalRun` / `EvalResult` 最小类型。
+- eval workspace 隔离目录。
+- timeout、retry、artifact 收集。
+- JSON result writer。
+- Markdown report writer。
+
+验收标准:
+
+- eval harness 可以运行一个本地 fixture task。
+- eval task 调用同一个 `AgentRuntime`。
+- eval run 输出目录不覆盖历史结果。
+- task stdout/stderr、events、artifacts 都能保留。
+- agent failure、environment failure、grader failure 能区分。
+
+退出条件:
+
+- 新 benchmark adapter 可以复用同一 eval harness。
+
+## 8.2 0.6.2 Terminal-Bench Adapter
+
+目标:接入固定小样本 Terminal-Bench,作为主公开基准 smoke。
+
+交付:
+
+- `flash eval terminal-bench --subset smoke`。
+- Terminal-Bench task loader。
+- task environment runner。
+- grader result parser。
+- smoke subset lock file。
+- failure classifier。
+
+验收标准:
+
+- 能跑固定 smoke subset。
+- 每个 task 都产生 session 和 event log。
+- report 包含 task id、pass/fail、耗时、命令数、token usage、失败原因。
+- fixed subset 版本固定,公开基准更新不会静默改变 smoke 口径。
+- 不存在 Terminal-Bench 专用 runtime 或绕过工具权限的 prompt 分支。
+
+退出条件:
+
+- Terminal-Bench smoke 可以作为日常能力回归信号。
+
 ## 9. 0.6.x Skill 机制评估点
 
 目标:只在真实需要时引入 Skill,避免过早把 prompt 系统复杂化。
@@ -401,6 +668,23 @@ model -> tool approval -> tool execution -> tool result -> model
 
 - 如果没有明确收益,继续不实现动态 Skill。
 - 如果实现,只作为 prompt/tool selection 扩展点,不成为新 runtime。
+
+## 9.1 0.6.x.1 最小 Skill 方案候选
+
+仅当触发条件满足时进入实现。候选方案保持克制:
+
+- skill 是本地 Markdown/TOML 描述,不包含可执行代码。
+- skill 只能提供 prompt 片段、工具使用偏好、项目规则。
+- skill 来源必须记录到 `events.jsonl`。
+- skill 不拥有独立权限模型。
+- skill 不读写 session 文件。
+
+验收标准:
+
+- 未启用 skill 时行为完全不变。
+- 启用 skill 后 replay 能看到使用了哪些 skill。
+- skill 不能绕过 `PermissionPolicy`。
+- skill 不能注入 secret 到日志。
 
 ## 10. 0.7 SWE-bench Verified Smoke
 
@@ -442,9 +726,56 @@ model -> tool approval -> tool execution -> tool result -> model
 - 可以基于 SWE-bench smoke 分析真实代码修改短板。
 - 评测结果能和 Terminal-Bench 结果并列比较,而不是只看单一总分。
 
-## 11. 0.7.x SubAgent 机制评估点
+## 10.1 0.7.1 SWE-bench Harness
 
-目标:只有单 Agent loop 难以定位失败原因时,再评估只读 SubAgent。
+目标:先跑通 checkout、patch、grader 数据链路。
+
+交付:
+
+- task metadata loader。
+- repo checkout/cache。
+- issue prompt builder。
+- patch collector。
+- grader command bridge。
+- per-task cleanup。
+
+验收标准:
+
+- 能对 1 个固定 verified task 完整执行 checkout、agent、patch、grader。
+- 运行目录与用户当前 workspace 隔离。
+- patch、events、grader log 都能保留。
+- task 超时后能清理进程并记录 timeout。
+
+退出条件:
+
+- SWE-bench 数据链路稳定,可以扩大到 smoke subset。
+
+## 10.2 0.7.2 SWE-bench Verified Smoke
+
+目标:把样本扩大到固定 10 个 task,并形成可比较报告。
+
+交付:
+
+- `flash eval swe-bench --subset verified --limit 10`。
+- fixed task list。
+- resolved/unresolved report。
+- failure classifier。
+
+验收标准:
+
+- 10 个固定 task 能顺序运行。
+- 每个 task 都能映射到 session id 和 patch。
+- report 记录 resolved/unresolved、耗时、命令数、token usage、失败原因。
+- 环境失败不会计为 agent resolved/unresolved。
+- 不存在 SWE-bench 专用 runtime 或权限绕过。
+
+退出条件:
+
+- SWE-bench smoke 可以和 Terminal-Bench smoke 并列用于能力分析。
+
+## 11. 0.7.x SubAgent / Task / AskUser 评估点
+
+目标:只有单 Agent loop、基础 event 状态和 approval 已经不足时,再评估更复杂的交互协议。
 
 这不是默认实现迭代,而是 0.7 后的评估门。
 
@@ -453,6 +784,14 @@ model -> tool approval -> tool execution -> tool result -> model
 - 大仓库代码定位明显拖慢主 loop。
 - 评测失败主要来自上下文收集不足。
 - 需要把分析任务和执行任务隔离。
+- TUI 中长期任务需要结构化 todo,单纯 events 难以表达进度。
+- 模型频繁需要向用户询问歧义,approval 不能表达问题类型。
+
+候选范围:
+
+- `Agent`:只读 SubAgent,用于独立分析。
+- `TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList`:结构化 todo 和进度。
+- `AskUserQuestion`:结构化向用户提问。
 
 验收标准:
 
@@ -461,11 +800,77 @@ model -> tool approval -> tool execution -> tool result -> model
 - SubAgent 结果作为 parent Agent 的普通上下文输入。
 - SubAgent 事件可从 parent session 的 `events.jsonl` replay。
 - SubAgent 不引入独立 session 存储格式,除非 replay 已无法表达。
+- `Task*` 只能更新 session 内任务状态,不能替代 `messages.jsonl` 或 `events.jsonl`。
+- `Task*` 状态必须能从 `events.jsonl` replay 重建。
+- `AskUserQuestion` 在 TUI、CLI、headless eval 下都有明确行为。
+- headless eval 下 `AskUserQuestion` 默认失败或使用预置答案,不能挂起无限等待。
+- 所有新增工具仍受 permission policy 和 workspace guard 约束。
 
 退出条件:
 
-- 如果单 Agent loop 能解决主要问题,继续不实现 SubAgent。
-- 如果实现,优先做只读分析型 SubAgent,不做多 Agent 调度平台。
+- 如果单 Agent loop 和基础 TUI 状态能解决主要问题,继续不实现这些工具。
+- 如果实现,按 `Task*` -> `AskUserQuestion` -> 只读 `Agent` 的顺序评估,不做多 Agent 调度平台。
+
+## 11.1 0.7.x.1 Task 工具候选
+
+目标:让长任务进度可结构化展示,但不扩大存储模型。
+
+交付:
+
+- `TaskCreate`。
+- `TaskUpdate`。
+- `TaskGet`。
+- `TaskList`。
+- task state event。
+- TUI task panel。
+
+验收标准:
+
+- task 状态可从 `events.jsonl` 完整重建。
+- task 不单独落盘为新必需文件。
+- replay 能展示 task 变化。
+- task 工具不能执行文件或命令操作。
+- headless CLI 中 task 变化能以简洁文本输出。
+
+## 11.2 0.7.x.2 AskUserQuestion 候选
+
+目标:只在 approval 不足以表达歧义时,允许模型提出结构化问题。
+
+交付:
+
+- `AskUserQuestion` tool spec。
+- TUI 问题渲染。
+- CLI 问题渲染。
+- headless eval 默认策略。
+- answer event。
+
+验收标准:
+
+- 问题必须包含明确选项或自由文本 schema。
+- TUI/CLI 回答都写入 event。
+- headless eval 没有预置答案时不会无限等待。
+- 用户回答进入下一轮 model context。
+- secret 类问题默认拒绝写入 events。
+
+## 11.3 0.7.x.3 只读 Agent 候选
+
+目标:只在评测证明需要时,引入可审计的只读 SubAgent。
+
+交付:
+
+- `Agent` tool spec。
+- child context builder。
+- parent event attribution。
+- read-only tool registry。
+- child summary result。
+
+验收标准:
+
+- child agent 默认只能使用 `Read`、`Glob`、`Grep`、`ListFiles`。
+- child agent 不能调用 `Edit`、`Write`、`Bash`。
+- child agent 输出只作为 parent 的 tool result。
+- child events 可通过 parent session replay。
+- child agent 有独立 max_turns 和 timeout。
 
 ## 12. 0.8 回归评测与报告
 

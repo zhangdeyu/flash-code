@@ -397,15 +397,17 @@ v1 可选:
 - 失败可归类为定位失败、patch 失败、测试失败、环境失败、超时。
 - 所有任务仍通过同一个 Agent runtime。
 
-### 0.7.x SubAgent 机制评估点
+### 0.7.x SubAgent / Task / AskUser 评估点
 
-目标:只有单 Agent loop 难以定位失败原因时,再评估只读 SubAgent。
+目标:只有单 Agent loop、基础 event 状态和 approval 已经不足时,再评估更复杂的交互协议。
 
 触发条件:
 
 - 大仓库代码定位明显拖慢主 loop。
 - 评测失败主要来自上下文收集不足。
 - 需要把分析任务和执行任务隔离。
+- TUI 中长期任务需要结构化 todo,单纯 events 难以表达进度。
+- 模型频繁需要向用户询问歧义,approval 不能表达问题类型。
 
 验收标准:
 
@@ -413,6 +415,11 @@ v1 可选:
 - SubAgent 不能直接执行写操作。
 - SubAgent 结果作为 parent Agent 的普通上下文输入。
 - SubAgent 事件可从 parent session 的 `events.jsonl` replay。
+- `TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList` 只能更新 session 内任务状态,不能替代 `messages.jsonl` 或 `events.jsonl`。
+- `Task*` 状态必须能从 `events.jsonl` replay 重建。
+- `AskUserQuestion` 在 TUI、CLI、headless eval 下都有明确行为。
+- headless eval 下 `AskUserQuestion` 默认失败或使用预置答案,不能挂起无限等待。
+- 所有新增工具仍受 permission policy 和 workspace guard 约束。
 
 ### 0.8 回归评测
 
