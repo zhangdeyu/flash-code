@@ -31,13 +31,49 @@
 - 新增 session/event/message 格式必须能 replay 或有 golden test。
 - 不引入与当前迭代目标无关的大型抽象。
 
+## 2.1 Agent 可见工具协议
+
+v1 暴露给 Agent 的工具保持少而稳定:
+
+| 工具 | 作用 | 默认风险 |
+|---|---|---|
+| `Read` | 读取指定文件的完整或部分内容 | Read |
+| `Edit` | 对现有文件进行精准、有针对性的修改 | Write |
+| `Write` | 创建或完全覆写文件内容 | Write |
+| `Glob` | 基于模式匹配快速查找文件和目录路径 | Read |
+| `Grep` | 在文件内容中通过正则或关键字搜索代码逻辑 | Read |
+| `ListFiles` | 列出特定路径下的文件和目录结构 | Read |
+| `Bash` | 在隔离或本地环境中执行 shell 命令行操作 | Execute / Destructive |
+
+实现层可以继续拆小工具,但 provider tool spec 和 prompt 中优先使用上面的高层工具名。当前旧实现映射:
+
+| 当前实现 | 目标 Agent 工具 |
+|---|---|
+| `read_file` | `Read` |
+| `apply_patch` | `Edit` |
+| `write_file` | `Write` |
+| `search` | 拆分为 `Glob` / `Grep` / `ListFiles` |
+| `shell` | `Bash` |
+| `run_tests` | `Bash` 的受控场景或内部 helper |
+| `git_diff` | `Bash` / `Read` 的受控场景或内部 helper |
+
+后置工具不进入 v1 默认暴露:
+
+| 工具 | 后置原因 |
+|---|---|
+| `TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList` | 需要任务状态模型、TUI 展示和 resume 语义 |
+| `Agent` | 属于 SubAgent,会引入独立上下文、权限继承和事件归属 |
+| `AskUserQuestion` | 需要同时定义 TUI、CLI、headless eval 下的交互行为 |
+
 允许暂缓:
 
 - 非 v1 必需的 provider。
 - Web UI。
 - parallel tool calls。
 - 动态 Skill 系统。
-- SubAgent 调度。
+- SubAgent 调度和 `Agent` 工具。
+- `Task*` 工具。
+- `AskUserQuestion` 工具。
 - 独立 telemetry/trajectory/compaction 系统。
 
 ## 3. 0.1 协议、存储与 CLI 骨架
@@ -109,7 +145,7 @@
 - 支持 streaming。
 - 支持 reasoning/text/tool call/usage 事件。
 - 实现顺序 Agent loop。
-- 实现只读和命令类基础工具。
+- 实现只读和命令类基础工具,并开始向 Agent 可见工具协议收敛。
 
 交付:
 
@@ -119,9 +155,8 @@
 - DeepSeek error mapper。
 - `flash run "<task>"`。
 - reasoning/text 流式输出。
-- `shell` tool。
-- `read_file` tool。
-- `search` tool。
+- Agent 可见工具雏形:`Read`、`ListFiles`、`Bash`。
+- 内部兼容实现:`read_file`、`search`、`shell`。
 - `confirm` / `yolo` / `human` 三种审批模式的最小实现。
 - 工具 stdout/stderr 进入 `events.jsonl`。
 - 长工具输出写入 `artifacts/`。
@@ -135,7 +170,7 @@ model -> tool approval -> tool execution -> tool result -> model
 
 - mock DeepSeek streaming 测试覆盖 reasoning delta、text delta、tool call、usage、done。
 - DeepSeek adapter 能把原始 SSE 转换为 provider-agnostic `ProviderEvent`。
-- `flash run "list files"` 能触发 shell 或 search tool 并正常结束。
+- `flash run "list files"` 能触发 `ListFiles` 或兼容 search tool 并正常结束。
 - tool call 成功、失败、拒绝、取消都会产生 tool result。
 - unknown tool 不 panic,写 error tool result。
 - 每轮 loop 都受 `max_turns` 限制,超限后 session 明确失败并写 event。
@@ -158,17 +193,15 @@ model -> tool approval -> tool execution -> tool result -> model
 
 范围:
 
-- 增加写文件和 patch 能力。
+- 增加 `Edit` / `Write` 能力。
 - 增加 git diff 和测试执行能力。
 - 强化 workspace 写入边界和 destructive 审批。
 - 加入简单 prompt projection/token budget。
 
 交付:
 
-- `apply_patch` tool。优先于直接 `write_file`。
-- 可选 `write_file` tool,只用于明确整文件写入场景。
-- `git_diff` tool。
-- `run_tests` tool。
+- Agent 可见工具:`Read`、`Edit`、`Write`、`Glob`、`Grep`、`ListFiles`、`Bash`。
+- 内部兼容实现:`apply_patch`、`write_file`、`git_diff`、`run_tests`。
 - workspace path guard。
 - command risk classifier。
 - 简单 prompt projection。
@@ -192,6 +225,29 @@ model -> tool approval -> tool execution -> tool result -> model
 
 - 在一个小型 Rust fixture 项目中,Agent 能修复一个已知失败测试。
 - 代码修改路径不需要 TUI 也能被 benchmark adapter 复用。
+
+## 5.1 0.3.x 工具协议收敛
+
+目标:把 0.2/0.3 的内部工具名收敛为稳定 Agent 可见工具协议。
+
+交付:
+
+- provider tool spec 暴露 `Read`、`Edit`、`Write`、`Glob`、`Grep`、`ListFiles`、`Bash`。
+- runtime 兼容旧工具名一段时间,避免已保存 session replay 失效。
+- `Glob` 支持路径 pattern 查找。
+- `Grep` 支持关键字或正则内容搜索。
+- `ListFiles` 支持列出目录结构。
+- `Bash` 统一承载 `run_tests` 和 `git_diff` 这类命令型场景。
+
+验收标准:
+
+- `flash run "list files"` 触发 `ListFiles`。
+- `flash run "fix failing tests"` replay 中出现 `Read`、`Edit`、`Bash` 或兼容别名映射事件。
+- 旧工具名 `read_file`、`apply_patch`、`write_file`、`search`、`shell` 仍能被 runtime 解析。
+- `Glob`、`Grep`、`ListFiles` 都是 Read 风险。
+- `Edit`、`Write` 都受 workspace path guard 保护。
+- `Bash` 对 destructive 命令仍返回 Destructive 风险。
+- 验收通过后提交并 push。
 
 ## 6. 0.4 TUI MVP
 

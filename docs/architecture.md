@@ -202,18 +202,35 @@ pub trait Tool {
 }
 ```
 
-v1 内置工具:
+v1 Agent 可见工具:
 
-- `shell`
-- `read_file`
-- `search`
+- `Read`:读取指定文件的完整或部分内容。
+- `Edit`:对现有文件进行精准、有针对性的修改。
+- `Write`:创建或完全覆写文件内容。
+- `Glob`:基于模式匹配快速查找文件和目录路径。
+- `Grep`:在文件内容中通过正则或关键字搜索代码逻辑。
+- `ListFiles`:列出特定路径下的文件和目录结构。
+- `Bash`:在隔离或本地环境中执行 shell 命令行操作。
 
-0.3 再加入:
+实现层可以继续拆成更小的工具,但 Provider tool spec 和 prompt 优先暴露上面的高层工具名。
 
-- `write_file`
-- `apply_patch`
-- `git_diff`
-- `run_tests`
+当前实现到目标协议的映射:
+
+| 当前实现 | 目标 Agent 工具 |
+|---|---|
+| `read_file` | `Read` |
+| `apply_patch` | `Edit` |
+| `write_file` | `Write` |
+| `search` | `Glob` / `Grep` / `ListFiles` |
+| `shell` | `Bash` |
+| `run_tests` | `Bash` 的受控场景或内部 helper |
+| `git_diff` | `Bash` / `Read` 的受控场景或内部 helper |
+
+后置工具:
+
+- `TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList`:任务状态和 TUI 展示成熟后。
+- `Agent`:SubAgent 机制成熟后。
+- `AskUserQuestion`:TUI、CLI、eval 下的交互语义统一后。
 
 ### 5.5 Event
 

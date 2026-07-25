@@ -250,9 +250,8 @@ v1 可选:
 - `agent` crate。
 - `flash run "<task>"`。
 - reasoning/text 流式输出。
-- shell tool。
-- read_file tool。
-- search tool。
+- Agent 可见工具雏形:`Read`、`ListFiles`、`Bash`。
+- 内部兼容实现:`read_file`、`search`、`shell`。
 - confirm/yolo/human 三种模式的最小实现。
 - 工具 stdout/stderr 写入 events,长输出写入 artifacts。
 - 顺序 Agent loop:模型 -> tool approval -> tool execution -> tool result -> 继续模型。
@@ -260,7 +259,7 @@ v1 可选:
 验收标准:
 
 - mock DeepSeek streaming 测试覆盖 reasoning delta、text delta、tool call、usage、done。
-- `flash run "list files"` 能触发 shell 或 search tool 并结束。
+- `flash run "list files"` 能触发 `ListFiles` 或兼容 search tool 并结束。
 - tool call 成功、失败、拒绝、取消都会产生 tool result。
 - 每轮 loop 都受 `max_turns` 限制,超限后 session 明确失败并写入 event。
 - v1 不执行 parallel tool calls;多个 tool call 按稳定顺序执行并写入 event。
@@ -275,9 +274,8 @@ v1 可选:
 
 交付:
 
-- write_file 或 apply_patch tool。
-- git diff tool。
-- test runner tool。
+- Agent 可见工具:`Read`、`Edit`、`Write`、`Glob`、`Grep`、`ListFiles`、`Bash`。
+- 内部兼容实现:`apply_patch`、`write_file`、`git_diff`、`run_tests`。
 - workspace 写入边界校验。
 - 简单 prompt projection/token budget。
 - 简单上下文过长处理:报错或保留最近消息,不做复杂 compaction。
@@ -499,6 +497,7 @@ flash chat
 - [架构方案](architecture.md):模块边界和核心协议。
 - [数据流转方案](data_flow.md):streaming、tool、event、replay 的流转。
 - [本地存储方案](storage.md):v1 session 文件结构。
+- [Agent 工具协议](tool_protocol.md):暴露给 Agent 的稳定工具名和权限语义。
 
 后续需要时再拆:
 
