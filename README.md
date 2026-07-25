@@ -23,3 +23,9 @@ Current planning document:
 - [Flash Code 数据流转方案](docs/data_flow.md)
 - [Flash Code 本地存储方案](docs/storage.md)
 - [Flash Code Agent 工具协议](docs/tool_protocol.md)
+
+Local quality gate:
+
+```bash
+scripts/check.sh
+```

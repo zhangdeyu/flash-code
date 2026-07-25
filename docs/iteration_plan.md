@@ -36,8 +36,9 @@
 - 0.4.3 TUI Approval 与 Resume。
 - 0.5.1 协议与存储测试加固。
 - 0.5.2 Tool 与 Permission 测试加固。
+- 0.5.3 Agent 与 TUI 测试加固。
 
-下一阶段从 0.5.3 Agent 与 TUI 测试加固开始。0.4 之后不重新设计 runtime,只把 TUI 作为 `Event` 的消费者和 `UserAction` 的生产者接入现有 Agent runtime。
+下一阶段从 0.6 Terminal-Bench Smoke 开始。0.4 之后不重新设计 runtime,只把 TUI 作为 `Event` 的消费者和 `UserAction` 的生产者接入现有 Agent runtime。
 
 ## 1.2 执行节奏
 

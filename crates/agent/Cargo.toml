@@ -12,5 +12,8 @@ path = "src/lib.rs"
 flash-core = { path = "../core" }
 flash-provider = { path = "../provider" }
 
+[dev-dependencies]
+flash-tools = { path = "../tools" }
+
 [lints]
 workspace = true

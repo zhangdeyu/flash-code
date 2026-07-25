@@ -1216,6 +1216,197 @@ mod tests {
     }
 
     #[test]
+    fn mock_provider_scenarios_should_cover_loop_outcomes() {
+        let scenarios = [
+            (
+                "success",
+                AgentRuntime::new(
+                    SmokeProvider::new(),
+                    flash_tools_for_tests(),
+                    AgentOptions {
+                        model: "smoke".to_string(),
+                        max_turns: 3,
+                        permission_policy: PermissionPolicy::new(
+                            flash_core::tools::ApprovalMode::Confirm,
+                        ),
+                        max_output_bytes: 200_000,
+                        max_prompt_bytes: 200_000,
+                    },
+                )
+                .run_task(&prepared_workspace("scenario_success"), "list files")
+                .unwrap()
+                .outcome,
+                Outcome::Succeeded,
+            ),
+            (
+                "unknown_tool",
+                AgentRuntime::new(
+                    UnknownToolProvider,
+                    ToolRegistry::new(),
+                    AgentOptions {
+                        model: "smoke".to_string(),
+                        max_turns: 1,
+                        permission_policy: PermissionPolicy::new(
+                            flash_core::tools::ApprovalMode::Yolo,
+                        ),
+                        max_output_bytes: 200_000,
+                        max_prompt_bytes: 200_000,
+                    },
+                )
+                .run_task(
+                    &prepared_workspace("scenario_unknown_tool"),
+                    "use missing tool",
+                )
+                .unwrap()
+                .outcome,
+                Outcome::Failed,
+            ),
+            (
+                "tool_failure",
+                {
+                    let root = prepared_workspace("scenario_tool_failure");
+                    let mut registry = ToolRegistry::new();
+                    registry.register(Box::new(ErrorTool)).unwrap();
+                    AgentRuntime::new(
+                        ErrorToolProvider,
+                        registry,
+                        AgentOptions {
+                            model: "smoke".to_string(),
+                            max_turns: 1,
+                            permission_policy: PermissionPolicy::new(
+                                flash_core::tools::ApprovalMode::Yolo,
+                            ),
+                            max_output_bytes: 200_000,
+                            max_prompt_bytes: 200_000,
+                        },
+                    )
+                    .run_task(&root, "error")
+                    .unwrap()
+                    .outcome
+                },
+                Outcome::Failed,
+            ),
+            (
+                "max_turns",
+                AgentRuntime::new(
+                    LoopProvider,
+                    flash_tools_for_tests(),
+                    AgentOptions {
+                        model: "smoke".to_string(),
+                        max_turns: 1,
+                        permission_policy: PermissionPolicy::new(
+                            flash_core::tools::ApprovalMode::Confirm,
+                        ),
+                        max_output_bytes: 200_000,
+                        max_prompt_bytes: 200_000,
+                    },
+                )
+                .run_task(&prepared_workspace("scenario_max_turns"), "loop")
+                .unwrap()
+                .outcome,
+                Outcome::Failed,
+            ),
+            (
+                "cancel",
+                {
+                    let root = prepared_workspace("scenario_cancel");
+                    let mut runtime = AgentRuntime::new(
+                        SmokeProvider::new(),
+                        flash_tools_for_tests(),
+                        AgentOptions {
+                            model: "smoke".to_string(),
+                            max_turns: 3,
+                            permission_policy: PermissionPolicy::new(
+                                flash_core::tools::ApprovalMode::Confirm,
+                            ),
+                            max_output_bytes: 200_000,
+                            max_prompt_bytes: 200_000,
+                        },
+                    );
+                    let mut observer = NoopObserver;
+                    runtime
+                        .run_task_controlled(&root, "list files", &mut observer, || true)
+                        .unwrap()
+                        .outcome
+                },
+                Outcome::Cancelled,
+            ),
+        ];
+
+        for (name, actual, expected) in scenarios {
+            assert_eq!(actual, expected, "scenario {name}");
+        }
+    }
+
+    #[test]
+    fn rust_fixture_smoke_should_fix_failing_test_and_keep_diff() {
+        let root = temp_dir("fixture_fix");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fixture_fix\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn answer() -> i32 {\n    41\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn answer_should_be_42() {\n        assert_eq!(answer(), 42);\n    }\n}\n",
+        )
+        .unwrap();
+        let git_init = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(git_init.status.success());
+        let git_add = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(git_add.status.success());
+        let git_commit = std::process::Command::new("git")
+            .args(["commit", "-m", "baseline"])
+            .env("GIT_AUTHOR_NAME", "Flash Test")
+            .env("GIT_AUTHOR_EMAIL", "flash@example.com")
+            .env("GIT_COMMITTER_NAME", "Flash Test")
+            .env("GIT_COMMITTER_EMAIL", "flash@example.com")
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(git_commit.status.success());
+        let mut runtime = AgentRuntime::new(
+            SmokeProvider::new(),
+            flash_tools::builtin_registry().unwrap(),
+            AgentOptions {
+                model: "smoke".to_string(),
+                max_turns: 8,
+                permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Yolo),
+                max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
+            },
+        );
+
+        let run = runtime.run_task(&root, "fix failing tests").unwrap();
+
+        assert_eq!(run.outcome, Outcome::Succeeded);
+        let test_output = std::process::Command::new("cargo")
+            .arg("test")
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(test_output.status.success());
+        let diff = std::process::Command::new("git")
+            .args(["diff", "--", "src/lib.rs"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&diff.stdout).contains("+    42"),
+            "diff should include the fixture fix"
+        );
+    }
+
+    #[test]
     fn run_task_controlled_should_cancel_without_committing_assistant_message() {
         let root = temp_dir("controlled_cancel");
         fs::create_dir_all(&root).unwrap();
@@ -1523,6 +1714,13 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("flash_agent_{name}_{nanos}"))
+    }
+
+    fn prepared_workspace(name: &str) -> PathBuf {
+        let root = temp_dir(name);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+        root
     }
 
     fn test_message(text: &str) -> Message {

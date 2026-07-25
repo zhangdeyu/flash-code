@@ -1022,6 +1022,35 @@ mod tests {
     }
 
     #[test]
+    fn render_to_string_should_match_key_state_snapshot() {
+        let events = [
+            r#"{"event":{"type":"assistant_delta","text":"streaming answer"}}"#,
+            r#"{"event":{"type":"reasoning_delta","text":"inspect workspace"}}"#,
+            r#"{"event":{"type":"tool_call_requested","call_id":"call_1","name":"Bash"}}"#,
+            r#"{"event":{"type":"tool_output_delta","call_id":"call_1","stream":"stdout","text":"test ok"}}"#,
+            r#"{"event":{"type":"approval_resolved","call_id":"call_1","approved":true}}"#,
+            r#"{"event":{"type":"error","message":"sample error"}}"#,
+        ];
+        let mut state = AppState::from_events(PathBuf::from("/tmp/project"), &events);
+        state.status = RunStatus::Running;
+        state.current_session_id = Some("session_snapshot".to_string());
+        state.permission_mode = "confirm".to_string();
+        state.pending_approval = Some(ApprovalPrompt {
+            call_id: "call_2".to_string(),
+            name: "Edit".to_string(),
+            input: "src/lib.rs".to_string(),
+            risk: "Write".to_string(),
+        });
+
+        let output = render_to_string(&state, 72, 22);
+
+        assert_eq!(
+            output,
+            include_str!("../tests/golden/key_state_snapshot.txt")
+        );
+    }
+
+    #[test]
     fn render_to_string_should_keep_rows_within_width() {
         let events =
             [r#"{"event":{"type":"assistant_delta","text":"averyveryveryveryveryverylongtoken"}}"#];
