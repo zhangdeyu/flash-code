@@ -17,6 +17,7 @@ dependencies = [
  "flash-agent",
  "flash-core",
  "flash-tools",
+ "flash-tui",
 ]
 
 [[package]]
@@ -39,6 +40,13 @@ dependencies = [
 
 [[package]]
 name = "flash-tools"
+version = "0.1.0"
+dependencies = [
+ "flash-core",
+]
+
+[[package]]
+name = "flash-tui"
 version = "0.1.0"
 dependencies = [
  "flash-core",

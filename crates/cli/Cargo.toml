@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 flash-agent = { path = "../agent" }
 flash-core = { path = "../core" }
+flash-tui = { path = "../tui" }
 flash-tools = { path = "../tools" }
 
 [lints]

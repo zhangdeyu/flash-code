@@ -8,6 +8,11 @@ The project command is:
 flash
 ```
 
+Current default behavior:
+
+- `flash`: enters the TUI shell for the current workspace.
+- `flash run "<task>"`: runs one headless Agent task for automation and evaluation.
+
 Current planning document:
 
 - [Flash Code 渐进式迭代计划](docs/iteration_plan.md)

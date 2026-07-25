@@ -31,8 +31,9 @@
 - 0.2 Headless Agent loop。
 - 0.3 代码修改能力。
 - 0.3.x 工具协议收敛。
+- 0.4.1 TUI Shell 与事件渲染。
 
-下一阶段从 0.4 TUI MVP 开始。0.4 之后不重新设计 runtime,只把 TUI 作为 `Event` 的消费者和 `UserAction` 的生产者接入现有 Agent runtime。
+下一阶段从 0.4.2 TUI Session 与输入流开始。0.4 之后不重新设计 runtime,只把 TUI 作为 `Event` 的消费者和 `UserAction` 的生产者接入现有 Agent runtime。
 
 ## 1.2 执行节奏
 

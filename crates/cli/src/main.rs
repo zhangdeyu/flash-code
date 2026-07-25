@@ -17,10 +17,7 @@ fn main() {
 
 fn run(args: Vec<String>) -> Result<(), CliError> {
     match args.first().map(String::as_str) {
-        None => {
-            print_help();
-            Ok(())
-        }
+        None => flash_tui::run_current_workspace().map_err(CliError::Tui),
         Some("--version" | "-V") => {
             println!("flash {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -30,10 +27,7 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         Some("run") => run_task(&args[1..]),
         Some("replay") => replay(&args[1..]),
         Some("resume") => resume(&args[1..]),
-        Some("tui") => {
-            println!("TUI is planned for 0.4. Use `flash run \"<task>\"` for 0.1-0.3.");
-            Ok(())
-        }
+        Some("tui") => flash_tui::run_current_workspace().map_err(CliError::Tui),
         Some("help" | "--help" | "-h") => {
             print_help();
             Ok(())
@@ -144,11 +138,12 @@ fn print_help() {
         "flash 0.1\n\n",
         "Usage:\n",
         "  flash init\n",
+        "  flash tui\n",
         "  flash doctor\n",
         "  flash run \"<task>\"\n",
         "  flash replay <events.jsonl>\n",
         "  flash resume <session_id>\n\n",
-        "In 0.4, running `flash` without a subcommand will enter the TUI.\n"
+        "Running `flash` without a subcommand enters the TUI.\n"
     ));
 }
 
@@ -158,6 +153,7 @@ enum CliError {
     Agent(flash_agent::AgentError),
     Storage(flash_core::storage::StorageError),
     ToolRegistry(flash_core::tools::ToolRegistryError),
+    Tui(flash_tui::TuiError),
     Workspace(flash_core::WorkspaceError),
     Usage(String),
 }
@@ -169,6 +165,7 @@ impl std::fmt::Display for CliError {
             Self::Agent(error) => write!(formatter, "{error}"),
             Self::Storage(error) => write!(formatter, "{error}"),
             Self::ToolRegistry(error) => write!(formatter, "{error}"),
+            Self::Tui(error) => write!(formatter, "{error}"),
             Self::Workspace(error) => write!(formatter, "{error}"),
             Self::Usage(message) => write!(formatter, "{message}"),
         }

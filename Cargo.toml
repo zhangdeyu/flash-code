@@ -5,6 +5,7 @@ members = [
     "crates/deepseek",
     "crates/tools",
     "crates/agent",
+    "crates/tui",
     "crates/cli",
 ]
 resolver = "2"
