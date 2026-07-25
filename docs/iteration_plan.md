@@ -21,6 +21,7 @@
 | 0.7 | SWE-bench Verified Smoke | 接入真实 issue 修复类评测 |
 | 0.7.x | SubAgent / Task / AskUser 评估点 | 仅在单 Agent loop 和 TUI 状态模型不足时引入 |
 | 0.8 | 回归评测与报告 | 形成 release 前防退化机制 |
+| 0.9 | 现代 Rust 栈重构与 API 真实接入 | 全面迁移至 `tokio` + `clap` + `serde` + `reqwest` + `ratatui` + `crossterm` 栈，接入真实 DeepSeek API 流式响应与高颜终端 UI |
 | 1.0 | 日常可用版本 | TUI、CLI、session、评测路径完整可用 |
 
 ## 1.1 当前状态
@@ -44,8 +45,10 @@
 - 0.7.2 SWE-bench Verified Smoke。
 - 0.7.x SubAgent / Task / AskUser 评估点:未触发实现条件,继续不实现复杂交互工具。
 - 0.8 回归评测与报告。
+- 0.9.1 接口收敛与 ToolUse 扩展: `ChatProvider` Callback 流式接口重构与 `ToolSpec` JSON Schema 补齐。
 
-下一阶段从 1.0 日常可用版本开始。0.4 之后不重新设计 runtime,只把 TUI 作为 `Event` 的消费者和 `UserAction` 的生产者接入现有 Agent runtime。
+当前进行中:
+- 0.9 现代 Rust 生态重构（详细方案参见 `docs/technical_plan_0_9_rearchitecture.md`）。
 
 ## 1.2 执行节奏
 
