@@ -81,6 +81,7 @@ fn run_task(args: &[String]) -> Result<(), CliError> {
             max_turns: config.max_turns,
             permission_policy: PermissionPolicy::new(config.approval_mode),
             max_output_bytes: config.shell_max_output_bytes,
+            max_prompt_bytes: 200_000,
         },
     );
     let run = runtime.run_task(&root, task)?;

@@ -22,6 +22,7 @@ pub struct AgentOptions {
     pub max_turns: u32,
     pub permission_policy: PermissionPolicy,
     pub max_output_bytes: usize,
+    pub max_prompt_bytes: usize,
 }
 
 impl<P> AgentRuntime<P>
@@ -53,7 +54,7 @@ where
                 },
             )?;
             let request = ChatRequest {
-                messages: history.clone(),
+                messages: project_history(&history, self.options.max_prompt_bytes),
                 tools: self
                     .tools
                     .names()
@@ -448,6 +449,33 @@ fn truncate(value: &str, max_bytes: usize) -> String {
     format!("{truncated}...[truncated]")
 }
 
+fn project_history(history: &[Message], max_bytes: usize) -> Vec<Message> {
+    let mut projected = Vec::new();
+    let mut used = 0;
+    for message in history.iter().rev() {
+        let size = message_size(message);
+        if !projected.is_empty() && used + size > max_bytes {
+            break;
+        }
+        used += size;
+        projected.push(message.clone());
+    }
+    projected.reverse();
+    projected
+}
+
+fn message_size(message: &Message) -> usize {
+    message
+        .content
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text { text } | ContentBlock::Reasoning { text } => text.len(),
+            ContentBlock::ToolUse { call_id, name } => call_id.len() + name.len(),
+            ContentBlock::ToolResult { call_id, .. } => call_id.len(),
+        })
+        .sum()
+}
+
 pub struct SmokeProvider {
     turn: u32,
 }
@@ -471,6 +499,7 @@ impl ChatProvider for SmokeProvider {
             .messages
             .iter()
             .any(|message| matches!(message.role, Role::Tool))
+            && !latest_user_task(&request).contains("fix failing tests")
         {
             return Ok(vec![
                 ProviderEvent::TextDelta("Done.".to_string()),
@@ -481,21 +510,10 @@ impl ChatProvider for SmokeProvider {
                 ProviderEvent::Done(StopReason::EndTurn),
             ]);
         }
-        let task = request
-            .messages
-            .iter()
-            .rev()
-            .find_map(|message| {
-                if message.role == Role::User {
-                    message.content.iter().find_map(|block| match block {
-                        ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
+        let task = latest_user_task(&request);
+        if task.contains("fix failing tests") {
+            return Ok(fix_failing_tests_events(tool_result_count(&request)));
+        }
         if task.contains("list files") {
             return Ok(vec![
                 ProviderEvent::ReasoningDelta("Need inspect workspace files.".to_string()),
@@ -516,6 +534,87 @@ impl ChatProvider for SmokeProvider {
             ProviderEvent::TextDelta("Task stored for the next runtime stage.".to_string()),
             ProviderEvent::Done(StopReason::EndTurn),
         ])
+    }
+}
+
+fn latest_user_task(request: &ChatRequest) -> &str {
+    request
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| {
+            if message.role == Role::User {
+                message.content.iter().find_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn tool_result_count(request: &ChatRequest) -> usize {
+    request
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::Tool)
+        .count()
+}
+
+fn fix_failing_tests_events(tool_results: usize) -> Vec<ProviderEvent> {
+    match tool_results {
+        0 => vec![
+            ProviderEvent::ReasoningDelta("Inspect the failing Rust source.".to_string()),
+            ProviderEvent::TextDelta("I will inspect the source before editing.".to_string()),
+            ProviderEvent::ToolCallComplete(ToolCall {
+                call_id: "call_read_1".to_string(),
+                name: "read_file".to_string(),
+                input: "src/lib.rs".to_string(),
+            }),
+            ProviderEvent::Done(StopReason::ToolUse),
+        ],
+        1 => vec![
+            ProviderEvent::TextDelta(
+                "I found the incorrect constant and will patch it.".to_string(),
+            ),
+            ProviderEvent::ToolCallComplete(ToolCall {
+                call_id: "call_patch_1".to_string(),
+                name: "apply_patch".to_string(),
+                input: concat!(
+                    "src/lib.rs\n",
+                    "---FIND---\n",
+                    "pub fn answer() -> i32 {\n    41\n}\n",
+                    "---REPLACE---\n",
+                    "pub fn answer() -> i32 {\n    42\n}\n"
+                )
+                .to_string(),
+            }),
+            ProviderEvent::Done(StopReason::ToolUse),
+        ],
+        2 => vec![
+            ProviderEvent::TextDelta("Now I will run the test suite.".to_string()),
+            ProviderEvent::ToolCallComplete(ToolCall {
+                call_id: "call_tests_1".to_string(),
+                name: "run_tests".to_string(),
+                input: "cargo test".to_string(),
+            }),
+            ProviderEvent::Done(StopReason::ToolUse),
+        ],
+        3 => vec![
+            ProviderEvent::TextDelta("Tests passed; I will collect the diff.".to_string()),
+            ProviderEvent::ToolCallComplete(ToolCall {
+                call_id: "call_diff_1".to_string(),
+                name: "git_diff".to_string(),
+                input: String::new(),
+            }),
+            ProviderEvent::Done(StopReason::ToolUse),
+        ],
+        _ => vec![
+            ProviderEvent::TextDelta("Fixed the failing test and verified the diff.".to_string()),
+            ProviderEvent::Done(StopReason::EndTurn),
+        ],
     }
 }
 
@@ -542,6 +641,7 @@ mod tests {
                 max_turns: 3,
                 permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Confirm),
                 max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
             },
         );
 
@@ -562,6 +662,7 @@ mod tests {
                 max_turns: 1,
                 permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Yolo),
                 max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
             },
         );
 
@@ -582,6 +683,7 @@ mod tests {
                 max_turns: 1,
                 permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Yolo),
                 max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
             },
         );
 
@@ -602,6 +704,7 @@ mod tests {
                 max_turns: 1,
                 permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Confirm),
                 max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
             },
         );
 
@@ -622,6 +725,7 @@ mod tests {
                 max_turns: 1,
                 permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Yolo),
                 max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
             },
         );
 
@@ -644,6 +748,7 @@ mod tests {
                 max_turns: 1,
                 permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Yolo),
                 max_output_bytes: 4,
+                max_prompt_bytes: 200_000,
             },
         );
 
@@ -671,6 +776,7 @@ mod tests {
                 max_turns: 1,
                 permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Yolo),
                 max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
             },
         );
 
@@ -700,6 +806,7 @@ mod tests {
                 max_turns: 1,
                 permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Confirm),
                 max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
             },
         );
 
@@ -729,6 +836,7 @@ mod tests {
                 max_turns: 1,
                 permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Yolo),
                 max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
             },
         );
 
@@ -742,6 +850,16 @@ mod tests {
         )
         .unwrap();
         assert!(messages.contains("\"status\":\"cancelled\""));
+    }
+
+    #[test]
+    fn project_history_should_keep_recent_messages_within_budget() {
+        let old = test_message("old text");
+        let recent = test_message("new");
+
+        let projected = project_history(&[old, recent.clone()], 3);
+
+        assert_eq!(projected, vec![recent]);
     }
 
     struct UnknownToolProvider;
@@ -972,5 +1090,16 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("flash_agent_{name}_{nanos}"))
+    }
+
+    fn test_message(text: &str) -> Message {
+        Message {
+            id: text.to_string(),
+            role: Role::User,
+            created_at: "0".to_string(),
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+        }
     }
 }
