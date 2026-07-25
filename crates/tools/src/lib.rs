@@ -11,6 +11,13 @@ use flash_core::{
 
 pub fn builtin_registry() -> Result<ToolRegistry, flash_core::tools::ToolRegistryError> {
     let mut registry = ToolRegistry::new();
+    registry.register(Box::new(ReadTool))?;
+    registry.register(Box::new(EditTool))?;
+    registry.register(Box::new(WriteTool))?;
+    registry.register(Box::new(GlobTool))?;
+    registry.register(Box::new(GrepTool))?;
+    registry.register(Box::new(ListFilesTool))?;
+    registry.register(Box::new(BashTool::default()))?;
     registry.register(Box::new(SearchTool))?;
     registry.register(Box::new(ReadFileTool))?;
     registry.register(Box::new(ShellTool::default()))?;
@@ -19,6 +26,183 @@ pub fn builtin_registry() -> Result<ToolRegistry, flash_core::tools::ToolRegistr
     registry.register(Box::new(GitDiffTool))?;
     registry.register(Box::new(RunTestsTool::default()))?;
     Ok(registry)
+}
+
+pub struct ReadTool;
+
+impl Tool for ReadTool {
+    fn name(&self) -> &str {
+        "Read"
+    }
+
+    fn risk(&self, _input: &str) -> ToolRisk {
+        ToolRisk::Read
+    }
+
+    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
+        read_file(input, context)
+    }
+}
+
+pub struct EditTool;
+
+impl Tool for EditTool {
+    fn name(&self) -> &str {
+        "Edit"
+    }
+
+    fn risk(&self, _input: &str) -> ToolRisk {
+        ToolRisk::Write
+    }
+
+    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
+        apply_replace_patch(input, context)
+    }
+}
+
+pub struct WriteTool;
+
+impl Tool for WriteTool {
+    fn name(&self) -> &str {
+        "Write"
+    }
+
+    fn risk(&self, _input: &str) -> ToolRisk {
+        ToolRisk::Write
+    }
+
+    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
+        write_file(input, context)
+    }
+}
+
+pub struct GlobTool;
+
+impl Tool for GlobTool {
+    fn name(&self) -> &str {
+        "Glob"
+    }
+
+    fn risk(&self, _input: &str) -> ToolRisk {
+        ToolRisk::Read
+    }
+
+    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let pattern = input.trim();
+        let mut matches = Vec::new();
+        visit_files(&context.workspace_root, &mut |path| {
+            if matches.len() >= 200 {
+                return;
+            }
+            let relative = path.strip_prefix(&context.workspace_root).unwrap_or(path);
+            let relative_text = relative.display().to_string();
+            if glob_match(pattern, &relative_text) {
+                matches.push(relative_text);
+            }
+        })?;
+        Ok(ToolOutput::success(matches.join("\n")))
+    }
+}
+
+pub struct GrepTool;
+
+impl Tool for GrepTool {
+    fn name(&self) -> &str {
+        "Grep"
+    }
+
+    fn risk(&self, _input: &str) -> ToolRisk {
+        ToolRisk::Read
+    }
+
+    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let needle = input.trim();
+        let mut matches = Vec::new();
+        visit_files(&context.workspace_root, &mut |path| {
+            if matches.len() >= 200 {
+                return;
+            }
+            let Ok(content) = fs::read_to_string(path) else {
+                return;
+            };
+            for (line_index, line) in content.lines().enumerate() {
+                if line.contains(needle) {
+                    let relative = path.strip_prefix(&context.workspace_root).unwrap_or(path);
+                    matches.push(format!(
+                        "{}:{}:{}",
+                        relative.display(),
+                        line_index + 1,
+                        line
+                    ));
+                }
+            }
+        })?;
+        Ok(ToolOutput::success(matches.join("\n")))
+    }
+}
+
+pub struct ListFilesTool;
+
+impl Tool for ListFilesTool {
+    fn name(&self) -> &str {
+        "ListFiles"
+    }
+
+    fn risk(&self, _input: &str) -> ToolRisk {
+        ToolRisk::Read
+    }
+
+    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let path = if input.trim().is_empty() || input.trim() == "." {
+            context.workspace_root.clone()
+        } else {
+            workspace_path(&context.workspace_root, input)?
+        };
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(&path)
+            .map_err(|error| ToolError::new(format!("failed to list files: {error}")))?
+        {
+            let entry =
+                entry.map_err(|error| ToolError::new(format!("failed to list files: {error}")))?;
+            let entry_path = entry.path();
+            let Some(name) = entry_path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name == ".git" || name == "target" || name == ".flash" {
+                continue;
+            }
+            let suffix = if entry_path.is_dir() { "/" } else { "" };
+            entries.push(format!("{name}{suffix}"));
+        }
+        entries.sort();
+        Ok(ToolOutput::success(entries.join("\n")))
+    }
+}
+
+pub struct BashTool {
+    timeout: Duration,
+}
+
+impl Default for BashTool {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(120),
+        }
+    }
+}
+
+impl Tool for BashTool {
+    fn name(&self) -> &str {
+        "Bash"
+    }
+
+    fn risk(&self, input: &str) -> ToolRisk {
+        command_risk(input)
+    }
+
+    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
+        shell_output(input, &context.workspace_root, self.timeout)
+    }
 }
 
 pub struct SearchTool;
@@ -68,10 +252,7 @@ impl Tool for ReadFileTool {
     }
 
     fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let path = workspace_path(&context.workspace_root, input)?;
-        let content = fs::read_to_string(path)
-            .map_err(|error| ToolError::new(format!("failed to read file: {error}")))?;
-        Ok(ToolOutput::success(content))
+        read_file(input, context)
     }
 }
 
@@ -91,24 +272,7 @@ impl Tool for ApplyPatchTool {
     }
 
     fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let patch = ReplacePatch::parse(input)?;
-        let path = existing_workspace_path(&context.workspace_root, patch.path)?;
-        let content = fs::read_to_string(&path)
-            .map_err(|error| ToolError::new(format!("failed to read patch target: {error}")))?;
-        if !content.contains(patch.find) {
-            return Err(ToolError::new("apply_patch failed: find text not found"));
-        }
-        let updated = content.replacen(patch.find, patch.replace, 1);
-        fs::write(&path, updated)
-            .map_err(|error| ToolError::new(format!("failed to write patch target: {error}")))?;
-        let root = context
-            .workspace_root
-            .canonicalize()
-            .map_err(|error| ToolError::new(format!("invalid workspace root: {error}")))?;
-        Ok(ToolOutput::success(format!(
-            "patched {}",
-            path.strip_prefix(&root).unwrap_or(&path).display()
-        )))
+        apply_replace_patch(input, context)
     }
 }
 
@@ -124,22 +288,7 @@ impl Tool for WriteFileTool {
     }
 
     fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let Some((path_text, content)) = input.split_once("\n---CONTENT---\n") else {
-            return Err(ToolError::new(
-                "write_file input must be `<path>\\n---CONTENT---\\n<content>`",
-            ));
-        };
-        let path = writable_workspace_path(&context.workspace_root, path_text)?;
-        fs::write(&path, content)
-            .map_err(|error| ToolError::new(format!("failed to write file: {error}")))?;
-        let root = context
-            .workspace_root
-            .canonicalize()
-            .map_err(|error| ToolError::new(format!("invalid workspace root: {error}")))?;
-        Ok(ToolOutput::success(format!(
-            "wrote {}",
-            path.strip_prefix(&root).unwrap_or(&path).display()
-        )))
+        write_file(input, context)
     }
 }
 
@@ -204,20 +353,96 @@ impl Tool for ShellTool {
     }
 
     fn risk(&self, input: &str) -> ToolRisk {
-        let command = input.trim();
-        if command.contains("rm -rf")
-            || command.starts_with("rm ")
-            || command.contains(" shutdown")
-            || command.contains(" mkfs")
-        {
-            ToolRisk::Destructive
-        } else {
-            ToolRisk::Execute
-        }
+        command_risk(input)
     }
 
     fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
         shell_output(input, &context.workspace_root, self.timeout)
+    }
+}
+
+fn read_file(input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
+    let path = workspace_path(&context.workspace_root, input)?;
+    let content = fs::read_to_string(path)
+        .map_err(|error| ToolError::new(format!("failed to read file: {error}")))?;
+    Ok(ToolOutput::success(content))
+}
+
+fn apply_replace_patch(input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
+    let patch = ReplacePatch::parse(input)?;
+    let path = existing_workspace_path(&context.workspace_root, patch.path)?;
+    let content = fs::read_to_string(&path)
+        .map_err(|error| ToolError::new(format!("failed to read patch target: {error}")))?;
+    if !content.contains(patch.find) {
+        return Err(ToolError::new("apply_patch failed: find text not found"));
+    }
+    let updated = content.replacen(patch.find, patch.replace, 1);
+    fs::write(&path, updated)
+        .map_err(|error| ToolError::new(format!("failed to write patch target: {error}")))?;
+    let root = context
+        .workspace_root
+        .canonicalize()
+        .map_err(|error| ToolError::new(format!("invalid workspace root: {error}")))?;
+    Ok(ToolOutput::success(format!(
+        "patched {}",
+        path.strip_prefix(&root).unwrap_or(&path).display()
+    )))
+}
+
+fn write_file(input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
+    let Some((path_text, content)) = input.split_once("\n---CONTENT---\n") else {
+        return Err(ToolError::new(
+            "write_file input must be `<path>\\n---CONTENT---\\n<content>`",
+        ));
+    };
+    let path = writable_workspace_path(&context.workspace_root, path_text)?;
+    fs::write(&path, content)
+        .map_err(|error| ToolError::new(format!("failed to write file: {error}")))?;
+    let root = context
+        .workspace_root
+        .canonicalize()
+        .map_err(|error| ToolError::new(format!("invalid workspace root: {error}")))?;
+    Ok(ToolOutput::success(format!(
+        "wrote {}",
+        path.strip_prefix(&root).unwrap_or(&path).display()
+    )))
+}
+
+fn command_risk(input: &str) -> ToolRisk {
+    let command = input.trim();
+    if command.contains("rm -rf")
+        || command.starts_with("rm ")
+        || command.contains(" shutdown")
+        || command.contains(" mkfs")
+    {
+        ToolRisk::Destructive
+    } else {
+        ToolRisk::Execute
+    }
+}
+
+fn glob_match(pattern: &str, path: &str) -> bool {
+    if pattern.is_empty() || pattern == "*" || pattern == "**/*" {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix("**/*") {
+        return path.ends_with(suffix);
+    }
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        return path.starts_with(prefix);
+    }
+    if pattern.contains('*') {
+        let parts = pattern.split('*').filter(|part| !part.is_empty());
+        let mut remainder = path;
+        for part in parts {
+            let Some(index) = remainder.find(part) else {
+                return false;
+            };
+            remainder = &remainder[index + part.len()..];
+        }
+        true
+    } else {
+        path == pattern || path.contains(pattern)
     }
 }
 
@@ -384,6 +609,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn builtin_registry_should_expose_new_protocol_names_and_legacy_aliases() {
+        let registry = builtin_registry().unwrap();
+
+        assert!(registry.get("Read").is_some());
+        assert!(registry.get("read_file").is_some());
+    }
+
+    #[test]
     fn search_should_find_workspace_files() {
         let root = temp_dir("search");
         fs::create_dir_all(root.join("src")).unwrap();
@@ -400,6 +633,63 @@ mod tests {
             .unwrap();
 
         assert!(output.stdout.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn list_files_should_list_directory_entries() {
+        let root = temp_dir("list_files");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("Cargo.toml"), "").unwrap();
+        let tool = ListFilesTool;
+
+        let output = tool
+            .call(
+                ".",
+                &ToolContext {
+                    workspace_root: root,
+                },
+            )
+            .unwrap();
+
+        assert!(output.stdout.contains("src/"));
+    }
+
+    #[test]
+    fn glob_should_match_file_patterns() {
+        let root = temp_dir("glob");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+        let tool = GlobTool;
+
+        let output = tool
+            .call(
+                "**/*.rs",
+                &ToolContext {
+                    workspace_root: root,
+                },
+            )
+            .unwrap();
+
+        assert!(output.stdout.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn grep_should_search_file_contents() {
+        let root = temp_dir("grep");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 42 }").unwrap();
+        let tool = GrepTool;
+
+        let output = tool
+            .call(
+                "answer",
+                &ToolContext {
+                    workspace_root: root,
+                },
+            )
+            .unwrap();
+
+        assert!(output.stdout.contains("src/lib.rs:1"));
     }
 
     #[test]
@@ -428,6 +718,25 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 41 }\n").unwrap();
         let tool = ApplyPatchTool;
+
+        let output = tool
+            .call(
+                "src/lib.rs\n---FIND---\n41\n---REPLACE---\n42",
+                &ToolContext {
+                    workspace_root: root,
+                },
+            )
+            .unwrap();
+
+        assert!(output.stdout.contains("patched src/lib.rs"));
+    }
+
+    #[test]
+    fn edit_should_replace_text_inside_workspace() {
+        let root = temp_dir("edit");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 41 }\n").unwrap();
+        let tool = EditTool;
 
         let output = tool
             .call(

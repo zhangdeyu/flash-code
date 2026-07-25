@@ -519,8 +519,8 @@ impl ChatProvider for SmokeProvider {
                 ProviderEvent::ReasoningDelta("Need inspect workspace files.".to_string()),
                 ProviderEvent::TextDelta("I will list matching files.".to_string()),
                 ProviderEvent::ToolCallComplete(ToolCall {
-                    call_id: "call_search_1".to_string(),
-                    name: "search".to_string(),
+                    call_id: "call_list_files_1".to_string(),
+                    name: "ListFiles".to_string(),
                     input: ".".to_string(),
                 }),
                 ProviderEvent::Usage(Usage {
@@ -570,7 +570,7 @@ fn fix_failing_tests_events(tool_results: usize) -> Vec<ProviderEvent> {
             ProviderEvent::TextDelta("I will inspect the source before editing.".to_string()),
             ProviderEvent::ToolCallComplete(ToolCall {
                 call_id: "call_read_1".to_string(),
-                name: "read_file".to_string(),
+                name: "Read".to_string(),
                 input: "src/lib.rs".to_string(),
             }),
             ProviderEvent::Done(StopReason::ToolUse),
@@ -581,7 +581,7 @@ fn fix_failing_tests_events(tool_results: usize) -> Vec<ProviderEvent> {
             ),
             ProviderEvent::ToolCallComplete(ToolCall {
                 call_id: "call_patch_1".to_string(),
-                name: "apply_patch".to_string(),
+                name: "Edit".to_string(),
                 input: concat!(
                     "src/lib.rs\n",
                     "---FIND---\n",
@@ -597,7 +597,7 @@ fn fix_failing_tests_events(tool_results: usize) -> Vec<ProviderEvent> {
             ProviderEvent::TextDelta("Now I will run the test suite.".to_string()),
             ProviderEvent::ToolCallComplete(ToolCall {
                 call_id: "call_tests_1".to_string(),
-                name: "run_tests".to_string(),
+                name: "Bash".to_string(),
                 input: "cargo test".to_string(),
             }),
             ProviderEvent::Done(StopReason::ToolUse),
@@ -606,8 +606,8 @@ fn fix_failing_tests_events(tool_results: usize) -> Vec<ProviderEvent> {
             ProviderEvent::TextDelta("Tests passed; I will collect the diff.".to_string()),
             ProviderEvent::ToolCallComplete(ToolCall {
                 call_id: "call_diff_1".to_string(),
-                name: "git_diff".to_string(),
-                input: String::new(),
+                name: "Bash".to_string(),
+                input: "git diff --".to_string(),
             }),
             ProviderEvent::Done(StopReason::ToolUse),
         ],
