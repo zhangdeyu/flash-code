@@ -35,6 +35,15 @@ impl Tool for ReadTool {
         "Read"
     }
 
+    fn description(&self) -> &str {
+        "Read the full or partial content of a file within the workspace."
+    }
+
+    fn parameters(&self) -> &str {
+        r#"{"type":"object","properties":{"path":{"type":"string","description":"Relative path to the file to read"},"start_line":{"type":"integer","description":"First line to read (1-indexed, inclusive)"},"end_line":{"type":"integer","description":"Last line to read (1-indexed, inclusive)"}},"required":["path"]}""
+        "#
+    }
+
     fn risk(&self, _input: &str) -> ToolRisk {
         ToolRisk::Read
     }
@@ -49,6 +58,15 @@ pub struct EditTool;
 impl Tool for EditTool {
     fn name(&self) -> &str {
         "Edit"
+    }
+
+    fn description(&self) -> &str {
+        "Make a targeted find-and-replace edit to an existing file. The find text must match exactly."
+    }
+
+    fn parameters(&self) -> &str {
+        r#"{"type":"object","properties":{"path":{"type":"string","description":"Relative path to the file to edit"},"find":{"type":"string","description":"Exact text to find in the file"},"replace":{"type":"string","description":"Replacement text"}},"required":["path","find","replace"]}""
+        "#
     }
 
     fn risk(&self, _input: &str) -> ToolRisk {
@@ -67,6 +85,15 @@ impl Tool for WriteTool {
         "Write"
     }
 
+    fn description(&self) -> &str {
+        "Create a new file or completely overwrite an existing file with the given content."
+    }
+
+    fn parameters(&self) -> &str {
+        r#"{"type":"object","properties":{"path":{"type":"string","description":"Relative path to the file to write"},"content":{"type":"string","description":"Full content to write to the file"}},"required":["path","content"]}""
+        "#
+    }
+
     fn risk(&self, _input: &str) -> ToolRisk {
         ToolRisk::Write
     }
@@ -81,6 +108,15 @@ pub struct GlobTool;
 impl Tool for GlobTool {
     fn name(&self) -> &str {
         "Glob"
+    }
+
+    fn description(&self) -> &str {
+        "Find files and directories matching a glob pattern (e.g. `**/*.rs`, `src/*.toml`)."
+    }
+
+    fn parameters(&self) -> &str {
+        r#"{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern to match against relative file paths"}},"required":["pattern"]}""
+        "#
     }
 
     fn risk(&self, _input: &str) -> ToolRisk {
@@ -109,6 +145,15 @@ pub struct GrepTool;
 impl Tool for GrepTool {
     fn name(&self) -> &str {
         "Grep"
+    }
+
+    fn description(&self) -> &str {
+        "Search for a keyword or pattern in file contents across the workspace. Returns file:line:content matches."
+    }
+
+    fn parameters(&self) -> &str {
+        r#"{"type":"object","properties":{"pattern":{"type":"string","description":"Keyword or substring to search for in file contents"}},"required":["pattern"]}""
+        "#
     }
 
     fn risk(&self, _input: &str) -> ToolRisk {
@@ -146,6 +191,15 @@ pub struct ListFilesTool;
 impl Tool for ListFilesTool {
     fn name(&self) -> &str {
         "ListFiles"
+    }
+
+    fn description(&self) -> &str {
+        "List the immediate children (files and directories) of a path in the workspace."
+    }
+
+    fn parameters(&self) -> &str {
+        r#"{"type":"object","properties":{"path":{"type":"string","description":"Relative path to the directory to list. Defaults to workspace root if omitted."}},"required":[]}""
+        "#
     }
 
     fn risk(&self, _input: &str) -> ToolRisk {
@@ -196,6 +250,15 @@ impl Tool for BashTool {
         "Bash"
     }
 
+    fn description(&self) -> &str {
+        "Execute a shell command in the workspace directory. Use for running tests, git commands, builds, etc."
+    }
+
+    fn parameters(&self) -> &str {
+        r#"{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"},"timeout_secs":{"type":"integer","description":"Optional timeout in seconds (default 120)"}},"required":["command"]}""
+        "#
+    }
+
     fn risk(&self, input: &str) -> ToolRisk {
         command_risk(input)
     }
@@ -210,6 +273,15 @@ pub struct SearchTool;
 impl Tool for SearchTool {
     fn name(&self) -> &str {
         "search"
+    }
+
+    fn description(&self) -> &str {
+        "[Legacy] Search for files by name in the workspace."
+    }
+
+    fn parameters(&self) -> &str {
+        r#"{"type":"object","properties":{"query":{"type":"string","description":"Filename or path fragment to search for"}},"required":[]}""
+        "#
     }
 
     fn risk(&self, _input: &str) -> ToolRisk {
@@ -247,6 +319,15 @@ impl Tool for ReadFileTool {
         "read_file"
     }
 
+    fn description(&self) -> &str {
+        "[Legacy] Read the content of a file."
+    }
+
+    fn parameters(&self) -> &str {
+        r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"}},"required":["path"]}""
+        "#
+    }
+
     fn risk(&self, _input: &str) -> ToolRisk {
         ToolRisk::Read
     }
@@ -267,6 +348,15 @@ impl Tool for ApplyPatchTool {
         "apply_patch"
     }
 
+    fn description(&self) -> &str {
+        "[Legacy] Apply a find-and-replace patch to a file."
+    }
+
+    fn parameters(&self) -> &str {
+        r#"{"type":"object","properties":{"input":{"type":"string","description":"Patch input in legacy format"}},"required":["input"]}""
+        "#
+    }
+
     fn risk(&self, _input: &str) -> ToolRisk {
         ToolRisk::Write
     }
@@ -283,6 +373,15 @@ impl Tool for WriteFileTool {
         "write_file"
     }
 
+    fn description(&self) -> &str {
+        "[Legacy] Write content to a file."
+    }
+
+    fn parameters(&self) -> &str {
+        r#"{"type":"object","properties":{"input":{"type":"string","description":"Path and content in legacy format"}},"required":["input"]}""
+        "#
+    }
+
     fn risk(&self, _input: &str) -> ToolRisk {
         ToolRisk::Write
     }
@@ -297,6 +396,15 @@ pub struct GitDiffTool;
 impl Tool for GitDiffTool {
     fn name(&self) -> &str {
         "git_diff"
+    }
+
+    fn description(&self) -> &str {
+        "[Legacy] Show the current git diff for the workspace."
+    }
+
+    fn parameters(&self) -> &str {
+        r#"{"type":"object","properties":{},"required":[]}""
+        "#
     }
 
     fn risk(&self, _input: &str) -> ToolRisk {
@@ -325,6 +433,15 @@ impl Tool for RunTestsTool {
         "run_tests"
     }
 
+    fn description(&self) -> &str {
+        "[Legacy] Run tests using cargo test or a custom command."
+    }
+
+    fn parameters(&self) -> &str {
+        r#"{"type":"object","properties":{"command":{"type":"string","description":"Test command to run (defaults to `cargo test`)"}},"required":[]}""
+        "#
+    }
+
     fn risk(&self, _input: &str) -> ToolRisk {
         ToolRisk::Execute
     }
@@ -350,6 +467,15 @@ impl Default for ShellTool {
 impl Tool for ShellTool {
     fn name(&self) -> &str {
         "shell"
+    }
+
+    fn description(&self) -> &str {
+        "[Legacy] Execute a shell command in the workspace directory."
+    }
+
+    fn parameters(&self) -> &str {
+        r#"{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"}},"required":["command"]}""
+        "#
     }
 
     fn risk(&self, input: &str) -> ToolRisk {

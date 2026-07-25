@@ -166,14 +166,17 @@ where
                 messages: project_history(&history, self.options.max_prompt_bytes),
                 tools: self
                     .tools
-                    .names()
-                    .map(|name| ToolSpec {
-                        name: name.to_string(),
+                    .descriptors()
+                    .map(|d| ToolSpec {
+                        name: d.name,
+                        description: d.description,
+                        parameters: d.parameters,
                     })
                     .collect(),
                 model: self.options.model.clone(),
             };
-            let provider_events = self.chat_with_retry(request)?;
+            let provider_events =
+                self.chat_with_retry_streaming(&session, request, observer)?;
             let turn_result = self.handle_provider_events(&session, provider_events, observer)?;
             let Some(turn_result) = turn_result else {
                 return Ok(AgentRun {
@@ -209,7 +212,7 @@ where
                 &turn_result
                     .tool_calls
                     .iter()
-                    .map(|call| (call.call_id.clone(), call.name.clone()))
+                    .map(|call| (call.call_id.clone(), call.name.clone(), call.input.clone()))
                     .collect::<Vec<_>>(),
             )?;
             history.push(assistant);
@@ -287,12 +290,12 @@ where
 
         for event in provider_events {
             match event {
-                ProviderEvent::ReasoningDelta(text) => {
-                    emit_event(session, Event::ReasoningDelta { text }, observer)?;
-                }
-                ProviderEvent::TextDelta(text) => {
-                    assistant_text.push_str(&text);
-                    emit_event(session, Event::AssistantDelta { text }, observer)?;
+                // ReasoningDelta and AssistantDelta were already streamed in
+                // chat_with_retry_streaming; skip re-emitting them here.
+                ProviderEvent::ReasoningDelta(_) | ProviderEvent::TextDelta(_) => {
+                    if let ProviderEvent::TextDelta(text) = event {
+                        assistant_text.push_str(&text);
+                    }
                 }
                 ProviderEvent::ToolCallComplete(call) => {
                     emit_event(
@@ -358,12 +361,36 @@ where
         }))
     }
 
-    fn chat_with_retry(&mut self, request: ChatRequest) -> Result<Vec<ProviderEvent>, AgentError> {
+    fn chat_with_retry_streaming<O: EventObserver>(
+        &mut self,
+        session: &flash_core::storage::Session,
+        request: ChatRequest,
+        observer: &mut O,
+    ) -> Result<Vec<ProviderEvent>, AgentError> {
         let mut attempts = 0;
         loop {
             attempts += 1;
-            match self.provider.chat(request.clone()) {
-                Ok(events) => return Ok(events),
+            let mut collected: Vec<ProviderEvent> = Vec::new();
+            let result = self.provider.chat(request.clone(), &mut |event| {
+                // Real-time streaming: emit ReasoningDelta and AssistantDelta immediately
+                // so TUI / CLI observers see output as it arrives.
+                let agent_event = match &event {
+                    ProviderEvent::ReasoningDelta(text) => Some(Event::ReasoningDelta {
+                        text: text.clone(),
+                    }),
+                    ProviderEvent::TextDelta(text) => Some(Event::AssistantDelta {
+                        text: text.clone(),
+                    }),
+                    _ => None,
+                };
+                if let Some(e) = agent_event {
+                    let _ = append_event(session, e.clone());
+                    observer.on_event(&e);
+                }
+                collected.push(event);
+            });
+            match result {
+                Ok(()) => return Ok(collected),
                 Err(error) if error.is_retryable() && attempts < 3 => continue,
                 Err(error) => return Err(AgentError::Provider(error)),
             }
@@ -728,7 +755,7 @@ fn message_size(message: &Message) -> usize {
         .iter()
         .map(|block| match block {
             ContentBlock::Text { text } | ContentBlock::Reasoning { text } => text.len(),
-            ContentBlock::ToolUse { call_id, name } => call_id.len() + name.len(),
+            ContentBlock::ToolUse { call_id, name, input } => call_id.len() + name.len() + input.len(),
             ContentBlock::ToolResult { call_id, .. } => call_id.len(),
         })
         .sum()
@@ -751,47 +778,56 @@ impl Default for SmokeProvider {
 }
 
 impl ChatProvider for SmokeProvider {
-    fn chat(&mut self, request: ChatRequest) -> Result<Vec<ProviderEvent>, ProviderError> {
+    fn chat(
+        &mut self,
+        request: ChatRequest,
+        on_event: &mut dyn FnMut(ProviderEvent),
+    ) -> Result<(), ProviderError> {
         self.turn += 1;
-        if request
+        let events = if request
             .messages
             .iter()
             .any(|message| matches!(message.role, Role::Tool))
             && !latest_user_task(&request).contains("fix failing tests")
         {
-            return Ok(vec![
+            vec![
                 ProviderEvent::TextDelta("Done.".to_string()),
                 ProviderEvent::Usage(Usage {
                     input_tokens: 10,
                     output_tokens: 2,
                 }),
                 ProviderEvent::Done(StopReason::EndTurn),
-            ]);
+            ]
+        } else {
+            let task = latest_user_task(&request);
+            if task.contains("fix failing tests") {
+                fix_failing_tests_events(tool_result_count(&request))
+            } else if task.contains("list files") {
+                vec![
+                    ProviderEvent::ReasoningDelta("Need inspect workspace files.".to_string()),
+                    ProviderEvent::TextDelta("I will list matching files.".to_string()),
+                    ProviderEvent::ToolCallComplete(ToolCall {
+                        call_id: "call_list_files_1".to_string(),
+                        name: "ListFiles".to_string(),
+                        input: ".".to_string(),
+                    }),
+                    ProviderEvent::Usage(Usage {
+                        input_tokens: 20,
+                        output_tokens: 6,
+                    }),
+                    ProviderEvent::Done(StopReason::ToolUse),
+                ]
+            } else {
+                vec![
+                    ProviderEvent::TextDelta("Task stored for the next runtime stage.".to_string()),
+                    ProviderEvent::Done(StopReason::EndTurn),
+                ]
+            }
+        };
+        for event in events {
+            on_event(event);
         }
-        let task = latest_user_task(&request);
-        if task.contains("fix failing tests") {
-            return Ok(fix_failing_tests_events(tool_result_count(&request)));
-        }
-        if task.contains("list files") {
-            return Ok(vec![
-                ProviderEvent::ReasoningDelta("Need inspect workspace files.".to_string()),
-                ProviderEvent::TextDelta("I will list matching files.".to_string()),
-                ProviderEvent::ToolCallComplete(ToolCall {
-                    call_id: "call_list_files_1".to_string(),
-                    name: "ListFiles".to_string(),
-                    input: ".".to_string(),
-                }),
-                ProviderEvent::Usage(Usage {
-                    input_tokens: 20,
-                    output_tokens: 6,
-                }),
-                ProviderEvent::Done(StopReason::ToolUse),
-            ]);
-        }
-        Ok(vec![
-            ProviderEvent::TextDelta("Task stored for the next runtime stage.".to_string()),
-            ProviderEvent::Done(StopReason::EndTurn),
-        ])
+        Ok(())
     }
 }
 
@@ -1450,38 +1486,49 @@ mod tests {
     struct UnknownToolProvider;
 
     impl ChatProvider for UnknownToolProvider {
-        fn chat(&mut self, _request: ChatRequest) -> Result<Vec<ProviderEvent>, ProviderError> {
-            Ok(vec![
-                ProviderEvent::ToolCallComplete(ToolCall {
-                    call_id: "call_missing".to_string(),
-                    name: "missing".to_string(),
-                    input: String::new(),
-                }),
-                ProviderEvent::Done(StopReason::ToolUse),
-            ])
+        fn chat(
+            &mut self,
+            _request: ChatRequest,
+            on_event: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderError> {
+            on_event(ProviderEvent::ToolCallComplete(ToolCall {
+                call_id: "call_missing".to_string(),
+                name: "missing".to_string(),
+                input: String::new(),
+            }));
+            on_event(ProviderEvent::Done(StopReason::ToolUse));
+            Ok(())
         }
     }
 
     struct PartialProvider;
 
     impl ChatProvider for PartialProvider {
-        fn chat(&mut self, _request: ChatRequest) -> Result<Vec<ProviderEvent>, ProviderError> {
-            Ok(vec![ProviderEvent::TextDelta("half".to_string())])
+        fn chat(
+            &mut self,
+            _request: ChatRequest,
+            on_event: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderError> {
+            on_event(ProviderEvent::TextDelta("half".to_string()));
+            Ok(())
         }
     }
 
     struct LoopProvider;
 
     impl ChatProvider for LoopProvider {
-        fn chat(&mut self, _request: ChatRequest) -> Result<Vec<ProviderEvent>, ProviderError> {
-            Ok(vec![
-                ProviderEvent::ToolCallComplete(ToolCall {
-                    call_id: "call_read".to_string(),
-                    name: "fake".to_string(),
-                    input: String::new(),
-                }),
-                ProviderEvent::Done(StopReason::ToolUse),
-            ])
+        fn chat(
+            &mut self,
+            _request: ChatRequest,
+            on_event: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderError> {
+            on_event(ProviderEvent::ToolCallComplete(ToolCall {
+                call_id: "call_read".to_string(),
+                name: "fake".to_string(),
+                input: String::new(),
+            }));
+            on_event(ProviderEvent::Done(StopReason::ToolUse));
+            Ok(())
         }
     }
 
@@ -1490,90 +1537,108 @@ mod tests {
     }
 
     impl ChatProvider for RetryProvider {
-        fn chat(&mut self, _request: ChatRequest) -> Result<Vec<ProviderEvent>, ProviderError> {
+        fn chat(
+            &mut self,
+            _request: ChatRequest,
+            on_event: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderError> {
             self.calls += 1;
             if self.calls == 1 {
                 return Err(ProviderError::RateLimited("rate limited".to_string()));
             }
-            Ok(vec![
-                ProviderEvent::TextDelta("ok".to_string()),
-                ProviderEvent::Done(StopReason::EndTurn),
-            ])
+            on_event(ProviderEvent::TextDelta("ok".to_string()));
+            on_event(ProviderEvent::Done(StopReason::EndTurn));
+            Ok(())
         }
     }
 
     struct LargeToolProvider;
 
     impl ChatProvider for LargeToolProvider {
-        fn chat(&mut self, _request: ChatRequest) -> Result<Vec<ProviderEvent>, ProviderError> {
-            Ok(vec![
-                ProviderEvent::ToolCallComplete(ToolCall {
-                    call_id: "call_large".to_string(),
-                    name: "large".to_string(),
-                    input: String::new(),
-                }),
-                ProviderEvent::Done(StopReason::ToolUse),
-            ])
+        fn chat(
+            &mut self,
+            _request: ChatRequest,
+            on_event: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderError> {
+            on_event(ProviderEvent::ToolCallComplete(ToolCall {
+                call_id: "call_large".to_string(),
+                name: "large".to_string(),
+                input: String::new(),
+            }));
+            on_event(ProviderEvent::Done(StopReason::ToolUse));
+            Ok(())
         }
     }
 
     struct ErrorToolProvider;
 
     impl ChatProvider for ErrorToolProvider {
-        fn chat(&mut self, _request: ChatRequest) -> Result<Vec<ProviderEvent>, ProviderError> {
-            Ok(vec![
-                ProviderEvent::ToolCallComplete(ToolCall {
-                    call_id: "call_error".to_string(),
-                    name: "error".to_string(),
-                    input: String::new(),
-                }),
-                ProviderEvent::Done(StopReason::ToolUse),
-            ])
+        fn chat(
+            &mut self,
+            _request: ChatRequest,
+            on_event: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderError> {
+            on_event(ProviderEvent::ToolCallComplete(ToolCall {
+                call_id: "call_error".to_string(),
+                name: "error".to_string(),
+                input: String::new(),
+            }));
+            on_event(ProviderEvent::Done(StopReason::ToolUse));
+            Ok(())
         }
     }
 
     struct ExecuteToolProvider;
 
     impl ChatProvider for ExecuteToolProvider {
-        fn chat(&mut self, _request: ChatRequest) -> Result<Vec<ProviderEvent>, ProviderError> {
-            Ok(vec![
-                ProviderEvent::ToolCallComplete(ToolCall {
-                    call_id: "call_execute".to_string(),
-                    name: "execute".to_string(),
-                    input: String::new(),
-                }),
-                ProviderEvent::Done(StopReason::ToolUse),
-            ])
+        fn chat(
+            &mut self,
+            _request: ChatRequest,
+            on_event: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderError> {
+            on_event(ProviderEvent::ToolCallComplete(ToolCall {
+                call_id: "call_execute".to_string(),
+                name: "execute".to_string(),
+                input: String::new(),
+            }));
+            on_event(ProviderEvent::Done(StopReason::ToolUse));
+            Ok(())
         }
     }
 
     struct CancelToolProvider;
 
     impl ChatProvider for CancelToolProvider {
-        fn chat(&mut self, _request: ChatRequest) -> Result<Vec<ProviderEvent>, ProviderError> {
-            Ok(vec![
-                ProviderEvent::ToolCallComplete(ToolCall {
-                    call_id: "call_cancel".to_string(),
-                    name: "cancel".to_string(),
-                    input: String::new(),
-                }),
-                ProviderEvent::Done(StopReason::ToolUse),
-            ])
+        fn chat(
+            &mut self,
+            _request: ChatRequest,
+            on_event: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderError> {
+            on_event(ProviderEvent::ToolCallComplete(ToolCall {
+                call_id: "call_cancel".to_string(),
+                name: "cancel".to_string(),
+                input: String::new(),
+            }));
+            on_event(ProviderEvent::Done(StopReason::ToolUse));
+            Ok(())
         }
     }
 
     struct DestructiveToolProvider;
 
     impl ChatProvider for DestructiveToolProvider {
-        fn chat(&mut self, _request: ChatRequest) -> Result<Vec<ProviderEvent>, ProviderError> {
-            Ok(vec![
-                ProviderEvent::ToolCallComplete(ToolCall {
-                    call_id: "call_destructive".to_string(),
-                    name: "destructive".to_string(),
-                    input: String::new(),
-                }),
-                ProviderEvent::Done(StopReason::ToolUse),
-            ])
+        fn chat(
+            &mut self,
+            _request: ChatRequest,
+            on_event: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderError> {
+            on_event(ProviderEvent::ToolCallComplete(ToolCall {
+                call_id: "call_destructive".to_string(),
+                name: "destructive".to_string(),
+                input: String::new(),
+            }));
+            on_event(ProviderEvent::Done(StopReason::ToolUse));
+            Ok(())
         }
     }
 
@@ -1582,6 +1647,15 @@ mod tests {
     impl Tool for FakeTool {
         fn name(&self) -> &str {
             "fake"
+        }
+
+        fn description(&self) -> &str {
+            "fake tool"
+        }
+
+        fn parameters(&self) -> &str {
+            r#"{"type":"object","properties":{}}""
+            "#
         }
 
         fn risk(&self, _input: &str) -> ToolRisk {
@@ -1600,6 +1674,15 @@ mod tests {
             "large"
         }
 
+        fn description(&self) -> &str {
+            "large tool"
+        }
+
+        fn parameters(&self) -> &str {
+            r#"{"type":"object","properties":{}}""
+            "#
+        }
+
         fn risk(&self, _input: &str) -> ToolRisk {
             ToolRisk::Read
         }
@@ -1616,6 +1699,15 @@ mod tests {
             "error"
         }
 
+        fn description(&self) -> &str {
+            "error tool"
+        }
+
+        fn parameters(&self) -> &str {
+            r#"{"type":"object","properties":{}}""
+            "#
+        }
+
         fn risk(&self, _input: &str) -> ToolRisk {
             ToolRisk::Read
         }
@@ -1630,6 +1722,15 @@ mod tests {
     impl Tool for ExecuteTool {
         fn name(&self) -> &str {
             "execute"
+        }
+
+        fn description(&self) -> &str {
+            "execute tool"
+        }
+
+        fn parameters(&self) -> &str {
+            r#"{"type":"object","properties":{}}""
+            "#
         }
 
         fn risk(&self, _input: &str) -> ToolRisk {
@@ -1656,6 +1757,15 @@ mod tests {
             "cancel"
         }
 
+        fn description(&self) -> &str {
+            "cancel tool"
+        }
+
+        fn parameters(&self) -> &str {
+            r#"{"type":"object","properties":{}}""
+            "#
+        }
+
         fn risk(&self, _input: &str) -> ToolRisk {
             ToolRisk::Read
         }
@@ -1674,6 +1784,15 @@ mod tests {
     impl Tool for DestructiveTool {
         fn name(&self) -> &str {
             "destructive"
+        }
+
+        fn description(&self) -> &str {
+            "destructive tool"
+        }
+
+        fn parameters(&self) -> &str {
+            r#"{"type":"object","properties":{}}""
+            "#
         }
 
         fn risk(&self, _input: &str) -> ToolRisk {
@@ -1697,6 +1816,15 @@ mod tests {
     impl Tool for SearchFakeTool {
         fn name(&self) -> &str {
             "search"
+        }
+
+        fn description(&self) -> &str {
+            "search fake tool"
+        }
+
+        fn parameters(&self) -> &str {
+            r#"{"type":"object","properties":{}}""
+            "#
         }
 
         fn risk(&self, _input: &str) -> ToolRisk {

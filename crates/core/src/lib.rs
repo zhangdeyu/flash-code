@@ -11,7 +11,7 @@ pub use storage::{
     create_session, init_workspace, replay_events,
 };
 pub use tools::{
-    PermissionDecision, PermissionPolicy, Tool, ToolContext, ToolError, ToolExitStatus, ToolOutput,
-    ToolRegistry, ToolRisk,
+    PermissionDecision, PermissionPolicy, Tool, ToolContext, ToolDescriptor, ToolError,
+    ToolExitStatus, ToolOutput, ToolRegistry, ToolRisk,
 };
 pub use workspace::{discover_workspace_root, WorkspaceError};

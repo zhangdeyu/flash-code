@@ -101,9 +101,25 @@ impl ToolError {
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
 
+    /// One-line description of what the tool does.
+    fn description(&self) -> &str;
+
+    /// JSON Schema string for the tool's input parameters.
+    /// Format: `{"type":"object","properties":{...},"required":[...]}`
+    fn parameters(&self) -> &str;
+
     fn risk(&self, input: &str) -> ToolRisk;
 
     fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError>;
+}
+
+/// Descriptor combining a tool's name, description and JSON Schema parameters.
+/// Used to build provider-specific tool specs (e.g. DeepSeek function-calling).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolDescriptor {
+    pub name: String,
+    pub description: String,
+    pub parameters: String,
 }
 
 #[derive(Default)]
@@ -131,6 +147,15 @@ impl ToolRegistry {
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.tools.keys().map(String::as_str)
+    }
+
+    /// Returns a `ToolDescriptor` (name + description + parameters) for every registered tool.
+    pub fn descriptors(&self) -> impl Iterator<Item = ToolDescriptor> + '_ {
+        self.tools.values().map(|tool| ToolDescriptor {
+            name: tool.name().to_string(),
+            description: tool.description().to_string(),
+            parameters: tool.parameters().to_string(),
+        })
     }
 }
 
@@ -160,6 +185,15 @@ mod tests {
     impl Tool for FakeTool {
         fn name(&self) -> &str {
             self.name
+        }
+
+        fn description(&self) -> &str {
+            "fake tool for testing"
+        }
+
+        fn parameters(&self) -> &str {
+            r#"{"type":"object","properties":{}}"
+            "#
         }
 
         fn risk(&self, _input: &str) -> ToolRisk {

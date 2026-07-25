@@ -18,7 +18,13 @@ pub trait Provider {
 }
 
 pub trait ChatProvider {
-    fn chat(&mut self, request: ChatRequest) -> Result<Vec<ProviderEvent>, ProviderError>;
+    /// Send a chat request and emit events via `on_event` as they arrive.
+    /// The callback is called for each `ProviderEvent` in streaming order.
+    fn chat(
+        &mut self,
+        request: ChatRequest,
+        on_event: &mut dyn FnMut(ProviderEvent),
+    ) -> Result<(), ProviderError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +37,11 @@ pub struct ChatRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSpec {
     pub name: String,
+    /// Short description of what the tool does, used in the model's function-calling prompt.
+    pub description: String,
+    /// JSON Schema string describing the tool's input parameters.
+    /// Format: `{"type":"object","properties":{...},"required":[...]}`
+    pub parameters: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +122,20 @@ mod tests {
         }
     }
 
+    struct EchoProvider;
+
+    impl ChatProvider for EchoProvider {
+        fn chat(
+            &mut self,
+            _request: ChatRequest,
+            on_event: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), ProviderError> {
+            on_event(ProviderEvent::TextDelta("hello".to_string()));
+            on_event(ProviderEvent::Done(StopReason::EndTurn));
+            Ok(())
+        }
+    }
+
     #[test]
     fn provider_should_expose_capabilities() {
         let provider = FakeProvider {
@@ -126,5 +151,22 @@ mod tests {
         };
 
         assert!(provider.capabilities().supports_tool_calls);
+    }
+
+    #[test]
+    fn chat_provider_should_emit_events_via_callback() {
+        let mut provider = EchoProvider;
+        let mut events = Vec::new();
+        provider
+            .chat(
+                ChatRequest {
+                    messages: Vec::new(),
+                    tools: Vec::new(),
+                    model: "test".to_string(),
+                },
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        assert_eq!(events.len(), 2);
     }
 }

@@ -28,6 +28,8 @@ pub enum ContentBlock {
     ToolUse {
         call_id: String,
         name: String,
+        /// The serialized input arguments passed to the tool (plain string, as received from provider).
+        input: String,
     },
     ToolResult {
         call_id: String,

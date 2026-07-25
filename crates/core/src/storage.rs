@@ -146,7 +146,7 @@ pub fn append_user_message(session: &Session, text: &str) -> Result<Message, Sto
 pub fn append_assistant_message(
     session: &Session,
     text: &str,
-    tool_uses: &[(String, String)],
+    tool_uses: &[(String, String, String)],
 ) -> Result<Message, StorageError> {
     let mut content = Vec::new();
     if !text.is_empty() {
@@ -154,10 +154,11 @@ pub fn append_assistant_message(
             text: text.to_string(),
         });
     }
-    for (call_id, name) in tool_uses {
+    for (call_id, name, input) in tool_uses {
         content.push(ContentBlock::ToolUse {
             call_id: call_id.clone(),
             name: name.clone(),
+            input: input.clone(),
         });
     }
     let message = Message {
@@ -264,10 +265,11 @@ fn content_block_to_json(block: &ContentBlock) -> String {
                 escape_json(text)
             )
         }
-        ContentBlock::ToolUse { call_id, name } => format!(
-            "{{\"type\":\"tool_use\",\"call_id\":\"{}\",\"name\":\"{}\"}}",
+        ContentBlock::ToolUse { call_id, name, input } => format!(
+            "{{\"type\":\"tool_use\",\"call_id\":\"{}\",\"name\":\"{}\",\"input\":\"{}\"}}",
             escape_json(call_id),
-            escape_json(name)
+            escape_json(name),
+            escape_json(input)
         ),
         ContentBlock::ToolResult { call_id, status } => format!(
             "{{\"type\":\"tool_result\",\"call_id\":\"{}\",\"status\":\"{}\"}}",
@@ -599,7 +601,7 @@ mod tests {
         append_assistant_message(
             &session,
             "I will read",
-            &[("call_1".to_string(), "Read".to_string())],
+            &[("call_1".to_string(), "Read".to_string(), "src/lib.rs".to_string())],
         )
         .unwrap();
         append_tool_result_message(&session, "call_1", ToolResultStatus::Success, "done").unwrap();
