@@ -88,6 +88,15 @@ pub struct SweBenchResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweBenchSummary {
+    pub total: usize,
+    pub evaluated: usize,
+    pub resolved: usize,
+    pub unresolved: usize,
+    pub environment_failures: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SweBenchFailureKind {
     LocalizationFailure,
     PatchFailure,
@@ -105,6 +114,12 @@ impl SweBenchFailureKind {
             Self::EnvironmentFailure => "environment_failure",
             Self::Timeout => "timeout",
         }
+    }
+}
+
+impl SweBenchRun {
+    pub fn summary(&self) -> SweBenchSummary {
+        swe_bench_summary_counts(&self.results)
     }
 }
 
@@ -1062,8 +1077,7 @@ fn write_swe_bench_task_result(run: &EvalRun, result: &SweBenchResult) -> Result
 }
 
 fn write_swe_bench_summary(run: &SweBenchRun) -> Result<(), EvalError> {
-    let resolved = run.results.iter().filter(|result| result.resolved).count();
-    let total = run.results.len();
+    let summary = run.summary();
     let mut json_tasks = String::new();
     for (index, result) in run.results.iter().enumerate() {
         if index > 0 {
@@ -1121,6 +1135,9 @@ fn write_swe_bench_summary(run: &SweBenchRun) -> Result<(), EvalError> {
             "\"limit\":{},",
             "\"lock_version\":\"{}\",",
             "\"resolved\":{},",
+            "\"unresolved\":{},",
+            "\"environment_failures\":{},",
+            "\"evaluated\":{},",
             "\"total\":{},",
             "\"tasks\":[{}]",
             "}}\n"
@@ -1128,8 +1145,11 @@ fn write_swe_bench_summary(run: &SweBenchRun) -> Result<(), EvalError> {
         escape_json(&run.subset),
         run.limit,
         escape_json(&run.lock_version),
-        resolved,
-        total,
+        summary.resolved,
+        summary.unresolved,
+        summary.environment_failures,
+        summary.evaluated,
+        summary.total,
         json_tasks
     );
     fs::write(run.path.join("result.json"), result_json)?;
@@ -1142,11 +1162,21 @@ fn write_swe_bench_summary(run: &SweBenchRun) -> Result<(), EvalError> {
             "| subset | {} |\n",
             "| limit | {} |\n",
             "| lock version | {} |\n",
-            "| resolved | {}/{} |\n\n",
+            "| resolved | {}/{} |\n",
+            "| unresolved | {} |\n",
+            "| environment failures | {} |\n",
+            "| total | {} |\n\n",
             "| Instance | Resolved | Duration ms | Commands | Tokens | Patch | Failure |\n",
             "|---|---:|---:|---:|---:|---|---|\n"
         ),
-        run.subset, run.limit, run.lock_version, resolved, total
+        run.subset,
+        run.limit,
+        run.lock_version,
+        summary.resolved,
+        summary.evaluated,
+        summary.unresolved,
+        summary.environment_failures,
+        summary.total
     );
     for result in &run.results {
         let patch_path = result
@@ -1171,6 +1201,27 @@ fn write_swe_bench_summary(run: &SweBenchRun) -> Result<(), EvalError> {
     }
     fs::write(run.path.join("report.md"), report)?;
     Ok(())
+}
+
+fn swe_bench_summary_counts(results: &[SweBenchResult]) -> SweBenchSummary {
+    let total = results.len();
+    let environment_failures = results
+        .iter()
+        .filter(|result| result.failure_kind == Some(SweBenchFailureKind::EnvironmentFailure))
+        .count();
+    let evaluated = total.saturating_sub(environment_failures);
+    let resolved = results
+        .iter()
+        .filter(|result| result.resolved && result.failure_kind.is_none())
+        .count();
+    let unresolved = evaluated.saturating_sub(resolved);
+    SweBenchSummary {
+        total,
+        evaluated,
+        resolved,
+        unresolved,
+        environment_failures,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1300,8 +1351,9 @@ mod tests {
     fn swe_bench_verified_tasks_should_load_fixed_task_metadata() {
         let tasks = swe_bench_verified_tasks().unwrap();
 
-        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks.len(), 10);
         assert_eq!(tasks[0].instance_id, "flash-code__local-rust-1");
+        assert_eq!(tasks[9].instance_id, "flash-code__local-rust-10");
         assert_eq!(tasks[0].repo, "flash-code/local-rust-fixture");
         assert_eq!(tasks[0].fail_to_pass, vec!["answer_should_be_42"]);
     }
@@ -1328,6 +1380,51 @@ mod tests {
         let patch_path = run.results[0].patch_path.as_ref().unwrap();
         assert!(patch_path.exists());
         assert!(fs::read_to_string(patch_path).unwrap().contains("+    42"));
+    }
+
+    #[test]
+    fn run_swe_bench_verified_should_run_fixed_10_task_subset() {
+        let root = temp_dir("swe_bench_verified_10");
+        fs::create_dir_all(&root).unwrap();
+
+        let run = run_swe_bench_verified(&root, 10).unwrap();
+        let summary = run.summary();
+
+        assert_eq!(run.results.len(), 10);
+        assert_eq!(summary.resolved, 10);
+        assert_eq!(summary.evaluated, 10);
+        assert_eq!(summary.environment_failures, 0);
+        assert!(run.results.iter().all(|result| result.session_id.is_some()));
+        assert!(run
+            .results
+            .iter()
+            .all(|result| result.patch_path.as_ref().is_some_and(|path| path.exists())));
+    }
+
+    #[test]
+    fn swe_bench_summary_should_exclude_environment_failures_from_evaluated_count() {
+        let results = vec![
+            swe_result("resolved", true, None),
+            swe_result("unresolved", false, Some(SweBenchFailureKind::TestFailure)),
+            swe_result(
+                "environment",
+                false,
+                Some(SweBenchFailureKind::EnvironmentFailure),
+            ),
+        ];
+
+        let summary = swe_bench_summary_counts(&results);
+
+        assert_eq!(
+            summary,
+            SweBenchSummary {
+                total: 3,
+                evaluated: 2,
+                resolved: 1,
+                unresolved: 1,
+                environment_failures: 1,
+            }
+        );
     }
 
     #[test]
@@ -1386,5 +1483,26 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("flash_eval_{name}_{nanos}"))
+    }
+
+    fn swe_result(
+        instance_id: &str,
+        resolved: bool,
+        failure_kind: Option<SweBenchFailureKind>,
+    ) -> SweBenchResult {
+        SweBenchResult {
+            instance_id: instance_id.to_string(),
+            resolved,
+            duration_ms: 0,
+            command_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            session_id: None,
+            events_path: None,
+            patch_path: None,
+            workspace_path: PathBuf::from("workspace"),
+            failure_kind,
+            failure_reason: None,
+        }
     }
 }

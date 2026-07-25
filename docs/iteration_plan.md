@@ -41,8 +41,9 @@
 - 0.6.2 Terminal-Bench Adapter。
 - 0.6.x Skill 机制评估点:未触发实现条件,继续不实现动态 Skill。
 - 0.7.1 SWE-bench Harness。
+- 0.7.2 SWE-bench Verified Smoke。
 
-下一阶段从 0.7.2 SWE-bench Verified Smoke 开始。0.4 之后不重新设计 runtime,只把 TUI 作为 `Event` 的消费者和 `UserAction` 的生产者接入现有 Agent runtime。
+下一阶段从 0.7.x SubAgent / Task / AskUser 评估点开始。0.4 之后不重新设计 runtime,只把 TUI 作为 `Event` 的消费者和 `UserAction` 的生产者接入现有 Agent runtime。
 
 ## 1.2 执行节奏
 

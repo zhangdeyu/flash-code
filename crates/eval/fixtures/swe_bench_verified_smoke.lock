@@ -1,8 +1,17 @@
 # Flash Code SWE-bench Verified harness smoke lock.
-# This local fixed task mirrors the SWE-bench Verified metadata shape while keeping 0.7.1 offline and deterministic.
+# This local fixed task list mirrors the SWE-bench Verified metadata shape while keeping 0.7.2 offline and deterministic.
 benchmark=swe-bench
 subset=verified
 split=test
-lock_version=swe-bench-verified-smoke-2026-07-25
+lock_version=swe-bench-verified-smoke-10-2026-07-25
 upstream_dataset=SWE-bench/SWE-bench_Verified
-task=instance_id=flash-code__local-rust-1|repo=flash-code/local-rust-fixture|base_commit=local-baseline|version=0.1.0|problem_statement=fix failing tests: answer_should_be_42 fails because answer returns 41|fail_to_pass=answer_should_be_42|pass_to_pass=none|timeout_secs=120
+task=instance_id=flash-code__local-rust-1|repo=flash-code/local-rust-fixture|base_commit=local-baseline-1|version=0.1.0|problem_statement=fix failing tests: answer_should_be_42 fails because answer returns 41|fail_to_pass=answer_should_be_42|pass_to_pass=none|timeout_secs=120
+task=instance_id=flash-code__local-rust-2|repo=flash-code/local-rust-fixture|base_commit=local-baseline-2|version=0.1.0|problem_statement=fix failing tests: answer_should_be_42 fails because answer returns 41|fail_to_pass=answer_should_be_42|pass_to_pass=none|timeout_secs=120
+task=instance_id=flash-code__local-rust-3|repo=flash-code/local-rust-fixture|base_commit=local-baseline-3|version=0.1.0|problem_statement=fix failing tests: answer_should_be_42 fails because answer returns 41|fail_to_pass=answer_should_be_42|pass_to_pass=none|timeout_secs=120
+task=instance_id=flash-code__local-rust-4|repo=flash-code/local-rust-fixture|base_commit=local-baseline-4|version=0.1.0|problem_statement=fix failing tests: answer_should_be_42 fails because answer returns 41|fail_to_pass=answer_should_be_42|pass_to_pass=none|timeout_secs=120
+task=instance_id=flash-code__local-rust-5|repo=flash-code/local-rust-fixture|base_commit=local-baseline-5|version=0.1.0|problem_statement=fix failing tests: answer_should_be_42 fails because answer returns 41|fail_to_pass=answer_should_be_42|pass_to_pass=none|timeout_secs=120
+task=instance_id=flash-code__local-rust-6|repo=flash-code/local-rust-fixture|base_commit=local-baseline-6|version=0.1.0|problem_statement=fix failing tests: answer_should_be_42 fails because answer returns 41|fail_to_pass=answer_should_be_42|pass_to_pass=none|timeout_secs=120
+task=instance_id=flash-code__local-rust-7|repo=flash-code/local-rust-fixture|base_commit=local-baseline-7|version=0.1.0|problem_statement=fix failing tests: answer_should_be_42 fails because answer returns 41|fail_to_pass=answer_should_be_42|pass_to_pass=none|timeout_secs=120
+task=instance_id=flash-code__local-rust-8|repo=flash-code/local-rust-fixture|base_commit=local-baseline-8|version=0.1.0|problem_statement=fix failing tests: answer_should_be_42 fails because answer returns 41|fail_to_pass=answer_should_be_42|pass_to_pass=none|timeout_secs=120
+task=instance_id=flash-code__local-rust-9|repo=flash-code/local-rust-fixture|base_commit=local-baseline-9|version=0.1.0|problem_statement=fix failing tests: answer_should_be_42 fails because answer returns 41|fail_to_pass=answer_should_be_42|pass_to_pass=none|timeout_secs=120
+task=instance_id=flash-code__local-rust-10|repo=flash-code/local-rust-fixture|base_commit=local-baseline-10|version=0.1.0|problem_statement=fix failing tests: answer_should_be_42 fails because answer returns 41|fail_to_pass=answer_should_be_42|pass_to_pass=none|timeout_secs=120

@@ -6,6 +6,8 @@
 
 0.7.1 采用离线固定 task,元数据字段对齐 SWE-bench Verified 的核心字段,但不接入外部数据集下载、Docker runner 或云端提交。这样可以先验证 Flash Code 自己的 runtime、tool、session、patch、grader 链路,避免在第一步引入不可控环境复杂度。
 
+说明:0.7.2 已在同一 lock 文件上扩展到 10 个固定 task。本文件记录 0.7.1 当时的 1-task harness 验收。
+
 参考公开资料:
 
 - SWE-bench 数据集字段包含 `instance_id`、`repo`、`base_commit`、`problem_statement`、`patch`、`test_patch`、`FAIL_TO_PASS`、`PASS_TO_PASS`。

@@ -233,7 +233,7 @@ fn eval_terminal_bench(args: &[String]) -> Result<(), CliError> {
 }
 
 fn eval_swe_bench(args: &[String]) -> Result<(), CliError> {
-    let usage = "usage: flash eval swe-bench --subset verified --limit 1";
+    let usage = "usage: flash eval swe-bench --subset verified --limit 10";
     let subset = parse_named_arg(args, "--subset", usage)?;
     if subset != "verified" {
         return Err(CliError::Usage(usage.to_string()));
@@ -242,11 +242,13 @@ fn eval_swe_bench(args: &[String]) -> Result<(), CliError> {
     let root = discover_workspace_root(None)?;
     init_workspace(&root)?;
     let run = flash_eval::run_swe_bench_verified(&root, limit)?;
-    let resolved = run.results.iter().filter(|result| result.resolved).count();
+    let summary = run.summary();
     println!("benchmark: swe-bench");
     println!("subset: {}", run.subset);
     println!("lock_version: {}", run.lock_version);
-    println!("resolved: {resolved}/{}", run.results.len());
+    println!("resolved: {}/{}", summary.resolved, summary.evaluated);
+    println!("unresolved: {}", summary.unresolved);
+    println!("environment_failures: {}", summary.environment_failures);
     println!("eval_run: {}", run.path.display());
     println!("report: {}", run.path.join("report.md").display());
     println!("result: {}", run.path.join("result.json").display());
@@ -379,7 +381,7 @@ fn print_help() {
         "  flash run \"<task>\"\n",
         "  flash eval fixture --task fix-rust\n",
         "  flash eval terminal-bench --subset smoke\n",
-        "  flash eval swe-bench --subset verified --limit 1\n",
+        "  flash eval swe-bench --subset verified --limit 10\n",
         "  flash replay <events.jsonl>\n",
         "  flash resume <session_id>\n\n",
         "Running `flash` without a subcommand enters the TUI.\n"
