@@ -43,8 +43,9 @@
 - 0.7.1 SWE-bench Harness。
 - 0.7.2 SWE-bench Verified Smoke。
 - 0.7.x SubAgent / Task / AskUser 评估点:未触发实现条件,继续不实现复杂交互工具。
+- 0.8 回归评测与报告。
 
-下一阶段从 0.8 回归评测与报告开始。0.4 之后不重新设计 runtime,只把 TUI 作为 `Event` 的消费者和 `UserAction` 的生产者接入现有 Agent runtime。
+下一阶段从 1.0 日常可用版本开始。0.4 之后不重新设计 runtime,只把 TUI 作为 `Event` 的消费者和 `UserAction` 的生产者接入现有 Agent runtime。
 
 ## 1.2 执行节奏
 

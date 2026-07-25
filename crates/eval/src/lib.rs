@@ -96,6 +96,63 @@ pub struct SweBenchSummary {
     pub environment_failures: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegressionRun {
+    pub run_id: String,
+    pub path: PathBuf,
+    pub report_path: PathBuf,
+    pub result_path: PathBuf,
+    pub trend_path: PathBuf,
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub pass_rate_bps: u64,
+    pub previous_pass_rate_bps: Option<u64>,
+    pub new_failures: Vec<String>,
+    pub benchmarks: Vec<RegressionBenchmarkResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegressionBenchmarkResult {
+    pub benchmark: String,
+    pub subset: String,
+    pub lock_version: String,
+    pub total: usize,
+    pub passed: usize,
+    pub agent_failures: usize,
+    pub environment_failures: usize,
+    pub benchmark_failures: usize,
+    pub report_path: PathBuf,
+    pub result_path: PathBuf,
+    pub replay_paths: Vec<PathBuf>,
+    pub failures: Vec<RegressionFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegressionFailure {
+    pub id: String,
+    pub category: RegressionFailureCategory,
+    pub reason: String,
+    pub replay_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegressionFailureCategory {
+    Agent,
+    Environment,
+    Benchmark,
+}
+
+impl RegressionFailureCategory {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent_failure",
+            Self::Environment => "environment_failure",
+            Self::Benchmark => "benchmark_failure",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SweBenchFailureKind {
     LocalizationFailure,
@@ -274,6 +331,58 @@ pub fn run_swe_bench_verified(root: &Path, limit: usize) -> Result<SweBenchRun, 
     };
     write_swe_bench_summary(&swe_run)?;
     Ok(swe_run)
+}
+
+pub fn run_regression(root: &Path) -> Result<RegressionRun, EvalError> {
+    run_regression_with_swe_limit(root, 10)
+}
+
+fn run_regression_with_swe_limit(
+    root: &Path,
+    swe_limit: usize,
+) -> Result<RegressionRun, EvalError> {
+    let run = create_eval_run(root)?;
+    let previous = latest_previous_regression(root, &run.path)?;
+    let fixture = run_fixture_eval(root, local_fixture_task("fix-rust")?)?;
+    let terminal = run_terminal_bench_smoke(root)?;
+    let swe = run_swe_bench_verified(root, swe_limit)?;
+    let benchmarks = vec![
+        regression_from_fixture(&fixture),
+        regression_from_terminal_bench(&terminal),
+        regression_from_swe_bench(&swe),
+    ];
+    let total = benchmarks
+        .iter()
+        .map(|benchmark| benchmark.total)
+        .sum::<usize>();
+    let passed = benchmarks
+        .iter()
+        .map(|benchmark| benchmark.passed)
+        .sum::<usize>();
+    let failed = total.saturating_sub(passed);
+    let pass_rate_bps = pass_rate_bps(passed, total);
+    let failures = regression_failure_ids(&benchmarks);
+    let previous_failures = previous
+        .as_ref()
+        .map(|snapshot| snapshot.failures.as_slice())
+        .unwrap_or_default();
+    let new_failures = new_failure_ids(&failures, previous_failures);
+    let regression = RegressionRun {
+        run_id: run.id,
+        report_path: run.path.join("report.md"),
+        result_path: run.path.join("regression_result.json"),
+        trend_path: run.path.join("trend.json"),
+        path: run.path,
+        total,
+        passed,
+        failed,
+        pass_rate_bps,
+        previous_pass_rate_bps: previous.map(|snapshot| snapshot.pass_rate_bps),
+        new_failures,
+        benchmarks,
+    };
+    write_regression_summary(&regression)?;
+    Ok(regression)
 }
 
 fn create_eval_run(root: &Path) -> Result<EvalRun, EvalError> {
@@ -1224,6 +1333,451 @@ fn swe_bench_summary_counts(results: &[SweBenchResult]) -> SweBenchSummary {
     }
 }
 
+fn regression_from_fixture(result: &EvalResult) -> RegressionBenchmarkResult {
+    let failure = eval_failure(result.task_id.as_str(), result);
+    RegressionBenchmarkResult {
+        benchmark: "internal".to_string(),
+        subset: "fixture".to_string(),
+        lock_version: "internal-fixture-fix-rust-v1".to_string(),
+        total: 1,
+        passed: usize::from(result.passed),
+        agent_failures: usize::from(matches!(
+            result.failure_kind,
+            Some(EvalFailureKind::AgentFailure)
+        )),
+        environment_failures: usize::from(matches!(
+            result.failure_kind,
+            Some(EvalFailureKind::EnvironmentFailure)
+        )),
+        benchmark_failures: usize::from(matches!(
+            result.failure_kind,
+            Some(EvalFailureKind::GraderFailure)
+        )),
+        report_path: result
+            .workspace_path
+            .parent()
+            .map(|path| path.join("report.md"))
+            .unwrap_or_else(|| result.workspace_path.join("report.md")),
+        result_path: result
+            .workspace_path
+            .parent()
+            .map(|path| path.join("result.json"))
+            .unwrap_or_else(|| result.workspace_path.join("result.json")),
+        replay_paths: result.events_path.iter().cloned().collect(),
+        failures: failure.into_iter().collect(),
+    }
+}
+
+fn regression_from_terminal_bench(run: &TerminalBenchRun) -> RegressionBenchmarkResult {
+    let failures = run
+        .results
+        .iter()
+        .filter_map(|result| eval_failure(result.task_id.as_str(), result))
+        .collect::<Vec<_>>();
+    RegressionBenchmarkResult {
+        benchmark: "terminal-bench".to_string(),
+        subset: run.subset.clone(),
+        lock_version: run.lock_version.clone(),
+        total: run.results.len(),
+        passed: run.results.iter().filter(|result| result.passed).count(),
+        agent_failures: failures
+            .iter()
+            .filter(|failure| failure.category == RegressionFailureCategory::Agent)
+            .count(),
+        environment_failures: failures
+            .iter()
+            .filter(|failure| failure.category == RegressionFailureCategory::Environment)
+            .count(),
+        benchmark_failures: failures
+            .iter()
+            .filter(|failure| failure.category == RegressionFailureCategory::Benchmark)
+            .count(),
+        report_path: run.path.join("report.md"),
+        result_path: run.path.join("result.json"),
+        replay_paths: run
+            .results
+            .iter()
+            .filter_map(|result| result.events_path.clone())
+            .collect(),
+        failures,
+    }
+}
+
+fn regression_from_swe_bench(run: &SweBenchRun) -> RegressionBenchmarkResult {
+    let failures = run
+        .results
+        .iter()
+        .filter_map(swe_failure)
+        .collect::<Vec<_>>();
+    RegressionBenchmarkResult {
+        benchmark: "swe-bench".to_string(),
+        subset: run.subset.clone(),
+        lock_version: run.lock_version.clone(),
+        total: run.results.len(),
+        passed: run.results.iter().filter(|result| result.resolved).count(),
+        agent_failures: failures
+            .iter()
+            .filter(|failure| failure.category == RegressionFailureCategory::Agent)
+            .count(),
+        environment_failures: failures
+            .iter()
+            .filter(|failure| failure.category == RegressionFailureCategory::Environment)
+            .count(),
+        benchmark_failures: failures
+            .iter()
+            .filter(|failure| failure.category == RegressionFailureCategory::Benchmark)
+            .count(),
+        report_path: run.path.join("report.md"),
+        result_path: run.path.join("result.json"),
+        replay_paths: run
+            .results
+            .iter()
+            .filter_map(|result| result.events_path.clone())
+            .collect(),
+        failures,
+    }
+}
+
+fn eval_failure(id: &str, result: &EvalResult) -> Option<RegressionFailure> {
+    let kind = result.failure_kind?;
+    let category = match kind {
+        EvalFailureKind::AgentFailure => RegressionFailureCategory::Agent,
+        EvalFailureKind::EnvironmentFailure => RegressionFailureCategory::Environment,
+        EvalFailureKind::GraderFailure => RegressionFailureCategory::Benchmark,
+    };
+    Some(RegressionFailure {
+        id: id.to_string(),
+        category,
+        reason: result
+            .failure_reason
+            .clone()
+            .unwrap_or_else(|| kind.as_str().to_string()),
+        replay_path: result.events_path.clone(),
+    })
+}
+
+fn swe_failure(result: &SweBenchResult) -> Option<RegressionFailure> {
+    let kind = result.failure_kind?;
+    let category = match kind {
+        SweBenchFailureKind::LocalizationFailure | SweBenchFailureKind::PatchFailure => {
+            RegressionFailureCategory::Agent
+        }
+        SweBenchFailureKind::EnvironmentFailure | SweBenchFailureKind::Timeout => {
+            RegressionFailureCategory::Environment
+        }
+        SweBenchFailureKind::TestFailure => RegressionFailureCategory::Benchmark,
+    };
+    Some(RegressionFailure {
+        id: result.instance_id.clone(),
+        category,
+        reason: result
+            .failure_reason
+            .clone()
+            .unwrap_or_else(|| kind.as_str().to_string()),
+        replay_path: result.events_path.clone(),
+    })
+}
+
+fn pass_rate_bps(passed: usize, total: usize) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    ((passed as u64) * 10_000) / (total as u64)
+}
+
+fn format_rate(bps: u64) -> String {
+    format!("{}.{:02}%", bps / 100, bps % 100)
+}
+
+fn regression_failure_ids(benchmarks: &[RegressionBenchmarkResult]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for benchmark in benchmarks {
+        for failure in &benchmark.failures {
+            ids.push(format!("{}/{}", benchmark.benchmark, failure.id));
+        }
+    }
+    ids
+}
+
+fn new_failure_ids(current: &[String], previous: &[String]) -> Vec<String> {
+    current
+        .iter()
+        .filter(|failure| !previous.contains(failure))
+        .cloned()
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegressionSnapshot {
+    pass_rate_bps: u64,
+    failures: Vec<String>,
+}
+
+fn latest_previous_regression(
+    root: &Path,
+    current_path: &Path,
+) -> Result<Option<RegressionSnapshot>, EvalError> {
+    let evals_path = root.join(".flash").join("evals");
+    if !evals_path.exists() {
+        return Ok(None);
+    }
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(evals_path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == current_path {
+            continue;
+        }
+        let result_path = path.join("regression_result.json");
+        if !result_path.exists() {
+            continue;
+        }
+        let modified = entry
+            .metadata()?
+            .modified()
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        candidates.push((modified, result_path));
+    }
+    candidates.sort_by_key(|(modified, _)| *modified);
+    let Some((_, result_path)) = candidates.pop() else {
+        return Ok(None);
+    };
+    parse_regression_snapshot(&fs::read_to_string(result_path)?)
+}
+
+fn parse_regression_snapshot(content: &str) -> Result<Option<RegressionSnapshot>, EvalError> {
+    let Some(rate) = find_json_number(content, "pass_rate_bps") else {
+        return Ok(None);
+    };
+    let pass_rate_bps = rate
+        .parse()
+        .map_err(|_| EvalError::InvalidTask("invalid regression pass_rate_bps".to_string()))?;
+    Ok(Some(RegressionSnapshot {
+        pass_rate_bps,
+        failures: parse_json_string_array(content, "failures"),
+    }))
+}
+
+fn parse_json_string_array(content: &str, key: &str) -> Vec<String> {
+    let needle = format!("\"{key}\":[");
+    let Some(start) = content.find(&needle).map(|index| index + needle.len()) else {
+        return Vec::new();
+    };
+    let rest = &content[start..];
+    let Some(end) = rest.find(']') else {
+        return Vec::new();
+    };
+    rest[..end]
+        .split(',')
+        .filter_map(|part| {
+            let trimmed = part.trim();
+            if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+                Some(trimmed[1..trimmed.len() - 1].replace("\\\"", "\""))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn write_regression_summary(run: &RegressionRun) -> Result<(), EvalError> {
+    fs::write(&run.result_path, regression_result_json(run))?;
+    fs::write(&run.trend_path, regression_trend_json(run))?;
+    fs::write(&run.report_path, regression_report_markdown(run))?;
+    Ok(())
+}
+
+fn regression_result_json(run: &RegressionRun) -> String {
+    let failures = json_string_array(&regression_failure_ids(&run.benchmarks));
+    let new_failures = json_string_array(&run.new_failures);
+    let previous_rate = run
+        .previous_pass_rate_bps
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let mut benchmarks = String::new();
+    for (index, benchmark) in run.benchmarks.iter().enumerate() {
+        if index > 0 {
+            benchmarks.push(',');
+        }
+        benchmarks.push_str(&format!(
+            concat!(
+                "{{",
+                "\"benchmark\":\"{}\",",
+                "\"subset\":\"{}\",",
+                "\"lock_version\":\"{}\",",
+                "\"passed\":{},",
+                "\"total\":{},",
+                "\"agent_failures\":{},",
+                "\"environment_failures\":{},",
+                "\"benchmark_failures\":{},",
+                "\"report_path\":\"{}\",",
+                "\"result_path\":\"{}\"",
+                "}}"
+            ),
+            escape_json(&benchmark.benchmark),
+            escape_json(&benchmark.subset),
+            escape_json(&benchmark.lock_version),
+            benchmark.passed,
+            benchmark.total,
+            benchmark.agent_failures,
+            benchmark.environment_failures,
+            benchmark.benchmark_failures,
+            escape_json(&benchmark.report_path.display().to_string()),
+            escape_json(&benchmark.result_path.display().to_string())
+        ));
+    }
+    format!(
+        concat!(
+            "{{",
+            "\"kind\":\"regression\",",
+            "\"passed\":{},",
+            "\"failed\":{},",
+            "\"total\":{},",
+            "\"pass_rate_bps\":{},",
+            "\"previous_pass_rate_bps\":{},",
+            "\"failures\":{},",
+            "\"new_failures\":{},",
+            "\"benchmarks\":[{}]",
+            "}}\n"
+        ),
+        run.passed,
+        run.failed,
+        run.total,
+        run.pass_rate_bps,
+        previous_rate,
+        failures,
+        new_failures,
+        benchmarks
+    )
+}
+
+fn regression_trend_json(run: &RegressionRun) -> String {
+    let previous_rate = run
+        .previous_pass_rate_bps
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    format!(
+        concat!(
+            "{{",
+            "\"kind\":\"regression_trend\",",
+            "\"run_id\":\"{}\",",
+            "\"pass_rate_bps\":{},",
+            "\"previous_pass_rate_bps\":{},",
+            "\"delta_bps\":{},",
+            "\"new_failures\":{}",
+            "}}\n"
+        ),
+        escape_json(&run.run_id),
+        run.pass_rate_bps,
+        previous_rate,
+        run.previous_pass_rate_bps
+            .map(|previous| run.pass_rate_bps as i64 - previous as i64)
+            .unwrap_or(0),
+        json_string_array(&run.new_failures)
+    )
+}
+
+fn regression_report_markdown(run: &RegressionRun) -> String {
+    let previous_rate = run
+        .previous_pass_rate_bps
+        .map(format_rate)
+        .unwrap_or_else(|| "n/a".to_string());
+    let delta = run
+        .previous_pass_rate_bps
+        .map(|previous| format!("{} bps", run.pass_rate_bps as i64 - previous as i64))
+        .unwrap_or_else(|| "n/a".to_string());
+    let mut report = format!(
+        concat!(
+            "# Flash Regression Report\n\n",
+            "| Field | Value |\n",
+            "|---|---|\n",
+            "| passed | {}/{} |\n",
+            "| pass rate | {} |\n",
+            "| previous pass rate | {} |\n",
+            "| delta | {} |\n",
+            "| new failures | {} |\n\n",
+            "| Benchmark | Subset | Lock version | Passed | Agent failures | Environment failures | Benchmark failures | Report |\n",
+            "|---|---|---|---:|---:|---:|---:|---|\n"
+        ),
+        run.passed,
+        run.total,
+        format_rate(run.pass_rate_bps),
+        previous_rate,
+        delta,
+        run.new_failures.len()
+    );
+    for benchmark in &run.benchmarks {
+        report.push_str(&format!(
+            "| {} | {} | {} | {}/{} | {} | {} | {} | {} |\n",
+            benchmark.benchmark,
+            benchmark.subset,
+            benchmark.lock_version,
+            benchmark.passed,
+            benchmark.total,
+            benchmark.agent_failures,
+            benchmark.environment_failures,
+            benchmark.benchmark_failures,
+            benchmark.report_path.display()
+        ));
+    }
+    report.push_str("\n## Replay Links\n\n");
+    for benchmark in &run.benchmarks {
+        for replay_path in &benchmark.replay_paths {
+            report.push_str(&format!(
+                "- {} {}: {}\n",
+                benchmark.benchmark,
+                benchmark.subset,
+                replay_path.display()
+            ));
+        }
+    }
+    report.push_str("\n## New Failures\n\n");
+    if run.new_failures.is_empty() {
+        report.push_str("- none\n");
+    } else {
+        for failure in &run.new_failures {
+            report.push_str(&format!("- {failure}\n"));
+        }
+    }
+    report.push_str("\n## Failures\n\n");
+    if run.failed == 0 {
+        report.push_str("- none\n");
+    } else {
+        for benchmark in &run.benchmarks {
+            for failure in &benchmark.failures {
+                let replay = failure
+                    .replay_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "n/a".to_string());
+                report.push_str(&format!(
+                    "- {}/{} [{}]: {} replay={}\n",
+                    benchmark.benchmark,
+                    failure.id,
+                    failure.category.as_str(),
+                    failure.reason,
+                    replay
+                ));
+            }
+        }
+    }
+    report
+}
+
+fn json_string_array(values: &[String]) -> String {
+    let mut content = String::from("[");
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            content.push(',');
+        }
+        content.push('"');
+        content.push_str(&escape_json(value));
+        content.push('"');
+    }
+    content.push(']');
+    content
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EventMetrics {
     command_count: u64,
@@ -1399,6 +1953,43 @@ mod tests {
             .results
             .iter()
             .all(|result| result.patch_path.as_ref().is_some_and(|path| path.exists())));
+    }
+
+    #[test]
+    fn run_regression_should_write_report_trend_and_replay_links() {
+        let root = temp_dir("regression");
+        fs::create_dir_all(&root).unwrap();
+
+        let run = run_regression_with_swe_limit(&root, 1).unwrap();
+
+        assert_eq!(run.total, 3);
+        assert_eq!(run.passed, 3);
+        assert!(run.report_path.exists());
+        assert!(run.result_path.exists());
+        assert!(run.trend_path.exists());
+        let report = fs::read_to_string(&run.report_path).unwrap();
+        assert!(report.contains("Replay Links"));
+        assert!(report.contains("internal-fixture-fix-rust-v1"));
+        assert!(report.contains("terminal-bench"));
+        assert!(report.contains("swe-bench"));
+        assert!(fs::read_to_string(&run.result_path)
+            .unwrap()
+            .contains("\"kind\":\"regression\""));
+    }
+
+    #[test]
+    fn run_regression_should_compare_against_previous_result() {
+        let root = temp_dir("regression_previous");
+        fs::create_dir_all(&root).unwrap();
+
+        let first = run_regression_with_swe_limit(&root, 1).unwrap();
+        let second = run_regression_with_swe_limit(&root, 1).unwrap();
+
+        assert_eq!(second.previous_pass_rate_bps, Some(first.pass_rate_bps));
+        assert!(second.new_failures.is_empty());
+        assert!(fs::read_to_string(&second.trend_path)
+            .unwrap()
+            .contains("\"previous_pass_rate_bps\":10000"));
     }
 
     #[test]

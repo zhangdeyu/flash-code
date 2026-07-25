@@ -163,6 +163,7 @@ fn eval(args: &[String]) -> Result<(), CliError> {
         Some("fixture") => eval_fixture(&args[1..]),
         Some("terminal-bench") => eval_terminal_bench(&args[1..]),
         Some("swe-bench") => eval_swe_bench(&args[1..]),
+        Some("regression") => eval_regression(&args[1..]),
         Some(command) => Err(CliError::Usage(format!("unknown eval command `{command}`"))),
         None => Err(CliError::Usage(
             "usage: flash eval fixture --task fix-rust".to_string(),
@@ -277,6 +278,41 @@ fn eval_swe_bench(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
+fn eval_regression(args: &[String]) -> Result<(), CliError> {
+    if !args.is_empty() {
+        return Err(CliError::Usage("usage: flash eval regression".to_string()));
+    }
+    let root = discover_workspace_root(None)?;
+    init_workspace(&root)?;
+    let run = flash_eval::run_regression(&root)?;
+    println!("benchmark: regression");
+    println!("passed: {}/{}", run.passed, run.total);
+    println!("pass_rate_bps: {}", run.pass_rate_bps);
+    match run.previous_pass_rate_bps {
+        Some(previous) => println!("previous_pass_rate_bps: {previous}"),
+        None => println!("previous_pass_rate_bps: none"),
+    }
+    println!("new_failures: {}", run.new_failures.len());
+    println!("eval_run: {}", run.path.display());
+    println!("report: {}", run.report_path.display());
+    println!("result: {}", run.result_path.display());
+    println!("trend: {}", run.trend_path.display());
+    for benchmark in run.benchmarks {
+        println!(
+            "benchmark_result: {} subset={} pass={}/{} agent_failures={} environment_failures={} benchmark_failures={}",
+            benchmark.benchmark,
+            benchmark.subset,
+            benchmark.passed,
+            benchmark.total,
+            benchmark.agent_failures,
+            benchmark.environment_failures,
+            benchmark.benchmark_failures
+        );
+        println!("benchmark_report: {}", benchmark.report_path.display());
+    }
+    Ok(())
+}
+
 fn parse_task_arg(args: &[String]) -> Result<String, CliError> {
     let Some(flag_index) = args.iter().position(|arg| arg == "--task") else {
         return Err(CliError::Usage(
@@ -382,6 +418,7 @@ fn print_help() {
         "  flash eval fixture --task fix-rust\n",
         "  flash eval terminal-bench --subset smoke\n",
         "  flash eval swe-bench --subset verified --limit 10\n",
+        "  flash eval regression\n",
         "  flash replay <events.jsonl>\n",
         "  flash resume <session_id>\n\n",
         "Running `flash` without a subcommand enters the TUI.\n"

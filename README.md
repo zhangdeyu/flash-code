@@ -16,6 +16,7 @@ Current default behavior:
 - `flash eval fixture --task fix-rust`: runs the local eval harness smoke task.
 - `flash eval terminal-bench --subset smoke`: runs the locked Terminal-Bench smoke adapter.
 - `flash eval swe-bench --subset verified --limit 10`: runs the locked SWE-bench Verified smoke adapter.
+- `flash eval regression`: runs the fixed smoke regression suite and writes a trend report.
 - `flash resume <session_id>`: validates the current workspace before resuming.
 
 Current planning document:
