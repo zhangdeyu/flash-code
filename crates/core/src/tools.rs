@@ -204,4 +204,89 @@ mod tests {
 
         assert_eq!(policy.decide(ToolRisk::Execute), PermissionDecision::Deny);
     }
+
+    #[test]
+    fn permission_policy_should_cover_confirm_yolo_and_human_modes() {
+        let cases = [
+            (
+                ApprovalMode::Confirm,
+                ToolRisk::Read,
+                PermissionDecision::Allow,
+            ),
+            (
+                ApprovalMode::Confirm,
+                ToolRisk::Write,
+                PermissionDecision::Ask,
+            ),
+            (
+                ApprovalMode::Confirm,
+                ToolRisk::Execute,
+                PermissionDecision::Ask,
+            ),
+            (
+                ApprovalMode::Confirm,
+                ToolRisk::Network,
+                PermissionDecision::Ask,
+            ),
+            (
+                ApprovalMode::Confirm,
+                ToolRisk::Destructive,
+                PermissionDecision::Ask,
+            ),
+            (
+                ApprovalMode::Yolo,
+                ToolRisk::Read,
+                PermissionDecision::Allow,
+            ),
+            (
+                ApprovalMode::Yolo,
+                ToolRisk::Write,
+                PermissionDecision::Allow,
+            ),
+            (
+                ApprovalMode::Yolo,
+                ToolRisk::Execute,
+                PermissionDecision::Allow,
+            ),
+            (
+                ApprovalMode::Yolo,
+                ToolRisk::Network,
+                PermissionDecision::Ask,
+            ),
+            (
+                ApprovalMode::Yolo,
+                ToolRisk::Destructive,
+                PermissionDecision::Ask,
+            ),
+            (
+                ApprovalMode::Human,
+                ToolRisk::Read,
+                PermissionDecision::Deny,
+            ),
+            (
+                ApprovalMode::Human,
+                ToolRisk::Write,
+                PermissionDecision::Deny,
+            ),
+            (
+                ApprovalMode::Human,
+                ToolRisk::Execute,
+                PermissionDecision::Deny,
+            ),
+            (
+                ApprovalMode::Human,
+                ToolRisk::Network,
+                PermissionDecision::Deny,
+            ),
+            (
+                ApprovalMode::Human,
+                ToolRisk::Destructive,
+                PermissionDecision::Deny,
+            ),
+        ];
+
+        for (mode, risk, expected) in cases {
+            assert_eq!(PermissionPolicy::new(mode).decide(risk), expected);
+        }
+    }
 }

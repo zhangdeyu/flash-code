@@ -1015,9 +1015,16 @@ mod tests {
         let artifact = root
             .join(".flash")
             .join("sessions")
-            .join(run.session_id)
+            .join(&run.session_id)
             .join("artifacts/call_large.stdout.txt");
         assert!(artifact.exists());
+        assert_eq!(fs::read_to_string(&artifact).unwrap(), "abcdef");
+
+        let session_dir = root.join(".flash").join("sessions").join(&run.session_id);
+        let events = fs::read_to_string(session_dir.join("events.jsonl")).unwrap();
+        let messages = fs::read_to_string(session_dir.join("messages.jsonl")).unwrap();
+        assert!(events.contains("[full output: artifacts/call_large.stdout.txt]"));
+        assert!(messages.contains("[full output: artifacts/call_large.stdout.txt]"));
     }
 
     #[test]

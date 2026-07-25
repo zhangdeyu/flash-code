@@ -612,8 +612,48 @@ mod tests {
     fn builtin_registry_should_expose_new_protocol_names_and_legacy_aliases() {
         let registry = builtin_registry().unwrap();
 
-        assert!(registry.get("Read").is_some());
-        assert!(registry.get("read_file").is_some());
+        for name in [
+            "Read",
+            "Edit",
+            "Write",
+            "Glob",
+            "Grep",
+            "ListFiles",
+            "Bash",
+            "read_file",
+            "apply_patch",
+            "write_file",
+            "search",
+            "shell",
+            "git_diff",
+            "run_tests",
+        ] {
+            assert!(registry.get(name).is_some(), "missing tool {name}");
+        }
+    }
+
+    #[test]
+    fn v1_tool_risks_should_match_protocol() {
+        let registry = builtin_registry().unwrap();
+        let cases = [
+            ("Read", "src/lib.rs", ToolRisk::Read),
+            (
+                "Edit",
+                "src/lib.rs\n---FIND---\na\n---REPLACE---\nb",
+                ToolRisk::Write,
+            ),
+            ("Write", "src/lib.rs\n---CONTENT---\n", ToolRisk::Write),
+            ("Glob", "**/*.rs", ToolRisk::Read),
+            ("Grep", "answer", ToolRisk::Read),
+            ("ListFiles", ".", ToolRisk::Read),
+            ("Bash", "cargo test", ToolRisk::Execute),
+            ("Bash", "rm -rf target", ToolRisk::Destructive),
+        ];
+
+        for (name, input, expected) in cases {
+            let tool = registry.get(name).unwrap();
+            assert_eq!(tool.risk(input), expected, "wrong risk for {name}");
+        }
     }
 
     #[test]
@@ -636,22 +676,49 @@ mod tests {
     }
 
     #[test]
+    fn read_should_read_file_contents() {
+        let root = temp_dir("read_success");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn ok() {}").unwrap();
+        let tool = ReadTool;
+
+        let output = tool.call("src/lib.rs", &context(root)).unwrap();
+
+        assert_eq!(output.stdout, "pub fn ok() {}");
+    }
+
+    #[test]
+    fn read_should_report_missing_file() {
+        let root = temp_dir("read_missing");
+        fs::create_dir_all(&root).unwrap();
+        let tool = ReadTool;
+
+        let error = tool.call("missing.rs", &context(root)).unwrap_err();
+
+        assert!(error.message.contains("invalid path"));
+    }
+
+    #[test]
     fn list_files_should_list_directory_entries() {
         let root = temp_dir("list_files");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("Cargo.toml"), "").unwrap();
         let tool = ListFilesTool;
 
-        let output = tool
-            .call(
-                ".",
-                &ToolContext {
-                    workspace_root: root,
-                },
-            )
-            .unwrap();
+        let output = tool.call(".", &context(root)).unwrap();
 
         assert!(output.stdout.contains("src/"));
+    }
+
+    #[test]
+    fn list_files_should_report_missing_directory() {
+        let root = temp_dir("list_files_missing");
+        fs::create_dir_all(&root).unwrap();
+        let tool = ListFilesTool;
+
+        let error = tool.call("missing", &context(root)).unwrap_err();
+
+        assert!(error.message.contains("invalid path"));
     }
 
     #[test]
@@ -661,16 +728,19 @@ mod tests {
         fs::write(root.join("src/lib.rs"), "").unwrap();
         let tool = GlobTool;
 
-        let output = tool
-            .call(
-                "**/*.rs",
-                &ToolContext {
-                    workspace_root: root,
-                },
-            )
-            .unwrap();
+        let output = tool.call("**/*.rs", &context(root)).unwrap();
 
         assert!(output.stdout.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn glob_should_report_invalid_workspace_root() {
+        let root = temp_dir("glob_missing_root");
+        let tool = GlobTool;
+
+        let error = tool.call("**/*.rs", &context(root)).unwrap_err();
+
+        assert!(error.message.contains("failed to read dir"));
     }
 
     #[test]
@@ -680,16 +750,19 @@ mod tests {
         fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 42 }").unwrap();
         let tool = GrepTool;
 
-        let output = tool
-            .call(
-                "answer",
-                &ToolContext {
-                    workspace_root: root,
-                },
-            )
-            .unwrap();
+        let output = tool.call("answer", &context(root)).unwrap();
 
         assert!(output.stdout.contains("src/lib.rs:1"));
+    }
+
+    #[test]
+    fn grep_should_report_invalid_workspace_root() {
+        let root = temp_dir("grep_missing_root");
+        let tool = GrepTool;
+
+        let error = tool.call("answer", &context(root)).unwrap_err();
+
+        assert!(error.message.contains("failed to read dir"));
     }
 
     #[test]
@@ -701,12 +774,7 @@ mod tests {
         let tool = ReadFileTool;
 
         let error = tool
-            .call(
-                outside.to_str().unwrap(),
-                &ToolContext {
-                    workspace_root: root,
-                },
-            )
+            .call(outside.to_str().unwrap(), &context(root))
             .unwrap_err();
 
         assert_eq!(error.message, "path escapes workspace");
@@ -722,9 +790,7 @@ mod tests {
         let output = tool
             .call(
                 "src/lib.rs\n---FIND---\n41\n---REPLACE---\n42",
-                &ToolContext {
-                    workspace_root: root,
-                },
+                &context(root),
             )
             .unwrap();
 
@@ -741,13 +807,44 @@ mod tests {
         let output = tool
             .call(
                 "src/lib.rs\n---FIND---\n41\n---REPLACE---\n42",
-                &ToolContext {
-                    workspace_root: root,
-                },
+                &context(root),
             )
             .unwrap();
 
         assert!(output.stdout.contains("patched src/lib.rs"));
+    }
+
+    #[test]
+    fn edit_should_report_find_text_missing() {
+        let root = temp_dir("edit_missing_find");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 42 }\n").unwrap();
+        let tool = EditTool;
+
+        let error = tool
+            .call(
+                "src/lib.rs\n---FIND---\n41\n---REPLACE---\n42",
+                &context(root),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.message, "apply_patch failed: find text not found");
+    }
+
+    #[test]
+    fn edit_should_reject_parent_dir_escape() {
+        let root = temp_dir("edit_escape_parent");
+        fs::create_dir_all(&root).unwrap();
+        let tool = EditTool;
+
+        let error = tool
+            .call(
+                "../outside.rs\n---FIND---\nold\n---REPLACE---\nnew",
+                &context(root),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.message, "path escapes workspace");
     }
 
     #[test]
@@ -760,13 +857,42 @@ mod tests {
         let error = tool
             .call(
                 "src/lib.rs\n---FIND---\n41\n---REPLACE---\n42",
-                &ToolContext {
-                    workspace_root: root,
-                },
+                &context(root),
             )
             .unwrap_err();
 
         assert_eq!(error.message, "apply_patch failed: find text not found");
+    }
+
+    #[test]
+    fn write_should_create_file_contents() {
+        let root = temp_dir("write_success");
+        fs::create_dir_all(root.join("src")).unwrap();
+        let tool = WriteTool;
+
+        let output = tool
+            .call(
+                "src/lib.rs\n---CONTENT---\npub fn ok() {}",
+                &context(root.clone()),
+            )
+            .unwrap();
+
+        assert!(output.stdout.contains("wrote src/lib.rs"));
+        assert_eq!(
+            fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+            "pub fn ok() {}"
+        );
+    }
+
+    #[test]
+    fn write_should_report_invalid_input_shape() {
+        let root = temp_dir("write_invalid");
+        fs::create_dir_all(&root).unwrap();
+        let tool = WriteTool;
+
+        let error = tool.call("src/lib.rs", &context(root)).unwrap_err();
+
+        assert!(error.message.contains("write_file input must be"));
     }
 
     #[test]
@@ -776,12 +902,7 @@ mod tests {
         let tool = WriteFileTool;
 
         let error = tool
-            .call(
-                "../outside.txt\n---CONTENT---\nnope",
-                &ToolContext {
-                    workspace_root: root,
-                },
-            )
+            .call("../outside.txt\n---CONTENT---\nnope", &context(root))
             .unwrap_err();
 
         assert_eq!(error.message, "path escapes workspace");
@@ -798,12 +919,7 @@ mod tests {
         let tool = WriteFileTool;
 
         let error = tool
-            .call(
-                "link/outside.txt\n---CONTENT---\nnope",
-                &ToolContext {
-                    workspace_root: root,
-                },
-            )
+            .call("link/outside.txt\n---CONTENT---\nnope", &context(root))
             .unwrap_err();
 
         assert_eq!(error.message, "path escapes workspace");
@@ -816,15 +932,45 @@ mod tests {
         let tool = WriteFileTool;
 
         let error = tool
-            .call(
-                "/tmp/outside.txt\n---CONTENT---\nnope",
-                &ToolContext {
-                    workspace_root: root,
-                },
-            )
+            .call("/tmp/outside.txt\n---CONTENT---\nnope", &context(root))
             .unwrap_err();
 
         assert_eq!(error.message, "path escapes workspace");
+    }
+
+    #[test]
+    fn bash_should_execute_successful_command() {
+        let root = temp_dir("bash_success");
+        fs::create_dir_all(&root).unwrap();
+        let tool = BashTool {
+            timeout: Duration::from_secs(1),
+        };
+
+        let output = tool.call("printf ok", &context(root)).unwrap();
+
+        assert_eq!(output.stdout, "ok");
+    }
+
+    #[test]
+    fn bash_should_return_error_for_failing_command() {
+        let root = temp_dir("bash_failure");
+        fs::create_dir_all(&root).unwrap();
+        let tool = BashTool {
+            timeout: Duration::from_secs(1),
+        };
+
+        let output = tool
+            .call("printf nope >&2; exit 7", &context(root))
+            .unwrap();
+
+        assert_eq!(output.status, ToolExitStatus::Error);
+    }
+
+    #[test]
+    fn bash_risk_should_classify_destructive_commands() {
+        let tool = BashTool::default();
+
+        assert_eq!(tool.risk("rm -rf target"), ToolRisk::Destructive);
     }
 
     #[test]
@@ -835,14 +981,7 @@ mod tests {
             timeout: Duration::from_millis(1),
         };
 
-        let output = tool
-            .call(
-                "sleep 1",
-                &ToolContext {
-                    workspace_root: root,
-                },
-            )
-            .unwrap();
+        let output = tool.call("sleep 1", &context(root)).unwrap();
 
         assert_eq!(output.status, ToolExitStatus::Error);
     }
@@ -854,15 +993,14 @@ mod tests {
         let tool = RunTestsTool::default();
 
         let output = tool
-            .call(
-                "printf failure >&2; exit 1",
-                &ToolContext {
-                    workspace_root: root,
-                },
-            )
+            .call("printf failure >&2; exit 1", &context(root))
             .unwrap();
 
         assert!(output.stderr.contains("failure"));
+    }
+
+    fn context(workspace_root: PathBuf) -> ToolContext {
+        ToolContext { workspace_root }
     }
 
     fn temp_dir(name: &str) -> PathBuf {
