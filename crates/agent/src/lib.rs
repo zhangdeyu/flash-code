@@ -10,6 +10,25 @@ use flash_provider::{
     ChatProvider, ChatRequest, ProviderError, ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
 };
 
+pub trait EventObserver {
+    fn on_event(&mut self, event: &Event);
+}
+
+impl<F> EventObserver for F
+where
+    F: FnMut(&Event),
+{
+    fn on_event(&mut self, event: &Event) {
+        self(event);
+    }
+}
+
+struct NoopObserver;
+
+impl EventObserver for NoopObserver {
+    fn on_event(&mut self, _event: &Event) {}
+}
+
 pub struct AgentRuntime<P> {
     provider: P,
     tools: ToolRegistry,
@@ -38,6 +57,32 @@ where
     }
 
     pub fn run_task(&mut self, workspace_root: &Path, task: &str) -> Result<AgentRun, AgentError> {
+        self.run_task_with_observer(workspace_root, task, NoopObserver)
+    }
+
+    pub fn run_task_with_observer<O>(
+        &mut self,
+        workspace_root: &Path,
+        task: &str,
+        mut observer: O,
+    ) -> Result<AgentRun, AgentError>
+    where
+        O: EventObserver,
+    {
+        self.run_task_controlled(workspace_root, task, &mut observer, || false)
+    }
+
+    pub fn run_task_controlled<O, C>(
+        &mut self,
+        workspace_root: &Path,
+        task: &str,
+        observer: &mut O,
+        mut should_cancel: C,
+    ) -> Result<AgentRun, AgentError>
+    where
+        O: EventObserver,
+        C: FnMut() -> bool,
+    {
         let session = create_session(workspace_root)?;
         let user = append_user_message(&session, task)?;
         let mut history = vec![user];
@@ -46,12 +91,34 @@ where
         };
 
         for turn in 1..=self.options.max_turns {
-            append_event(
+            if should_cancel() {
+                emit_event(
+                    &session,
+                    Event::Error {
+                        message: "run cancelled".to_string(),
+                    },
+                    observer,
+                )?;
+                emit_event(
+                    &session,
+                    Event::SessionFinished {
+                        outcome: Outcome::Cancelled,
+                    },
+                    observer,
+                )?;
+                return Ok(AgentRun {
+                    session_id: session.id,
+                    outcome: Outcome::Cancelled,
+                });
+            }
+
+            emit_event(
                 &session,
                 Event::ModelRequestStarted {
                     request_id: format!("request_{turn}"),
                     model: self.options.model.clone(),
                 },
+                observer,
             )?;
             let request = ChatRequest {
                 messages: project_history(&history, self.options.max_prompt_bytes),
@@ -65,13 +132,34 @@ where
                 model: self.options.model.clone(),
             };
             let provider_events = self.chat_with_retry(request)?;
-            let turn_result = self.handle_provider_events(&session, provider_events)?;
+            let turn_result = self.handle_provider_events(&session, provider_events, observer)?;
             let Some(turn_result) = turn_result else {
                 return Ok(AgentRun {
                     session_id: session.id,
                     outcome: Outcome::Cancelled,
                 });
             };
+
+            if should_cancel() {
+                emit_event(
+                    &session,
+                    Event::Error {
+                        message: "run cancelled".to_string(),
+                    },
+                    observer,
+                )?;
+                emit_event(
+                    &session,
+                    Event::SessionFinished {
+                        outcome: Outcome::Cancelled,
+                    },
+                    observer,
+                )?;
+                return Ok(AgentRun {
+                    session_id: session.id,
+                    outcome: Outcome::Cancelled,
+                });
+            }
 
             let assistant = append_assistant_message(
                 &session,
@@ -85,11 +173,12 @@ where
             history.push(assistant);
 
             if turn_result.tool_calls.is_empty() {
-                append_event(
+                emit_event(
                     &session,
                     Event::SessionFinished {
                         outcome: Outcome::Succeeded,
                     },
+                    observer,
                 )?;
                 return Ok(AgentRun {
                     session_id: session.id,
@@ -98,22 +187,44 @@ where
             }
 
             for call in turn_result.tool_calls {
-                let message = self.execute_tool_call(&session, &context, &call)?;
+                if should_cancel() {
+                    emit_event(
+                        &session,
+                        Event::Error {
+                            message: "run cancelled".to_string(),
+                        },
+                        observer,
+                    )?;
+                    emit_event(
+                        &session,
+                        Event::SessionFinished {
+                            outcome: Outcome::Cancelled,
+                        },
+                        observer,
+                    )?;
+                    return Ok(AgentRun {
+                        session_id: session.id,
+                        outcome: Outcome::Cancelled,
+                    });
+                }
+                let message = self.execute_tool_call(&session, &context, &call, observer)?;
                 history.push(message);
             }
         }
 
-        append_event(
+        emit_event(
             &session,
             Event::Error {
                 message: "max_turns exceeded".to_string(),
             },
+            observer,
         )?;
-        append_event(
+        emit_event(
             &session,
             Event::SessionFinished {
                 outcome: Outcome::Failed,
             },
+            observer,
         )?;
         Ok(AgentRun {
             session_id: session.id,
@@ -125,6 +236,7 @@ where
         &self,
         session: &flash_core::storage::Session,
         provider_events: Vec<ProviderEvent>,
+        observer: &mut impl EventObserver,
     ) -> Result<Option<TurnResult>, AgentError> {
         let mut assistant_text = String::new();
         let mut tool_calls = Vec::new();
@@ -133,19 +245,20 @@ where
         for event in provider_events {
             match event {
                 ProviderEvent::ReasoningDelta(text) => {
-                    append_event(session, Event::ReasoningDelta { text })?;
+                    emit_event(session, Event::ReasoningDelta { text }, observer)?;
                 }
                 ProviderEvent::TextDelta(text) => {
                     assistant_text.push_str(&text);
-                    append_event(session, Event::AssistantDelta { text })?;
+                    emit_event(session, Event::AssistantDelta { text }, observer)?;
                 }
                 ProviderEvent::ToolCallComplete(call) => {
-                    append_event(
+                    emit_event(
                         session,
                         Event::ToolCallRequested {
                             call_id: call.call_id.clone(),
                             name: call.name.clone(),
                         },
+                        observer,
                     )?;
                     tool_calls.push(call);
                 }
@@ -153,12 +266,13 @@ where
                     input_tokens,
                     output_tokens,
                 }) => {
-                    append_event(
+                    emit_event(
                         session,
                         Event::UsageRecorded {
                             input_tokens,
                             output_tokens,
                         },
+                        observer,
                     )?;
                 }
                 ProviderEvent::Done(StopReason::EndTurn | StopReason::ToolUse) => {
@@ -166,28 +280,31 @@ where
                 }
                 ProviderEvent::Done(StopReason::MaxTokens) => {
                     saw_done = true;
-                    append_event(
+                    emit_event(
                         session,
                         Event::Error {
                             message: "provider stopped at max tokens".to_string(),
                         },
+                        observer,
                     )?;
                 }
             }
         }
 
         if !saw_done {
-            append_event(
+            emit_event(
                 session,
                 Event::Error {
                     message: "model stream ended before done".to_string(),
                 },
+                observer,
             )?;
-            append_event(
+            emit_event(
                 session,
                 Event::SessionFinished {
                     outcome: Outcome::Cancelled,
                 },
+                observer,
             )?;
             return Ok(None);
         }
@@ -215,20 +332,23 @@ where
         session: &flash_core::storage::Session,
         context: &ToolContext,
         call: &ToolCall,
+        observer: &mut impl EventObserver,
     ) -> Result<Message, AgentError> {
         let Some(tool) = self.tools.get(&call.name) else {
-            append_event(
+            emit_event(
                 session,
                 Event::Error {
                     message: format!("unknown tool `{}`", call.name),
                 },
+                observer,
             )?;
-            append_event(
+            emit_event(
                 session,
                 Event::ToolFinished {
                     call_id: call.call_id.clone(),
                     status: ToolResultStatus::Error,
                 },
+                observer,
             )?;
             return append_tool_result_message(
                 session,
@@ -245,35 +365,39 @@ where
             .decide(tool.risk(&call.input));
         match decision {
             PermissionDecision::Allow => {
-                append_event(
+                emit_event(
                     session,
                     Event::ApprovalResolved {
                         call_id: call.call_id.clone(),
                         approved: true,
                     },
+                    observer,
                 )?;
-                append_event(
+                emit_event(
                     session,
                     Event::ToolStarted {
                         call_id: call.call_id.clone(),
                         name: call.name.clone(),
                     },
+                    observer,
                 )?;
                 match tool.call(&call.input, context) {
-                    Ok(output) => self.commit_tool_output(session, call, output),
+                    Ok(output) => self.commit_tool_output(session, call, output, observer),
                     Err(error) => {
-                        append_event(
+                        emit_event(
                             session,
                             Event::Error {
                                 message: error.message.clone(),
                             },
+                            observer,
                         )?;
-                        append_event(
+                        emit_event(
                             session,
                             Event::ToolFinished {
                                 call_id: call.call_id.clone(),
                                 status: ToolResultStatus::Error,
                             },
+                            observer,
                         )?;
                         append_tool_result_message(
                             session,
@@ -286,25 +410,28 @@ where
                 }
             }
             PermissionDecision::Ask | PermissionDecision::Deny => {
-                append_event(
+                emit_event(
                     session,
                     Event::ApprovalRequired {
                         call_id: call.call_id.clone(),
                     },
+                    observer,
                 )?;
-                append_event(
+                emit_event(
                     session,
                     Event::ApprovalResolved {
                         call_id: call.call_id.clone(),
                         approved: false,
                     },
+                    observer,
                 )?;
-                append_event(
+                emit_event(
                     session,
                     Event::ToolFinished {
                         call_id: call.call_id.clone(),
                         status: ToolResultStatus::Rejected,
                     },
+                    observer,
                 )?;
                 append_tool_result_message(
                     session,
@@ -322,27 +449,30 @@ where
         session: &flash_core::storage::Session,
         call: &ToolCall,
         output: flash_core::ToolOutput,
+        observer: &mut impl EventObserver,
     ) -> Result<Message, AgentError> {
         let stdout = self.materialize_output(session, &call.call_id, "stdout", &output.stdout)?;
         let stderr = self.materialize_output(session, &call.call_id, "stderr", &output.stderr)?;
         if !stdout.is_empty() {
-            append_event(
+            emit_event(
                 session,
                 Event::ToolOutputDelta {
                     call_id: call.call_id.clone(),
                     stream: "stdout".to_string(),
                     text: stdout.clone(),
                 },
+                observer,
             )?;
         }
         if !stderr.is_empty() {
-            append_event(
+            emit_event(
                 session,
                 Event::ToolOutputDelta {
                     call_id: call.call_id.clone(),
                     stream: "stderr".to_string(),
                     text: stderr.clone(),
                 },
+                observer,
             )?;
         }
         let status = match output.status {
@@ -350,12 +480,13 @@ where
             ToolExitStatus::Error => ToolResultStatus::Error,
             ToolExitStatus::Cancelled => ToolResultStatus::Cancelled,
         };
-        append_event(
+        emit_event(
             session,
             Event::ToolFinished {
                 call_id: call.call_id.clone(),
                 status,
             },
+            observer,
         )?;
         append_tool_result_message(
             session,
@@ -385,6 +516,16 @@ where
             artifact
         ))
     }
+}
+
+fn emit_event(
+    session: &flash_core::storage::Session,
+    event: Event,
+    observer: &mut impl EventObserver,
+) -> Result<(), AgentError> {
+    append_event(session, event.clone())?;
+    observer.on_event(&event);
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -850,6 +991,71 @@ mod tests {
         )
         .unwrap();
         assert!(messages.contains("\"status\":\"cancelled\""));
+    }
+
+    #[test]
+    fn run_task_with_observer_should_emit_live_events_after_storage_commit() {
+        let root = temp_dir("observer");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+        let mut runtime = AgentRuntime::new(
+            SmokeProvider::new(),
+            flash_tools_for_tests(),
+            AgentOptions {
+                model: "smoke".to_string(),
+                max_turns: 3,
+                permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Confirm),
+                max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
+            },
+        );
+        let mut observed = Vec::new();
+
+        let run = runtime
+            .run_task_with_observer(&root, "list files", |event: &Event| {
+                observed.push(event.event_type().to_string());
+            })
+            .unwrap();
+
+        let events = fs::read_to_string(
+            root.join(".flash")
+                .join("sessions")
+                .join(run.session_id)
+                .join("events.jsonl"),
+        )
+        .unwrap();
+        assert!(events.contains(observed.first().unwrap()));
+    }
+
+    #[test]
+    fn run_task_controlled_should_cancel_without_committing_assistant_message() {
+        let root = temp_dir("controlled_cancel");
+        fs::create_dir_all(&root).unwrap();
+        let mut runtime = AgentRuntime::new(
+            SmokeProvider::new(),
+            flash_tools_for_tests(),
+            AgentOptions {
+                model: "smoke".to_string(),
+                max_turns: 3,
+                permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Confirm),
+                max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
+            },
+        );
+        let mut observer = NoopObserver;
+
+        let run = runtime
+            .run_task_controlled(&root, "list files", &mut observer, || true)
+            .unwrap();
+
+        let messages = fs::read_to_string(
+            root.join(".flash")
+                .join("sessions")
+                .join(run.session_id)
+                .join("messages.jsonl"),
+        )
+        .unwrap();
+        assert!(!messages.contains("\"role\":\"assistant\""));
     }
 
     #[test]

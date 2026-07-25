@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use flash_agent::{AgentOptions, AgentRuntime, SmokeProvider};
 use flash_core::{
-    discover_workspace_root, init_workspace, replay_events, Config, ConfigOverrides,
+    discover_workspace_root, init_workspace, replay_events, Config, ConfigOverrides, Event,
     PermissionPolicy,
 };
 
@@ -17,7 +17,7 @@ fn main() {
 
 fn run(args: Vec<String>) -> Result<(), CliError> {
     match args.first().map(String::as_str) {
-        None => flash_tui::run_current_workspace().map_err(CliError::Tui),
+        None => tui(),
         Some("--version" | "-V") => {
             println!("flash {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -27,12 +27,52 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         Some("run") => run_task(&args[1..]),
         Some("replay") => replay(&args[1..]),
         Some("resume") => resume(&args[1..]),
-        Some("tui") => flash_tui::run_current_workspace().map_err(CliError::Tui),
+        Some("tui") => tui(),
         Some("help" | "--help" | "-h") => {
             print_help();
             Ok(())
         }
         Some(command) => Err(CliError::Usage(format!("unknown command `{command}`"))),
+    }
+}
+
+fn tui() -> Result<(), CliError> {
+    let mut runner = CliTaskRunner;
+    flash_tui::run_current_workspace(&mut runner).map_err(CliError::Tui)
+}
+
+struct CliTaskRunner;
+
+impl flash_tui::TaskRunner for CliTaskRunner {
+    fn run_task(
+        &mut self,
+        workspace_root: &Path,
+        task: &str,
+        observer: &mut dyn FnMut(&Event),
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<flash_tui::TuiRun, String> {
+        let config = load_config(workspace_root, &ConfigOverrides::default())
+            .map_err(|error| error.to_string())?;
+        let registry = flash_tools::builtin_registry().map_err(|error| error.to_string())?;
+        let mut runtime = AgentRuntime::new(
+            SmokeProvider::new(),
+            registry,
+            AgentOptions {
+                model: config.deepseek_model,
+                max_turns: config.max_turns,
+                permission_policy: PermissionPolicy::new(config.approval_mode),
+                max_output_bytes: config.shell_max_output_bytes,
+                max_prompt_bytes: 200_000,
+            },
+        );
+        let mut runtime_observer = |event: &Event| observer(event);
+        let run = runtime
+            .run_task_controlled(workspace_root, task, &mut runtime_observer, should_cancel)
+            .map_err(|error| error.to_string())?;
+        Ok(flash_tui::TuiRun {
+            session_id: run.session_id,
+            outcome: run.outcome.as_str().to_string(),
+        })
     }
 }
 
