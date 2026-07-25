@@ -1,18 +1,16 @@
 [package]
-name = "flash-cli"
+name = "flash-eval"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "flash"
-path = "src/main.rs"
+[lib]
+name = "flash_eval"
+path = "src/lib.rs"
 
 [dependencies]
 flash-agent = { path = "../agent" }
 flash-core = { path = "../core" }
-flash-eval = { path = "../eval" }
-flash-tui = { path = "../tui" }
 flash-tools = { path = "../tools" }
 
 [lints]

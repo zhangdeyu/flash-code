@@ -26,6 +26,7 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         Some("init") => init(),
         Some("doctor") => doctor(),
         Some("run") => run_task(&args[1..]),
+        Some("eval") => eval(&args[1..]),
         Some("replay") => replay(&args[1..]),
         Some("resume") => resume(&args[1..]),
         Some("tui") => tui(),
@@ -157,6 +158,55 @@ fn run_task(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
+fn eval(args: &[String]) -> Result<(), CliError> {
+    match args.first().map(String::as_str) {
+        Some("fixture") => eval_fixture(&args[1..]),
+        Some(command) => Err(CliError::Usage(format!("unknown eval command `{command}`"))),
+        None => Err(CliError::Usage(
+            "usage: flash eval fixture --task fix-rust".to_string(),
+        )),
+    }
+}
+
+fn eval_fixture(args: &[String]) -> Result<(), CliError> {
+    let task_id = parse_task_arg(args)?;
+    let root = discover_workspace_root(None)?;
+    init_workspace(&root)?;
+    let task = flash_eval::local_fixture_task(&task_id)?;
+    let result = flash_eval::run_fixture_eval(&root, task)?;
+    println!("task: {}", result.task_id);
+    println!("passed: {}", result.passed);
+    if let Some(session_id) = &result.session_id {
+        println!("session: {session_id}");
+    }
+    if let Some(events_path) = &result.events_path {
+        println!("events: {}", events_path.display());
+    }
+    println!(
+        "eval_run: {}",
+        result
+            .workspace_path
+            .parent()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| result.workspace_path.display().to_string())
+    );
+    if let Some(kind) = result.failure_kind {
+        println!("failure_kind: {}", kind.as_str());
+    }
+    Ok(())
+}
+
+fn parse_task_arg(args: &[String]) -> Result<String, CliError> {
+    let Some(flag_index) = args.iter().position(|arg| arg == "--task") else {
+        return Err(CliError::Usage(
+            "usage: flash eval fixture --task fix-rust".to_string(),
+        ));
+    };
+    args.get(flag_index + 1)
+        .cloned()
+        .ok_or_else(|| CliError::Usage("usage: flash eval fixture --task fix-rust".to_string()))
+}
+
 fn replay(args: &[String]) -> Result<(), CliError> {
     let Some(path) = args.first() else {
         return Err(CliError::Usage(
@@ -214,6 +264,7 @@ fn print_help() {
         "  flash tui\n",
         "  flash doctor\n",
         "  flash run \"<task>\"\n",
+        "  flash eval fixture --task fix-rust\n",
         "  flash replay <events.jsonl>\n",
         "  flash resume <session_id>\n\n",
         "Running `flash` without a subcommand enters the TUI.\n"
@@ -224,6 +275,7 @@ fn print_help() {
 enum CliError {
     Config(flash_core::config::ConfigError),
     Agent(flash_agent::AgentError),
+    Eval(flash_eval::EvalError),
     Storage(flash_core::storage::StorageError),
     ToolRegistry(flash_core::tools::ToolRegistryError),
     Tui(flash_tui::TuiError),
@@ -236,6 +288,7 @@ impl std::fmt::Display for CliError {
         match self {
             Self::Config(error) => write!(formatter, "{error}"),
             Self::Agent(error) => write!(formatter, "{error}"),
+            Self::Eval(error) => write!(formatter, "{error}"),
             Self::Storage(error) => write!(formatter, "{error}"),
             Self::ToolRegistry(error) => write!(formatter, "{error}"),
             Self::Tui(error) => write!(formatter, "{error}"),
@@ -262,6 +315,12 @@ impl From<flash_core::storage::StorageError> for CliError {
 impl From<flash_agent::AgentError> for CliError {
     fn from(error: flash_agent::AgentError) -> Self {
         Self::Agent(error)
+    }
+}
+
+impl From<flash_eval::EvalError> for CliError {
+    fn from(error: flash_eval::EvalError) -> Self {
+        Self::Eval(error)
     }
 }
 

@@ -17,6 +17,7 @@ version = "0.1.0"
 dependencies = [
  "flash-agent",
  "flash-core",
+ "flash-eval",
  "flash-tools",
  "flash-tui",
 ]
@@ -30,6 +31,15 @@ name = "flash-deepseek"
 version = "0.1.0"
 dependencies = [
  "flash-provider",
+]
+
+[[package]]
+name = "flash-eval"
+version = "0.1.0"
+dependencies = [
+ "flash-agent",
+ "flash-core",
+ "flash-tools",
 ]
 
 [[package]]
