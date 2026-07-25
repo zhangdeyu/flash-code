@@ -55,7 +55,34 @@ pub struct ToolContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutput {
-    pub text: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub status: ToolExitStatus,
+}
+
+impl ToolOutput {
+    pub fn success(stdout: impl Into<String>) -> Self {
+        Self {
+            stdout: stdout.into(),
+            stderr: String::new(),
+            status: ToolExitStatus::Success,
+        }
+    }
+
+    pub fn error(stderr: impl Into<String>) -> Self {
+        Self {
+            stdout: String::new(),
+            stderr: stderr.into(),
+            status: ToolExitStatus::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolExitStatus {
+    Success,
+    Error,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,9 +167,7 @@ mod tests {
         }
 
         fn call(&self, _input: &str, _context: &ToolContext) -> Result<ToolOutput, ToolError> {
-            Ok(ToolOutput {
-                text: "ok".to_string(),
-            })
+            Ok(ToolOutput::success("ok"))
         }
     }
 

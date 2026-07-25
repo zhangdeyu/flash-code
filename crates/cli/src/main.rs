@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
 
+use flash_agent::{AgentOptions, AgentRuntime, SmokeProvider};
 use flash_core::{
-    append_user_message, create_session, discover_workspace_root, init_workspace, replay_events,
-    Config, ConfigOverrides,
+    discover_workspace_root, init_workspace, replay_events, Config, ConfigOverrides,
+    PermissionPolicy,
 };
 
 fn main() {
@@ -70,11 +71,21 @@ fn run_task(args: &[String]) -> Result<(), CliError> {
         ));
     };
     let root = discover_workspace_root(None)?;
-    let session = create_session(&root)?;
-    append_user_message(&session, task)?;
-    println!("session: {}", session.id);
-    println!("stored: {}", session.path.display());
-    println!("0.1 runtime stored the task. DeepSeek agent loop starts in 0.2.");
+    let config = load_config(&root, &ConfigOverrides::default())?;
+    let registry = flash_tools::builtin_registry().map_err(CliError::ToolRegistry)?;
+    let mut runtime = AgentRuntime::new(
+        SmokeProvider::new(),
+        registry,
+        AgentOptions {
+            model: config.deepseek_model,
+            max_turns: config.max_turns,
+            permission_policy: PermissionPolicy::new(config.approval_mode),
+            max_output_bytes: config.shell_max_output_bytes,
+        },
+    );
+    let run = runtime.run_task(&root, task)?;
+    println!("session: {}", run.session_id);
+    println!("outcome: {}", run.outcome.as_str());
     Ok(())
 }
 
@@ -143,7 +154,9 @@ fn print_help() {
 #[derive(Debug)]
 enum CliError {
     Config(flash_core::config::ConfigError),
+    Agent(flash_agent::AgentError),
     Storage(flash_core::storage::StorageError),
+    ToolRegistry(flash_core::tools::ToolRegistryError),
     Workspace(flash_core::WorkspaceError),
     Usage(String),
 }
@@ -152,7 +165,9 @@ impl std::fmt::Display for CliError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Config(error) => write!(formatter, "{error}"),
+            Self::Agent(error) => write!(formatter, "{error}"),
             Self::Storage(error) => write!(formatter, "{error}"),
+            Self::ToolRegistry(error) => write!(formatter, "{error}"),
             Self::Workspace(error) => write!(formatter, "{error}"),
             Self::Usage(message) => write!(formatter, "{message}"),
         }
@@ -170,6 +185,12 @@ impl From<flash_core::config::ConfigError> for CliError {
 impl From<flash_core::storage::StorageError> for CliError {
     fn from(error: flash_core::storage::StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+impl From<flash_agent::AgentError> for CliError {
+    fn from(error: flash_agent::AgentError) -> Self {
+        Self::Agent(error)
     }
 }
 

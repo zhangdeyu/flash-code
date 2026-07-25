@@ -1,3 +1,5 @@
+use flash_core::Message;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelCapabilities {
     pub supports_reasoning: bool,
@@ -14,6 +16,82 @@ pub trait Provider {
 
     fn capabilities(&self) -> &ModelCapabilities;
 }
+
+pub trait ChatProvider {
+    fn chat(&mut self, request: ChatRequest) -> Result<Vec<ProviderEvent>, ProviderError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatRequest {
+    pub messages: Vec<Message>,
+    pub tools: Vec<ToolSpec>,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSpec {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderEvent {
+    ReasoningDelta(String),
+    TextDelta(String),
+    ToolCallComplete(ToolCall),
+    Usage(Usage),
+    Done(StopReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub input: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    EndTurn,
+    ToolUse,
+    MaxTokens,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderError {
+    Authentication(String),
+    Billing(String),
+    RateLimited(String),
+    Server(String),
+    InvalidRequest(String),
+    Unrecoverable(String),
+}
+
+impl ProviderError {
+    pub const fn is_retryable(&self) -> bool {
+        matches!(self, Self::RateLimited(_) | Self::Server(_))
+    }
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Authentication(message)
+            | Self::Billing(message)
+            | Self::RateLimited(message)
+            | Self::Server(message)
+            | Self::InvalidRequest(message)
+            | Self::Unrecoverable(message) => write!(formatter, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for ProviderError {}
 
 #[cfg(test)]
 mod tests {

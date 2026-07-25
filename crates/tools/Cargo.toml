@@ -1,17 +1,15 @@
 [package]
-name = "flash-cli"
+name = "flash-tools"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "flash"
-path = "src/main.rs"
+[lib]
+name = "flash_tools"
+path = "src/lib.rs"
 
 [dependencies]
-flash-agent = { path = "../agent" }
 flash-core = { path = "../core" }
-flash-tools = { path = "../tools" }
 
 [lints]
 workspace = true

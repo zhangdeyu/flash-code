@@ -3,10 +3,20 @@
 version = 4
 
 [[package]]
-name = "flash-cli"
+name = "flash-agent"
 version = "0.1.0"
 dependencies = [
  "flash-core",
+ "flash-provider",
+]
+
+[[package]]
+name = "flash-cli"
+version = "0.1.0"
+dependencies = [
+ "flash-agent",
+ "flash-core",
+ "flash-tools",
 ]
 
 [[package]]
@@ -14,7 +24,21 @@ name = "flash-core"
 version = "0.1.0"
 
 [[package]]
+name = "flash-deepseek"
+version = "0.1.0"
+dependencies = [
+ "flash-provider",
+]
+
+[[package]]
 name = "flash-provider"
+version = "0.1.0"
+dependencies = [
+ "flash-core",
+]
+
+[[package]]
+name = "flash-tools"
 version = "0.1.0"
 dependencies = [
  "flash-core",

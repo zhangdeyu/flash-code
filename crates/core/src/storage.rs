@@ -3,7 +3,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::protocol::{escape_json, ContentBlock, Event, Message, Role, SessionStatus};
+use crate::protocol::{
+    escape_json, ContentBlock, Event, Message, Role, SessionStatus, ToolResultStatus,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workspace {
@@ -141,6 +143,69 @@ pub fn append_user_message(session: &Session, text: &str) -> Result<Message, Sto
     Ok(message)
 }
 
+pub fn append_assistant_message(
+    session: &Session,
+    text: &str,
+    tool_uses: &[(String, String)],
+) -> Result<Message, StorageError> {
+    let mut content = Vec::new();
+    if !text.is_empty() {
+        content.push(ContentBlock::Text {
+            text: text.to_string(),
+        });
+    }
+    for (call_id, name) in tool_uses {
+        content.push(ContentBlock::ToolUse {
+            call_id: call_id.clone(),
+            name: name.clone(),
+        });
+    }
+    let message = Message {
+        id: new_id("msg"),
+        role: Role::Assistant,
+        created_at: timestamp(),
+        content,
+    };
+    append_line(
+        &session.path.join("messages.jsonl"),
+        &message_to_jsonl(&message),
+    )?;
+    append_event(
+        session,
+        Event::AssistantMessageCompleted {
+            message_id: message.id.clone(),
+        },
+    )?;
+    Ok(message)
+}
+
+pub fn append_tool_result_message(
+    session: &Session,
+    call_id: &str,
+    status: ToolResultStatus,
+    text: &str,
+) -> Result<Message, StorageError> {
+    let message = Message {
+        id: new_id("msg"),
+        role: Role::Tool,
+        created_at: timestamp(),
+        content: vec![
+            ContentBlock::ToolResult {
+                call_id: call_id.to_string(),
+                status,
+            },
+            ContentBlock::Text {
+                text: text.to_string(),
+            },
+        ],
+    };
+    append_line(
+        &session.path.join("messages.jsonl"),
+        &message_to_jsonl(&message),
+    )?;
+    Ok(message)
+}
+
 pub fn append_event(session: &Session, event: Event) -> Result<(), StorageError> {
     let path = session.path.join("events.jsonl");
     let sequence = next_sequence(&path)?;
@@ -166,12 +231,12 @@ fn append_line(path: &Path, line: &str) -> Result<(), StorageError> {
 }
 
 fn message_to_jsonl(message: &Message) -> String {
-    let content = match message.content.first() {
-        Some(ContentBlock::Text { text }) => {
-            format!("{{\"type\":\"text\",\"text\":\"{}\"}}", escape_json(text))
-        }
-        _ => "{\"type\":\"text\",\"text\":\"\"}".to_string(),
-    };
+    let content = message
+        .content
+        .iter()
+        .map(content_block_to_json)
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
         concat!(
             "{{\"version\":\"1\",\"message\":{{",
@@ -188,6 +253,30 @@ fn message_to_jsonl(message: &Message) -> String {
     )
 }
 
+fn content_block_to_json(block: &ContentBlock) -> String {
+    match block {
+        ContentBlock::Text { text } => {
+            format!("{{\"type\":\"text\",\"text\":\"{}\"}}", escape_json(text))
+        }
+        ContentBlock::Reasoning { text } => {
+            format!(
+                "{{\"type\":\"reasoning\",\"text\":\"{}\"}}",
+                escape_json(text)
+            )
+        }
+        ContentBlock::ToolUse { call_id, name } => format!(
+            "{{\"type\":\"tool_use\",\"call_id\":\"{}\",\"name\":\"{}\"}}",
+            escape_json(call_id),
+            escape_json(name)
+        ),
+        ContentBlock::ToolResult { call_id, status } => format!(
+            "{{\"type\":\"tool_result\",\"call_id\":\"{}\",\"status\":\"{}\"}}",
+            escape_json(call_id),
+            status.as_str()
+        ),
+    }
+}
+
 fn event_to_jsonl(sequence: u64, session_id: &str, event: &Event) -> String {
     let body = match event {
         Event::SessionStarted { session_id } => {
@@ -202,13 +291,74 @@ fn event_to_jsonl(sequence: u64, session_id: &str, event: &Event) -> String {
                 escape_json(message_id)
             )
         }
+        Event::ModelRequestStarted { request_id, model } => format!(
+            "{{\"type\":\"model_request_started\",\"request_id\":\"{}\",\"model\":\"{}\"}}",
+            escape_json(request_id),
+            escape_json(model)
+        ),
+        Event::AssistantMessageCompleted { message_id } => format!(
+            "{{\"type\":\"assistant_message_completed\",\"message_id\":\"{}\"}}",
+            escape_json(message_id)
+        ),
         Event::Error { message } => {
             format!(
                 "{{\"type\":\"error\",\"message\":\"{}\"}}",
                 escape_json(message)
             )
         }
-        other => format!("{{\"type\":\"{}\"}}", other.event_type()),
+        Event::ReasoningDelta { text } => format!(
+            "{{\"type\":\"reasoning_delta\",\"text\":\"{}\"}}",
+            escape_json(text)
+        ),
+        Event::AssistantDelta { text } => format!(
+            "{{\"type\":\"assistant_delta\",\"text\":\"{}\"}}",
+            escape_json(text)
+        ),
+        Event::ToolCallRequested { call_id, name } => format!(
+            "{{\"type\":\"tool_call_requested\",\"call_id\":\"{}\",\"name\":\"{}\"}}",
+            escape_json(call_id),
+            escape_json(name)
+        ),
+        Event::ApprovalRequired { call_id } => format!(
+            "{{\"type\":\"approval_required\",\"call_id\":\"{}\"}}",
+            escape_json(call_id)
+        ),
+        Event::ApprovalResolved { call_id, approved } => format!(
+            "{{\"type\":\"approval_resolved\",\"call_id\":\"{}\",\"approved\":{}}}",
+            escape_json(call_id),
+            approved
+        ),
+        Event::ToolStarted { call_id, name } => format!(
+            "{{\"type\":\"tool_started\",\"call_id\":\"{}\",\"name\":\"{}\"}}",
+            escape_json(call_id),
+            escape_json(name)
+        ),
+        Event::ToolOutputDelta {
+            call_id,
+            stream,
+            text,
+        } => format!(
+            "{{\"type\":\"tool_output_delta\",\"call_id\":\"{}\",\"stream\":\"{}\",\"text\":\"{}\"}}",
+            escape_json(call_id),
+            escape_json(stream),
+            escape_json(text)
+        ),
+        Event::ToolFinished { call_id, status } => format!(
+            "{{\"type\":\"tool_finished\",\"call_id\":\"{}\",\"status\":\"{}\"}}",
+            escape_json(call_id),
+            status.as_str()
+        ),
+        Event::UsageRecorded {
+            input_tokens,
+            output_tokens,
+        } => format!(
+            "{{\"type\":\"usage_recorded\",\"input_tokens\":{},\"output_tokens\":{}}}",
+            input_tokens, output_tokens
+        ),
+        Event::SessionFinished { outcome } => format!(
+            "{{\"type\":\"session_finished\",\"outcome\":\"{}\"}}",
+            outcome.as_str()
+        ),
     };
     format!(
         concat!(
