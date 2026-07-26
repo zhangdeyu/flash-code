@@ -5,10 +5,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use flash_core::{
     append_assistant_message_async, append_event_async, append_system_message_async,
-    append_tool_result_message_async, append_user_message_async, create_continuation_session_async,
-    create_session_async, finalize_session_async, load_session_history_async, CancellationToken,
-    ContentBlock, Event, Message, Outcome, PermissionDecision, PermissionPolicy, Role, ToolContext,
-    ToolError, ToolErrorKind, ToolExitStatus, ToolRegistry, ToolResultStatus, ToolRisk,
+    append_tool_result_message_async, append_user_message_async,
+    create_continuation_session_with_limits_async, create_session_with_limits_async,
+    finalize_session_async, load_session_history_async, ArtifactLimits, CancellationToken,
+    ContentBlock, Event, Message, Outcome, PermissionDecision, PermissionPolicy, Role,
+    StorageLimits, ToolContext, ToolError, ToolErrorKind, ToolExitStatus, ToolRegistry,
+    ToolResultStatus, ToolRisk,
 };
 use flash_provider::{
     send_event, ChatProvider, ChatRequest, ProviderError, ProviderEvent, StopReason, ToolCall,
@@ -58,6 +60,8 @@ pub struct AgentRuntime<P> {
     provider: P,
     tools: ToolRegistry,
     options: AgentOptions,
+    storage_limits: StorageLimits,
+    artifact_limits: ArtifactLimits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +82,19 @@ where
             provider,
             tools,
             options,
+            storage_limits: StorageLimits::default(),
+            artifact_limits: ArtifactLimits::default(),
         }
+    }
+
+    pub fn with_resource_limits(
+        mut self,
+        storage_limits: StorageLimits,
+        artifact_limits: ArtifactLimits,
+    ) -> Self {
+        self.storage_limits = storage_limits;
+        self.artifact_limits = artifact_limits;
+        self
     }
 
     pub async fn run_task(
@@ -280,7 +296,8 @@ where
         let approval = controls.approval;
         let (session, inherited_history) = match start {
             SessionStart::New => (
-                create_session_async(workspace_root.to_path_buf()).await?,
+                create_session_with_limits_async(workspace_root.to_path_buf(), self.storage_limits)
+                    .await?,
                 None,
             ),
             SessionStart::Continue(parent_session_id) => {
@@ -291,9 +308,10 @@ where
                 .await?;
                 validate_tool_turns(&history)
                     .map_err(|error| AgentError::History(error.to_string()))?;
-                let session = create_continuation_session_async(
+                let session = create_continuation_session_with_limits_async(
                     workspace_root.to_path_buf(),
                     parent_session_id,
+                    self.storage_limits,
                 )
                 .await?;
                 (session, Some(history))
@@ -318,6 +336,7 @@ where
                 cancellation: cancellation.clone(),
                 artifact_dir: Some(session.path.join("artifacts")),
                 artifact_stem: None,
+                artifact_limits: Some(self.artifact_limits),
             };
 
             for turn in 1..=self.options.max_turns {
@@ -1118,16 +1137,20 @@ where
         let safe_call_id = sanitize_artifact_component(call_id);
         let artifact = format!("artifacts/{safe_call_id}.{stream}.txt");
         let path: PathBuf = session.path.join(&artifact);
+        let artifact_dir = session.path.join("artifacts");
         let full_text = text.to_string();
         let artifact_text = full_text.clone();
-        tokio::task::spawn_blocking(move || std::fs::write(&path, artifact_text))
-            .await
-            .map_err(|error| {
-                AgentError::Storage(flash_core::storage::StorageError::TaskJoin(
-                    error.to_string(),
-                ))
-            })?
-            .map_err(flash_core::storage::StorageError::Io)?;
+        let limits = self.artifact_limits;
+        tokio::task::spawn_blocking(move || {
+            write_agent_artifact(&artifact_dir, &path, artifact_text.as_bytes(), limits)
+        })
+        .await
+        .map_err(|error| {
+            AgentError::Storage(flash_core::storage::StorageError::TaskJoin(
+                error.to_string(),
+            ))
+        })?
+        .map_err(AgentError::Tool)?;
         Ok(MaterializedOutput {
             text: format!(
                 "{}\n[full output: {}]",
@@ -1138,6 +1161,79 @@ where
             truncated: true,
         })
     }
+}
+
+fn write_agent_artifact(
+    artifact_dir: &Path,
+    path: &Path,
+    bytes: &[u8],
+    limits: ArtifactLimits,
+) -> Result<(), ToolError> {
+    use std::io::Write;
+
+    if bytes.len() as u64 > limits.max_file_bytes {
+        return Err(ToolError::with_kind(
+            ToolErrorKind::ResourceLimit,
+            format!("artifact exceeded {} bytes", limits.max_file_bytes),
+        ));
+    }
+    let mut used = 0_u64;
+    for entry in std::fs::read_dir(artifact_dir).map_err(|error| {
+        ToolError::with_kind(
+            ToolErrorKind::Io,
+            format!("failed to inspect artifact directory: {error}"),
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            ToolError::with_kind(
+                ToolErrorKind::Io,
+                format!("failed to inspect artifact: {error}"),
+            )
+        })?;
+        let metadata = std::fs::symlink_metadata(entry.path()).map_err(|error| {
+            ToolError::with_kind(
+                ToolErrorKind::Io,
+                format!("failed to inspect artifact: {error}"),
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(ToolError::with_kind(
+                ToolErrorKind::PermissionDenied,
+                "artifact directory contains an untrusted non-file entry",
+            ));
+        }
+        used = used.saturating_add(metadata.len());
+    }
+    if used.saturating_add(bytes.len() as u64) > limits.max_session_bytes {
+        return Err(ToolError::with_kind(
+            ToolErrorKind::ResourceLimit,
+            format!(
+                "session artifacts exceeded {} bytes",
+                limits.max_session_bytes
+            ),
+        ));
+    }
+    let mut file = std::fs::File::create_new(path).map_err(|error| {
+        ToolError::with_kind(
+            ToolErrorKind::Io,
+            format!("failed to create artifact: {error}"),
+        )
+    })?;
+    if let Err(error) = file.write_all(bytes) {
+        let _result = std::fs::remove_file(path);
+        return Err(ToolError::with_kind(
+            ToolErrorKind::Io,
+            format!("failed to write artifact: {error}"),
+        ));
+    }
+    if let Err(error) = file.sync_all() {
+        let _result = std::fs::remove_file(path);
+        return Err(ToolError::with_kind(
+            ToolErrorKind::Io,
+            format!("failed to sync artifact: {error}"),
+        ));
+    }
+    Ok(())
 }
 
 fn retry_delay(request_id: &str, attempt: u32, retry_after: Option<Duration>) -> Duration {
@@ -2400,6 +2496,123 @@ mod tests {
         assert!(messages.contains(&format!("[full output: artifacts/{artifact_name}]")));
     }
 
+    #[tokio::test]
+    async fn artifact_file_limit_should_fail_and_finalize_session() {
+        let root = prepared_workspace("artifact_file_limit");
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(LargeTool)).unwrap();
+        let mut runtime = AgentRuntime::new(
+            LargeToolProvider,
+            registry,
+            AgentOptions {
+                model: "smoke".to_string(),
+                max_turns: 1,
+                permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Yolo),
+                max_output_bytes: 4,
+                max_prompt_bytes: 200_000,
+            },
+        )
+        .with_resource_limits(
+            StorageLimits::default(),
+            ArtifactLimits {
+                max_file_bytes: 5,
+                max_session_bytes: 10,
+            },
+        );
+
+        let error = runtime.run_task(&root, "large").await.unwrap_err();
+        let session = only_session_path(&root);
+
+        assert!(matches!(
+            error,
+            AgentError::Tool(ToolError {
+                kind: ToolErrorKind::ResourceLimit,
+                ..
+            })
+        ));
+        assert!(fs::read_to_string(session.join("session.json"))
+            .unwrap()
+            .contains("\"status\":\"failed\""));
+        assert_eq!(fs::read_dir(session.join("artifacts")).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn artifact_session_limit_should_include_multiple_streams() {
+        let root = prepared_workspace("artifact_session_limit");
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DualOutputTool)).unwrap();
+        let mut runtime = AgentRuntime::new(
+            LargeToolProvider,
+            registry,
+            AgentOptions {
+                model: "smoke".to_string(),
+                max_turns: 1,
+                permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Yolo),
+                max_output_bytes: 2,
+                max_prompt_bytes: 200_000,
+            },
+        )
+        .with_resource_limits(
+            StorageLimits::default(),
+            ArtifactLimits {
+                max_file_bytes: 4,
+                max_session_bytes: 6,
+            },
+        );
+
+        let error = runtime.run_task(&root, "large").await.unwrap_err();
+        let session = only_session_path(&root);
+
+        assert!(matches!(
+            error,
+            AgentError::Tool(ToolError {
+                kind: ToolErrorKind::ResourceLimit,
+                ..
+            })
+        ));
+        assert!(fs::read_to_string(session.join("session.json"))
+            .unwrap()
+            .contains("\"status\":\"failed\""));
+        assert_eq!(fs::read_dir(session.join("artifacts")).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn event_limit_should_finalize_session_as_failed() {
+        let root = prepared_workspace("event_limit");
+        let mut runtime = AgentRuntime::new(
+            HugeDeltaProvider,
+            ToolRegistry::new(),
+            AgentOptions {
+                model: "smoke".to_string(),
+                max_turns: 1,
+                permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Yolo),
+                max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
+            },
+        )
+        .with_resource_limits(
+            StorageLimits {
+                max_event_bytes: 256,
+                max_jsonl_bytes: 4096,
+            },
+            ArtifactLimits::default(),
+        );
+
+        let error = runtime.run_task(&root, "large event").await.unwrap_err();
+        let session = only_session_path(&root);
+        let metadata = fs::read_to_string(session.join("session.json")).unwrap();
+        let events = fs::read_to_string(session.join("events.jsonl")).unwrap();
+
+        assert!(matches!(
+            error,
+            AgentError::Storage(flash_core::storage::StorageError::ResourceLimit { .. })
+        ));
+        assert!(metadata.contains("\"status\":\"failed\""));
+        assert!(!metadata.contains("\"status\":\"succeeded\""));
+        assert_eq!(events.matches("\"type\":\"session_finished\"").count(), 1);
+        assert!(events.contains("\"outcome\":\"failed\""));
+    }
+
     #[test]
     fn artifact_name_should_not_allow_path_traversal() {
         let name = sanitize_artifact_component("../../outside/evil");
@@ -3173,6 +3386,21 @@ mod tests {
 
     struct LargeToolProvider;
 
+    struct HugeDeltaProvider;
+
+    #[async_trait(?Send)]
+    impl ChatProvider for HugeDeltaProvider {
+        async fn chat(
+            &mut self,
+            _request: ChatRequest,
+            events: tokio::sync::mpsc::Sender<ProviderEvent>,
+        ) -> Result<(), ProviderError> {
+            send_event(&events, ProviderEvent::TextDelta("x".repeat(1024))).await?;
+            send_event(&events, ProviderEvent::Done(StopReason::EndTurn)).await?;
+            Ok(())
+        }
+    }
+
     #[async_trait(?Send)]
     impl ChatProvider for LargeToolProvider {
         async fn chat(
@@ -3331,6 +3559,40 @@ mod tests {
 
         fn call(&self, _input: Value, _context: &ToolContext) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput::success("abcdef"))
+        }
+    }
+
+    struct DualOutputTool;
+
+    impl Tool for DualOutputTool {
+        fn name(&self) -> &str {
+            "large"
+        }
+
+        fn description(&self) -> &str {
+            "two large streams"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+
+        fn risk(&self, _input: &Value) -> Result<ToolRisk, ToolError> {
+            Ok(ToolRisk::Read)
+        }
+
+        fn call(&self, _input: Value, _context: &ToolContext) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                stdout: "abcd".to_string(),
+                stderr: "efgh".to_string(),
+                status: ToolExitStatus::Success,
+                exit_code: Some(0),
+                signal: None,
+                duration_ms: 0,
+                timed_out: false,
+                truncated: false,
+                artifact: None,
+            })
         }
     }
 

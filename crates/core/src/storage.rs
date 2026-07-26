@@ -20,6 +20,21 @@ pub struct Workspace {
     pub root: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageLimits {
+    pub max_event_bytes: usize,
+    pub max_jsonl_bytes: u64,
+}
+
+impl Default for StorageLimits {
+    fn default() -> Self {
+        Self {
+            max_event_bytes: 1024 * 1024,
+            max_jsonl_bytes: 50 * 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Session {
     pub id: String,
@@ -28,6 +43,7 @@ pub struct Session {
     pub parent_session_id: Option<String>,
     pub status: SessionStatus,
     pub owner_pid: Option<u32>,
+    pub limits: StorageLimits,
     sequence: Arc<Mutex<u64>>,
     finalizing: Arc<AtomicBool>,
 }
@@ -40,6 +56,7 @@ impl PartialEq for Session {
             && self.parent_session_id == other.parent_session_id
             && self.status == other.status
             && self.owner_pid == other.owner_pid
+            && self.limits == other.limits
     }
 }
 
@@ -69,6 +86,10 @@ pub enum StorageError {
         path: PathBuf,
         line: usize,
         message: String,
+    },
+    ResourceLimit {
+        resource: String,
+        limit: u64,
     },
 }
 
@@ -103,6 +124,12 @@ impl std::fmt::Display for StorageError {
                 "corrupt JSONL at {} line {line}: {message}",
                 path.display()
             ),
+            Self::ResourceLimit { resource, limit } => {
+                write!(
+                    formatter,
+                    "{resource} exceeded configured limit of {limit} bytes"
+                )
+            }
         }
     }
 }
@@ -139,12 +166,27 @@ pub fn init_workspace(root: &Path) -> Result<Workspace, StorageError> {
 }
 
 pub fn create_session(root: &Path) -> Result<Session, StorageError> {
-    create_session_record(root, None)
+    create_session_with_limits(root, StorageLimits::default())
+}
+
+pub fn create_session_with_limits(
+    root: &Path,
+    limits: StorageLimits,
+) -> Result<Session, StorageError> {
+    create_session_record(root, None, limits)
 }
 
 pub fn create_continuation_session(
     root: &Path,
     parent_session_id: &str,
+) -> Result<Session, StorageError> {
+    create_continuation_session_with_limits(root, parent_session_id, StorageLimits::default())
+}
+
+pub fn create_continuation_session_with_limits(
+    root: &Path,
+    parent_session_id: &str,
+    limits: StorageLimits,
 ) -> Result<Session, StorageError> {
     let parent = load_session(root, parent_session_id)?;
     if parent.status == SessionStatus::Running {
@@ -152,12 +194,13 @@ pub fn create_continuation_session(
             parent_session_id.to_string(),
         ));
     }
-    create_session_record(root, Some(parent_session_id.to_string()))
+    create_session_record(root, Some(parent_session_id.to_string()), limits)
 }
 
 fn create_session_record(
     root: &Path,
     parent_session_id: Option<String>,
+    limits: StorageLimits,
 ) -> Result<Session, StorageError> {
     init_workspace(root)?;
     let id = new_id("session");
@@ -170,6 +213,7 @@ fn create_session_record(
         parent_session_id: parent_session_id.clone(),
         status: SessionStatus::Running,
         owner_pid: Some(std::process::id()),
+        limits,
         sequence: Arc::new(Mutex::new(1)),
         finalizing: Arc::new(AtomicBool::new(false)),
     };
@@ -195,11 +239,29 @@ pub async fn create_session_async(root: PathBuf) -> Result<Session, StorageError
     run_blocking_storage(move || create_session(&root)).await
 }
 
+pub async fn create_session_with_limits_async(
+    root: PathBuf,
+    limits: StorageLimits,
+) -> Result<Session, StorageError> {
+    run_blocking_storage(move || create_session_with_limits(&root, limits)).await
+}
+
 pub async fn create_continuation_session_async(
     root: PathBuf,
     parent_session_id: String,
 ) -> Result<Session, StorageError> {
     run_blocking_storage(move || create_continuation_session(&root, &parent_session_id)).await
+}
+
+pub async fn create_continuation_session_with_limits_async(
+    root: PathBuf,
+    parent_session_id: String,
+    limits: StorageLimits,
+) -> Result<Session, StorageError> {
+    run_blocking_storage(move || {
+        create_continuation_session_with_limits(&root, &parent_session_id, limits)
+    })
+    .await
 }
 
 pub fn append_system_message(session: &Session, text: &str) -> Result<Message, StorageError> {
@@ -214,6 +276,7 @@ pub fn append_system_message(session: &Session, text: &str) -> Result<Message, S
     append_line(
         &session.path.join("messages.jsonl"),
         &message_to_jsonl(&message)?,
+        session.limits.max_jsonl_bytes,
     )?;
     touch_session(session)?;
     Ok(message)
@@ -237,8 +300,9 @@ pub fn load_session(root: &Path, session_id: &str) -> Result<Session, StorageErr
             actual: root.to_path_buf(),
         });
     }
-    repair_jsonl::<MessageRecord>(&session_dir.join("messages.jsonl"))?;
-    repair_jsonl::<EventRecord>(&session_dir.join("events.jsonl"))?;
+    let limits = StorageLimits::default();
+    repair_jsonl::<MessageRecord>(&session_dir.join("messages.jsonl"), limits.max_jsonl_bytes)?;
+    repair_jsonl::<EventRecord>(&session_dir.join("events.jsonl"), limits.max_jsonl_bytes)?;
     let sequence = next_sequence(&session_dir.join("events.jsonl"))?;
     let finalized = record.status != SessionStatus::Running;
     Ok(Session {
@@ -248,6 +312,7 @@ pub fn load_session(root: &Path, session_id: &str) -> Result<Session, StorageErr
         parent_session_id: record.parent_session_id,
         status: record.status,
         owner_pid: record.owner_pid,
+        limits,
         sequence: Arc::new(Mutex::new(sequence)),
         finalizing: Arc::new(AtomicBool::new(finalized)),
     })
@@ -255,7 +320,7 @@ pub fn load_session(root: &Path, session_id: &str) -> Result<Session, StorageErr
 
 pub fn load_session_messages(session: &Session) -> Result<Vec<Message>, StorageError> {
     let path = session.path.join("messages.jsonl");
-    repair_jsonl::<MessageRecord>(&path)?;
+    repair_jsonl::<MessageRecord>(&path, session.limits.max_jsonl_bytes)?;
     let content = fs::read_to_string(path)?;
     content
         .lines()
@@ -306,6 +371,7 @@ pub fn append_user_message(session: &Session, text: &str) -> Result<Message, Sto
     append_line(
         &session.path.join("messages.jsonl"),
         &message_to_jsonl(&message)?,
+        session.limits.max_jsonl_bytes,
     )?;
     touch_session(session)?;
     append_event(
@@ -357,6 +423,7 @@ pub fn append_assistant_message(
     append_line(
         &session.path.join("messages.jsonl"),
         &message_to_jsonl(&message)?,
+        session.limits.max_jsonl_bytes,
     )?;
     touch_session(session)?;
     append_event(
@@ -401,6 +468,7 @@ pub fn append_tool_result_message(
     append_line(
         &session.path.join("messages.jsonl"),
         &message_to_jsonl(&message)?,
+        session.limits.max_jsonl_bytes,
     )?;
     touch_session(session)?;
     Ok(message)
@@ -417,12 +485,32 @@ pub async fn append_tool_result_message_async(
 }
 
 pub fn append_event(session: &Session, event: Event) -> Result<(), StorageError> {
+    const ERROR_RESERVE_BYTES: u64 = 512;
+    const TERMINAL_RESERVE_BYTES: u64 = 1024;
     let path = session.path.join("events.jsonl");
     let mut sequence = session
         .sequence
         .lock()
         .map_err(|_| StorageError::SequenceLock)?;
-    append_line(&path, &event_to_jsonl(*sequence, &session.id, &event)?)?;
+    let line = event_to_jsonl(*sequence, &session.id, &event)?;
+    if line.len().saturating_add(1) > session.limits.max_event_bytes {
+        return Err(StorageError::ResourceLimit {
+            resource: "event record".to_string(),
+            limit: session.limits.max_event_bytes as u64,
+        });
+    }
+    let max_jsonl_bytes = match event {
+        Event::SessionFinished { .. } => session.limits.max_jsonl_bytes,
+        Event::Error { .. } => session
+            .limits
+            .max_jsonl_bytes
+            .saturating_sub(ERROR_RESERVE_BYTES),
+        _ => session
+            .limits
+            .max_jsonl_bytes
+            .saturating_sub(TERMINAL_RESERVE_BYTES),
+    };
+    append_line(&path, &line, max_jsonl_bytes)?;
     *sequence += 1;
     touch_session(session)
 }
@@ -467,7 +555,7 @@ pub async fn finalize_session_async(
 }
 
 pub fn replay_events(path: &Path) -> Result<Vec<String>, StorageError> {
-    repair_jsonl::<EventRecord>(path)?;
+    repair_jsonl::<EventRecord>(path, StorageLimits::default().max_jsonl_bytes)?;
     let content = fs::read_to_string(path)?;
     content
         .lines()
@@ -488,7 +576,10 @@ pub fn recover_session(root: &Path, session_id: &str) -> Result<Session, Storage
         return Ok(session);
     }
 
-    let records = read_event_records(&session.path.join("events.jsonl"))?;
+    let records = read_event_records(
+        &session.path.join("events.jsonl"),
+        session.limits.max_jsonl_bytes,
+    )?;
     let finished = records
         .iter()
         .filter_map(|record| match record.event {
@@ -558,27 +649,41 @@ pub fn recover_workspace_sessions(root: &Path) -> Result<Vec<Session>, StorageEr
     Ok(recovered)
 }
 
-fn append_line(path: &Path, line: &str) -> Result<(), StorageError> {
+fn append_line(path: &Path, line: &str, max_bytes: u64) -> Result<(), StorageError> {
     let mut file = OpenOptions::new().append(true).create(true).open(path)?;
+    let additional = line.len().saturating_add(1) as u64;
+    let current = file.metadata()?.len();
+    if current.saturating_add(additional) > max_bytes {
+        return Err(StorageError::ResourceLimit {
+            resource: path.display().to_string(),
+            limit: max_bytes,
+        });
+    }
     writeln!(file, "{line}")?;
     file.flush()?;
     Ok(())
 }
 
-fn read_event_records(path: &Path) -> Result<Vec<EventRecord>, StorageError> {
-    repair_jsonl::<EventRecord>(path)?;
+fn read_event_records(path: &Path, max_bytes: u64) -> Result<Vec<EventRecord>, StorageError> {
+    repair_jsonl::<EventRecord>(path, max_bytes)?;
     fs::read_to_string(path)?
         .lines()
         .map(|line| serde_json::from_str(line).map_err(StorageError::from))
         .collect()
 }
 
-fn repair_jsonl<T>(path: &Path) -> Result<bool, StorageError>
+fn repair_jsonl<T>(path: &Path, max_bytes: u64) -> Result<bool, StorageError>
 where
     T: DeserializeOwned,
 {
     if !path.exists() {
         return Ok(false);
+    }
+    if path.metadata()?.len() > max_bytes {
+        return Err(StorageError::ResourceLimit {
+            resource: path.display().to_string(),
+            limit: max_bytes,
+        });
     }
     let bytes = fs::read(path)?;
     if bytes.is_empty() {
@@ -1269,7 +1374,11 @@ mod tests {
 
         let recovered = recover_session(&root, &session.id).unwrap();
         let recovered_again = recover_session(&root, &session.id).unwrap();
-        let records = read_event_records(&session.path.join("events.jsonl")).unwrap();
+        let records = read_event_records(
+            &session.path.join("events.jsonl"),
+            session.limits.max_jsonl_bytes,
+        )
+        .unwrap();
         let recovery_errors = records
             .iter()
             .filter(|record| {
@@ -1329,7 +1438,11 @@ mod tests {
         set_owner_pid(&session, Some(exited_pid()));
 
         let recovered = recover_session(&root, &session.id).unwrap();
-        let records = read_event_records(&session.path.join("events.jsonl")).unwrap();
+        let records = read_event_records(
+            &session.path.join("events.jsonl"),
+            session.limits.max_jsonl_bytes,
+        )
+        .unwrap();
 
         assert_eq!(recovered.status, SessionStatus::Succeeded);
         assert_eq!(recovered.owner_pid, None);
@@ -1340,6 +1453,105 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn event_and_jsonl_limits_should_return_structured_errors() {
+        let root = temp_dir("storage_limits");
+        fs::create_dir_all(&root).unwrap();
+        let mut session = create_session(&root).unwrap();
+        session.limits = StorageLimits {
+            max_event_bytes: 256,
+            max_jsonl_bytes: 4096,
+        };
+
+        let event_error = append_event(
+            &session,
+            Event::AssistantDelta {
+                request_id: "request".to_string(),
+                attempt: 1,
+                text: "x".repeat(1024),
+            },
+        )
+        .unwrap_err();
+        session.limits.max_event_bytes = 1024;
+        session.limits.max_jsonl_bytes = fs::metadata(session.path.join("events.jsonl"))
+            .unwrap()
+            .len()
+            + 512;
+        let jsonl_error = append_event(
+            &session,
+            Event::AssistantDelta {
+                request_id: "request".to_string(),
+                attempt: 1,
+                text: "y".repeat(32),
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            event_error,
+            StorageError::ResourceLimit { resource, .. } if resource == "event record"
+        ));
+        assert!(matches!(jsonl_error, StorageError::ResourceLimit { .. }));
+    }
+
+    #[test]
+    fn jsonl_limit_should_reserve_space_for_terminal_event() {
+        let root = temp_dir("terminal_reserve");
+        fs::create_dir_all(&root).unwrap();
+        let mut session = create_session(&root).unwrap();
+        let current = fs::metadata(session.path.join("events.jsonl"))
+            .unwrap()
+            .len();
+        session.limits = StorageLimits {
+            max_event_bytes: 1024,
+            max_jsonl_bytes: current + 512,
+        };
+
+        let normal = append_event(
+            &session,
+            Event::AssistantDelta {
+                request_id: "request".to_string(),
+                attempt: 1,
+                text: "blocked".to_string(),
+            },
+        )
+        .unwrap_err();
+        append_event(
+            &session,
+            Event::SessionFinished {
+                outcome: Outcome::Failed,
+            },
+        )
+        .unwrap();
+        finalize_session(&session, Outcome::Failed).unwrap();
+
+        assert!(matches!(normal, StorageError::ResourceLimit { .. }));
+        let loaded = load_session(&root, &session.id).unwrap();
+        assert_eq!(loaded.status, SessionStatus::Failed);
+        assert_eq!(
+            fs::read_to_string(session.path.join("events.jsonl"))
+                .unwrap()
+                .matches("\"type\":\"session_finished\"")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn message_jsonl_limit_should_stop_before_partial_write() {
+        let root = temp_dir("message_jsonl_limit");
+        fs::create_dir_all(&root).unwrap();
+        let mut session = create_session(&root).unwrap();
+        session.limits.max_jsonl_bytes = 32;
+
+        let error = append_user_message(&session, &"x".repeat(128)).unwrap_err();
+
+        assert!(matches!(error, StorageError::ResourceLimit { .. }));
+        assert!(fs::read_to_string(session.path.join("messages.jsonl"))
+            .unwrap()
+            .is_empty());
     }
 
     fn set_owner_pid(session: &Session, owner_pid: Option<u32>) {
@@ -1388,6 +1600,7 @@ mod tests {
             parent_session_id: None,
             status: SessionStatus::Running,
             owner_pid: Some(std::process::id()),
+            limits: StorageLimits::default(),
             sequence: Arc::new(Mutex::new(1)),
             finalizing: Arc::new(AtomicBool::new(false)),
         }

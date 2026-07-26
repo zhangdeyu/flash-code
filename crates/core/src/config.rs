@@ -21,6 +21,10 @@ pub struct Config {
     pub shell_timeout_secs: u64,
     pub shell_max_output_bytes: usize,
     pub allow_network: bool,
+    pub artifact_max_file_bytes: u64,
+    pub artifact_max_session_bytes: u64,
+    pub storage_max_event_bytes: usize,
+    pub storage_max_jsonl_bytes: u64,
 }
 
 impl Default for Config {
@@ -41,6 +45,10 @@ impl Default for Config {
             shell_timeout_secs: 120,
             shell_max_output_bytes: 200_000,
             allow_network: false,
+            artifact_max_file_bytes: 10 * 1024 * 1024,
+            artifact_max_session_bytes: 50 * 1024 * 1024,
+            storage_max_event_bytes: 1024 * 1024,
+            storage_max_jsonl_bytes: 50 * 1024 * 1024,
         }
     }
 }
@@ -67,6 +75,7 @@ impl Config {
         }
         config.apply_env(env);
         config.apply_overrides(overrides);
+        config.validate()?;
         Ok(config)
     }
 
@@ -175,6 +184,18 @@ impl Config {
                     ConfigError::Parse(format!("invalid shell max_output_bytes `{value}`"))
                 })?;
             }
+            ("artifacts", "max_file_bytes") => {
+                self.artifact_max_file_bytes = parse_positive(value, "max_file_bytes")?;
+            }
+            ("artifacts", "max_session_bytes") => {
+                self.artifact_max_session_bytes = parse_positive(value, "max_session_bytes")?;
+            }
+            ("storage", "max_event_bytes") => {
+                self.storage_max_event_bytes = parse_positive(value, "max_event_bytes")?;
+            }
+            ("storage", "max_jsonl_bytes") => {
+                self.storage_max_jsonl_bytes = parse_positive(value, "max_jsonl_bytes")?;
+            }
             _ => {
                 let qualified = if section.is_empty() {
                     key.to_string()
@@ -185,6 +206,25 @@ impl Config {
                     "unknown config key `{qualified}`"
                 )));
             }
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.artifact_max_file_bytes > self.artifact_max_session_bytes {
+            return Err(ConfigError::Parse(
+                "artifacts.max_file_bytes cannot exceed max_session_bytes".to_string(),
+            ));
+        }
+        if self.storage_max_jsonl_bytes < 4096 {
+            return Err(ConfigError::Parse(
+                "storage.max_jsonl_bytes must be at least 4096".to_string(),
+            ));
+        }
+        if self.storage_max_event_bytes as u64 > self.storage_max_jsonl_bytes {
+            return Err(ConfigError::Parse(
+                "storage.max_event_bytes cannot exceed max_jsonl_bytes".to_string(),
+            ));
         }
         Ok(())
     }
@@ -442,6 +482,54 @@ mod tests {
         assert!(error
             .to_string()
             .contains("first_byte_timeout_secs must be greater than zero"));
+    }
+
+    #[test]
+    fn load_should_apply_and_validate_resource_limits() {
+        let dir = temp_dir("resource_limits");
+        let workspace = dir.join("workspace.toml");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &workspace,
+            concat!(
+                "[artifacts]\n",
+                "max_file_bytes = 100\n",
+                "max_session_bytes = 200\n",
+                "[storage]\n",
+                "max_event_bytes = 300\n",
+                "max_jsonl_bytes = 4096\n",
+            ),
+        )
+        .unwrap();
+
+        let config = Config::load(
+            None,
+            Some(&workspace),
+            &BTreeMap::new(),
+            &ConfigOverrides::default(),
+        )
+        .unwrap();
+
+        assert_eq!(config.artifact_max_file_bytes, 100);
+        assert_eq!(config.artifact_max_session_bytes, 200);
+        assert_eq!(config.storage_max_event_bytes, 300);
+        assert_eq!(config.storage_max_jsonl_bytes, 4096);
+
+        fs::write(
+            &workspace,
+            "[artifacts]\nmax_file_bytes = 201\nmax_session_bytes = 200\n",
+        )
+        .unwrap();
+        let error = Config::load(
+            None,
+            Some(&workspace),
+            &BTreeMap::new(),
+            &ConfigOverrides::default(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("max_file_bytes cannot exceed max_session_bytes"));
     }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {

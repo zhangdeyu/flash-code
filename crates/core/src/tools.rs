@@ -63,6 +63,22 @@ pub struct ToolContext {
     pub cancellation: CancellationToken,
     pub artifact_dir: Option<PathBuf>,
     pub artifact_stem: Option<String>,
+    pub artifact_limits: Option<ArtifactLimits>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactLimits {
+    pub max_file_bytes: u64,
+    pub max_session_bytes: u64,
+}
+
+impl Default for ArtifactLimits {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: 10 * 1024 * 1024,
+            max_session_bytes: 50 * 1024 * 1024,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -190,6 +206,7 @@ pub enum ToolErrorKind {
     Timeout,
     Cancelled,
     ProcessFailed,
+    ResourceLimit,
     Internal,
 }
 
@@ -304,6 +321,7 @@ fn validate_parameters_schema(schema: &Value) -> Result<(), String> {
 pub enum ToolRegistryError {
     DuplicateName(String),
     InvalidSchema { name: String, message: String },
+    RuntimeUnavailable(String),
 }
 
 impl std::fmt::Display for ToolRegistryError {
@@ -313,6 +331,7 @@ impl std::fmt::Display for ToolRegistryError {
             Self::InvalidSchema { name, message } => {
                 write!(formatter, "tool `{name}` has invalid schema: {message}")
             }
+            Self::RuntimeUnavailable(message) => write!(formatter, "{message}"),
         }
     }
 }

@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use clap::{Args, Parser, Subcommand};
 use flash_agent::{AgentOptions, AgentRuntime, ApprovalController, ApprovalRequest, SmokeProvider};
 use flash_core::{
-    discover_workspace_root, init_workspace, recover_session, replay_events, Config,
-    ConfigOverrides, Event, PermissionPolicy,
+    discover_workspace_root, init_workspace, recover_session, replay_events, ArtifactLimits,
+    Config, ConfigOverrides, Event, PermissionPolicy, StorageLimits,
 };
 use flash_deepseek::{DeepSeekOptions, DeepSeekProvider};
 use flash_provider::{ChatProvider, ChatRequest, ProviderError, ProviderEvent};
@@ -158,13 +158,14 @@ impl flash_tui::TaskRunner for CliTaskRunner {
             provider,
             registry,
             AgentOptions {
-                model: config.deepseek_model,
+                model: config.deepseek_model.clone(),
                 max_turns: config.max_turns,
                 permission_policy: PermissionPolicy::new(config.approval_mode),
                 max_output_bytes: config.shell_max_output_bytes,
                 max_prompt_bytes: 200_000,
             },
-        );
+        )
+        .with_resource_limits(storage_limits(&config), artifact_limits(&config));
         let controller_cell = RefCell::new(controller);
         let mut runtime_observer = |event: &Event| controller_cell.borrow_mut().on_event(event);
         let mut runtime_approval = CliApprovalController {
@@ -221,13 +222,29 @@ fn doctor() -> Result<(), CliError> {
     println!("model: {}", config.deepseek_model);
     if config.allow_network {
         println!("bash_network_policy: allowed after permission policy");
-    } else if cfg!(target_os = "macos") {
-        println!("bash_network_policy: denied by offline allowlist and macOS sandbox");
     } else {
+        let sandbox = flash_tools::macos_sandbox_status();
         println!(
-            "bash_network_policy: degraded to offline allowlist; unknown commands are denied because no OS network sandbox is available"
+            "bash_network_policy: denied by offline allowlist and macOS sandbox ({})",
+            if sandbox.available {
+                sandbox.detail
+            } else {
+                format!("unavailable: {}", sandbox.detail)
+            }
         );
     }
+    println!(
+        "artifact_limits: file={} session={} bytes",
+        config.artifact_max_file_bytes, config.artifact_max_session_bytes
+    );
+    println!(
+        "storage_limits: event={} jsonl={} bytes",
+        config.storage_max_event_bytes, config.storage_max_jsonl_bytes
+    );
+    println!(
+        "shell_limits: timeout={} seconds preview_output={} bytes",
+        config.shell_timeout_secs, config.shell_max_output_bytes
+    );
     if env::var(&config.deepseek_api_key_env).is_ok() {
         println!("api_key_env: {} present", config.deepseek_api_key_env);
     } else {
@@ -272,13 +289,28 @@ fn configured_runtime(config: Config) -> Result<AgentRuntime<CliProvider>, CliEr
         provider,
         registry,
         AgentOptions {
-            model: config.deepseek_model,
+            model: config.deepseek_model.clone(),
             max_turns: config.max_turns,
             permission_policy: PermissionPolicy::new(config.approval_mode),
             max_output_bytes: config.shell_max_output_bytes,
             max_prompt_bytes: 200_000,
         },
-    ))
+    )
+    .with_resource_limits(storage_limits(&config), artifact_limits(&config)))
+}
+
+fn storage_limits(config: &Config) -> StorageLimits {
+    StorageLimits {
+        max_event_bytes: config.storage_max_event_bytes,
+        max_jsonl_bytes: config.storage_max_jsonl_bytes,
+    }
+}
+
+fn artifact_limits(config: &Config) -> ArtifactLimits {
+    ArtifactLimits {
+        max_file_bytes: config.artifact_max_file_bytes,
+        max_session_bytes: config.artifact_max_session_bytes,
+    }
 }
 
 fn provider_from_config(config: &Config) -> Result<CliProvider, CliError> {

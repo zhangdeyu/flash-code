@@ -3,12 +3,13 @@ use std::io::{Read, Write};
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use flash_core::{
-    CancellationToken, Tool, ToolContext, ToolError, ToolErrorKind, ToolExitStatus, ToolOutput,
-    ToolRegistry, ToolRisk,
+    ArtifactLimits, CancellationToken, Tool, ToolContext, ToolError, ToolErrorKind, ToolExitStatus,
+    ToolOutput, ToolRegistry, ToolRisk,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -22,6 +23,17 @@ pub fn builtin_registry_with_options(
     shell_max_output_bytes: usize,
     allow_network: bool,
 ) -> Result<ToolRegistry, flash_core::tools::ToolRegistryError> {
+    if !allow_network {
+        let sandbox = macos_sandbox_status();
+        if !sandbox.available {
+            return Err(flash_core::tools::ToolRegistryError::RuntimeUnavailable(
+                format!(
+                    "network-disabled Bash requires macOS sandbox-exec: {}",
+                    sandbox.detail
+                ),
+            ));
+        }
+    }
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ReadTool))?;
     registry.register(Box::new(EditTool))?;
@@ -35,6 +47,49 @@ pub fn builtin_registry_with_options(
         allow_network,
     }))?;
     Ok(registry)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxStatus {
+    pub available: bool,
+    pub detail: String,
+}
+
+pub fn macos_sandbox_status() -> SandboxStatus {
+    #[cfg(target_os = "macos")]
+    {
+        sandbox_status_with_path(Path::new("/usr/bin/sandbox-exec"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        SandboxStatus {
+            available: false,
+            detail: "unsupported operating system".to_string(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sandbox_status_with_path(path: &Path) -> SandboxStatus {
+    let result = Command::new(path)
+        .arg("-p")
+        .arg("(version 1) (allow default) (deny network*)")
+        .arg("/usr/bin/true")
+        .status();
+    match result {
+        Ok(status) if status.success() => SandboxStatus {
+            available: true,
+            detail: path.display().to_string(),
+        },
+        Ok(status) => SandboxStatus {
+            available: false,
+            detail: format!("{} exited with {status}", path.display()),
+        },
+        Err(error) => SandboxStatus {
+            available: false,
+            detail: format!("{}: {error}", path.display()),
+        },
+    }
 }
 
 pub struct ReadTool;
@@ -632,7 +687,7 @@ fn shell_output(
     allow_network: bool,
     artifacts: Option<ShellArtifacts>,
 ) -> Result<ToolOutput, ToolError> {
-    let mut process = shell_command(allow_network);
+    let mut process = shell_command(allow_network)?;
     process
         .arg("-c")
         .arg(command)
@@ -700,10 +755,12 @@ fn shell_output(
     };
     let stdout = stdout_reader.join().map_err(|_| {
         ToolError::with_kind(ToolErrorKind::Internal, "shell stdout reader panicked")
-    })??;
-    let mut stderr = stderr_reader.join().map_err(|_| {
+    })?;
+    let stderr = stderr_reader.join().map_err(|_| {
         ToolError::with_kind(ToolErrorKind::Internal, "shell stderr reader panicked")
-    })??;
+    })?;
+    let stdout = stdout?;
+    let mut stderr = stderr?;
     if timed_out {
         stderr
             .preview
@@ -737,25 +794,44 @@ fn shell_output(
     })
 }
 
-fn shell_command(allow_network: bool) -> Command {
+fn shell_command(allow_network: bool) -> Result<Command, ToolError> {
     #[cfg(target_os = "macos")]
     if !allow_network {
-        let mut command = Command::new("sandbox-exec");
-        command
-            .arg("-p")
-            .arg("(version 1) (allow default) (deny network*)")
-            .arg("sh");
-        return command;
+        return sandboxed_shell_command(Path::new("/usr/bin/sandbox-exec"));
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = allow_network;
-    Command::new("sh")
+    if !allow_network {
+        return Err(ToolError::with_kind(
+            ToolErrorKind::PermissionDenied,
+            "network-disabled Bash requires macOS sandbox-exec",
+        ));
+    }
+    Ok(Command::new("/bin/sh"))
+}
+
+#[cfg(target_os = "macos")]
+fn sandboxed_shell_command(sandbox_exec: &Path) -> Result<Command, ToolError> {
+    let status = sandbox_status_with_path(sandbox_exec);
+    if !status.available {
+        return Err(ToolError::with_kind(
+            ToolErrorKind::PermissionDenied,
+            format!("macOS sandbox unavailable: {}", status.detail),
+        ));
+    }
+    let mut command = Command::new(sandbox_exec);
+    command
+        .arg("-p")
+        .arg("(version 1) (allow default) (deny network*)")
+        .arg("/bin/sh");
+    Ok(command)
 }
 
 #[derive(Clone)]
 struct OutputArtifact {
     path: PathBuf,
     reference: String,
+    limits: ArtifactLimits,
+    usage: ArtifactUsage,
 }
 
 struct ShellArtifacts {
@@ -767,6 +843,34 @@ struct CapturedOutput {
     preview: Vec<u8>,
     truncated: bool,
     artifact: Option<String>,
+}
+
+#[derive(Clone)]
+struct ArtifactUsage {
+    used: Arc<Mutex<u64>>,
+}
+
+impl ArtifactUsage {
+    fn reserve(&self, bytes: u64, max_total: u64) -> Result<(), ToolError> {
+        let mut used = self
+            .used
+            .lock()
+            .map_err(|_| ToolError::with_kind(ToolErrorKind::Internal, "artifact budget lock"))?;
+        if used.saturating_add(bytes) > max_total {
+            return Err(ToolError::with_kind(
+                ToolErrorKind::ResourceLimit,
+                format!("session artifacts exceeded {max_total} bytes"),
+            ));
+        }
+        *used += bytes;
+        Ok(())
+    }
+
+    fn release(&self, bytes: u64) {
+        if let Ok(mut used) = self.used.lock() {
+            *used = used.saturating_sub(bytes);
+        }
+    }
 }
 
 fn output_artifacts(context: &ToolContext) -> Result<Option<ShellArtifacts>, ToolError> {
@@ -783,16 +887,116 @@ fn output_artifacts(context: &ToolContext) -> Result<Option<ShellArtifacts>, Too
             "invalid artifact stem",
         ));
     }
+    let limits = context.artifact_limits.unwrap_or_default();
+    let usage = ArtifactUsage {
+        used: Arc::new(Mutex::new(artifact_directory_usage(dir)?)),
+    };
     Ok(Some(ShellArtifacts {
         stdout: OutputArtifact {
             path: dir.join(format!("{stem}.stdout.txt")),
             reference: format!("artifacts/{stem}.stdout.txt"),
+            limits,
+            usage: usage.clone(),
         },
         stderr: OutputArtifact {
             path: dir.join(format!("{stem}.stderr.txt")),
             reference: format!("artifacts/{stem}.stderr.txt"),
+            limits,
+            usage,
         },
     }))
+}
+
+fn artifact_directory_usage(dir: &Path) -> Result<u64, ToolError> {
+    let mut total = 0_u64;
+    for entry in fs::read_dir(dir).map_err(|error| {
+        ToolError::with_kind(
+            ToolErrorKind::Io,
+            format!("failed to inspect artifact directory: {error}"),
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            ToolError::with_kind(
+                ToolErrorKind::Io,
+                format!("failed to inspect artifact: {error}"),
+            )
+        })?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+            ToolError::with_kind(
+                ToolErrorKind::Io,
+                format!("failed to inspect artifact: {error}"),
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(ToolError::with_kind(
+                ToolErrorKind::PermissionDenied,
+                "artifact directory contains an untrusted non-file entry",
+            ));
+        }
+        total = total.saturating_add(metadata.len());
+    }
+    Ok(total)
+}
+
+struct ArtifactWriter {
+    file: File,
+    artifact: OutputArtifact,
+    written: u64,
+}
+
+impl ArtifactWriter {
+    fn create(artifact: OutputArtifact) -> Result<Self, ToolError> {
+        let file = File::create_new(&artifact.path).map_err(|error| {
+            ToolError::with_kind(
+                ToolErrorKind::Io,
+                format!("failed to create shell output artifact: {error}"),
+            )
+        })?;
+        Ok(Self {
+            file,
+            artifact,
+            written: 0,
+        })
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), ToolError> {
+        let bytes_len = bytes.len() as u64;
+        if self.written.saturating_add(bytes_len) > self.artifact.limits.max_file_bytes {
+            return Err(self.fail(format!(
+                "artifact exceeded {} bytes",
+                self.artifact.limits.max_file_bytes
+            )));
+        }
+        if let Err(error) = self
+            .artifact
+            .usage
+            .reserve(bytes_len, self.artifact.limits.max_session_bytes)
+        {
+            self.cleanup();
+            return Err(error);
+        }
+        if let Err(error) = self.file.write_all(bytes) {
+            self.artifact.usage.release(bytes_len);
+            self.cleanup();
+            return Err(ToolError::with_kind(
+                ToolErrorKind::Io,
+                format!("failed to write shell output artifact: {error}"),
+            ));
+        }
+        self.written += bytes_len;
+        Ok(())
+    }
+
+    fn fail(&mut self, message: String) -> ToolError {
+        self.cleanup();
+        ToolError::with_kind(ToolErrorKind::ResourceLimit, message)
+    }
+
+    fn cleanup(&mut self) {
+        self.artifact.usage.release(self.written);
+        self.written = 0;
+        let _result = fs::remove_file(&self.artifact.path);
+    }
 }
 
 fn read_limited(
@@ -803,7 +1007,7 @@ fn read_limited(
     let mut preview = Vec::with_capacity(max_output_bytes.min(8 * 1024));
     let mut buffer = [0_u8; 8 * 1024];
     let mut truncated = false;
-    let mut artifact_writer: Option<File> = None;
+    let mut artifact_writer: Option<ArtifactWriter> = None;
     let mut artifact_reference = None;
     loop {
         let read = reader.read(&mut buffer).map_err(|error| {
@@ -819,33 +1023,13 @@ fn read_limited(
         let keep = read.min(remaining);
         preview.extend_from_slice(&buffer[..keep]);
         if let Some(writer) = artifact_writer.as_mut() {
-            writer.write_all(&buffer[..read]).map_err(|error| {
-                ToolError::with_kind(
-                    ToolErrorKind::Io,
-                    format!("failed to write shell output artifact: {error}"),
-                )
-            })?;
+            writer.write_all(&buffer[..read])?;
         } else if keep < read {
             truncated = true;
             if let Some(artifact) = &artifact {
-                let mut writer = File::create(&artifact.path).map_err(|error| {
-                    ToolError::with_kind(
-                        ToolErrorKind::Io,
-                        format!("failed to create shell output artifact: {error}"),
-                    )
-                })?;
-                writer.write_all(&preview).map_err(|error| {
-                    ToolError::with_kind(
-                        ToolErrorKind::Io,
-                        format!("failed to write shell output artifact: {error}"),
-                    )
-                })?;
-                writer.write_all(&buffer[keep..read]).map_err(|error| {
-                    ToolError::with_kind(
-                        ToolErrorKind::Io,
-                        format!("failed to write shell output artifact: {error}"),
-                    )
-                })?;
+                let mut writer = ArtifactWriter::create(artifact.clone())?;
+                writer.write_all(&preview)?;
+                writer.write_all(&buffer[keep..read])?;
                 artifact_reference = Some(artifact.reference.clone());
                 artifact_writer = Some(writer);
             }
@@ -863,7 +1047,7 @@ fn terminate_process_group(child: &mut Child) -> Result<(), ToolError> {
     let process_group = -(child.id() as i32);
     // SAFETY: the child was placed in its own process group before spawning.
     let result = unsafe { libc::kill(process_group, libc::SIGKILL) };
-    if result == 0 {
+    if result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
         Ok(())
     } else {
         Err(ToolError::with_kind(
@@ -1240,16 +1424,21 @@ mod tests {
         let root = temp_dir("shell_timeout");
         fs::create_dir_all(&root).unwrap();
         let tool = BashTool {
-            timeout: Duration::from_millis(1),
+            timeout: Duration::from_millis(100),
             allow_network: true,
             ..BashTool::default()
         };
 
         let output = tool
-            .call(json!({"command": "sleep 1"}), &context(root))
+            .call(
+                json!({"command": "sleep 30 & echo $! > child.pid; wait"}),
+                &context(root.clone()),
+            )
             .unwrap();
 
         assert_eq!(output.status, ToolExitStatus::Error);
+        assert!(output.timed_out);
+        assert_process_exited(read_pid(&root.join("child.pid")));
     }
 
     #[test]
@@ -1266,6 +1455,10 @@ mod tests {
         let mut context = context(root);
         context.artifact_dir = Some(artifact_dir.clone());
         context.artifact_stem = Some("call_large".to_string());
+        context.artifact_limits = Some(ArtifactLimits {
+            max_file_bytes: 400_000,
+            max_session_bytes: 400_000,
+        });
 
         let output = tool
             .call(json!({"command": "yes x | head -c 300000"}), &context)
@@ -1301,11 +1494,17 @@ mod tests {
             cancellation.cancel();
         });
 
-        let output = tool.call(json!({"command": "sleep 30"}), &context).unwrap();
+        let output = tool
+            .call(
+                json!({"command": "sleep 30 & echo $! > child.pid; wait"}),
+                &context,
+            )
+            .unwrap();
         cancel_thread.join().unwrap();
 
         assert_eq!(output.status, ToolExitStatus::Cancelled);
         assert!(output.duration_ms < 2_000);
+        assert_process_exited(read_pid(&context.workspace_root.join("child.pid")));
     }
 
     #[test]
@@ -1349,13 +1548,160 @@ mod tests {
         assert_eq!(error.kind, ToolErrorKind::PermissionDenied);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandboxed_shell_should_block_real_socket_connection() {
+        let root = temp_dir("sandbox_socket");
+        fs::create_dir_all(&root).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = thread::spawn(move || listener.accept().unwrap());
+        let allowed = shell_output(
+            &format!("/usr/bin/nc -z 127.0.0.1 {port}"),
+            &root,
+            Duration::from_secs(2),
+            1024,
+            &CancellationToken::new(),
+            true,
+            None,
+        )
+        .unwrap();
+        accept.join().unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let denied = shell_output(
+            &format!("/usr/bin/nc -z 127.0.0.1 {port}"),
+            &root,
+            Duration::from_secs(2),
+            1024,
+            &CancellationToken::new(),
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(allowed.status, ToolExitStatus::Success);
+        assert_eq!(denied.status, ToolExitStatus::Error);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn missing_sandbox_exec_should_be_rejected_before_spawn() {
+        let missing = temp_dir("missing_sandbox_exec");
+
+        let error = sandboxed_shell_command(&missing).unwrap_err();
+
+        assert_eq!(error.kind, ToolErrorKind::PermissionDenied);
+        assert!(error.message.contains("sandbox unavailable"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn startup_sandbox_probe_should_report_available_runtime() {
+        let status = macos_sandbox_status();
+
+        assert!(status.available, "{}", status.detail);
+        assert_eq!(status.detail, "/usr/bin/sandbox-exec");
+    }
+
+    #[test]
+    fn shell_artifact_limits_should_stop_single_and_total_writes() {
+        let root = temp_dir("shell_artifact_limits");
+        let artifact_dir = root.join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let tool = BashTool {
+            timeout: Duration::from_secs(2),
+            max_output_bytes: 2,
+            allow_network: true,
+        };
+        let mut single = context(root.clone());
+        single.artifact_dir = Some(artifact_dir.clone());
+        single.artifact_stem = Some("single".to_string());
+        single.artifact_limits = Some(ArtifactLimits {
+            max_file_bytes: 4,
+            max_session_bytes: 20,
+        });
+
+        let single_error = tool
+            .call(json!({"command": "printf 12345678"}), &single)
+            .unwrap_err();
+        assert_eq!(single_error.kind, ToolErrorKind::ResourceLimit);
+        assert_eq!(fs::read_dir(&artifact_dir).unwrap().count(), 0);
+
+        let mut total = context(root);
+        total.artifact_dir = Some(artifact_dir.clone());
+        total.artifact_stem = Some("total".to_string());
+        total.artifact_limits = Some(ArtifactLimits {
+            max_file_bytes: 10,
+            max_session_bytes: 12,
+        });
+        let total_error = tool
+            .call(
+                json!({"command": "printf 12345678; printf abcdefgh >&2"}),
+                &total,
+            )
+            .unwrap_err();
+
+        assert_eq!(total_error.kind, ToolErrorKind::ResourceLimit);
+        let total_bytes = fs::read_dir(artifact_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum::<u64>();
+        assert!(total_bytes <= 12);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_artifact_should_reject_symlink_entries() {
+        let root = temp_dir("shell_artifact_symlink");
+        let artifact_dir = root.join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+        std::os::unix::fs::symlink("/tmp", artifact_dir.join("untrusted")).unwrap();
+        let mut context = context(root);
+        context.artifact_dir = Some(artifact_dir);
+        context.artifact_stem = Some("call".to_string());
+        context.artifact_limits = Some(ArtifactLimits::default());
+
+        let error = match output_artifacts(&context) {
+            Ok(_) => panic!("symlink artifact entry should be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind, ToolErrorKind::PermissionDenied);
+    }
+
     fn context(workspace_root: PathBuf) -> ToolContext {
         ToolContext {
             workspace_root,
             cancellation: CancellationToken::new(),
             artifact_dir: None,
             artifact_stem: None,
+            artifact_limits: None,
         }
+    }
+
+    #[cfg(unix)]
+    fn read_pid(path: &Path) -> i32 {
+        for _ in 0..100 {
+            if let Ok(content) = fs::read_to_string(path) {
+                return content.trim().parse().unwrap();
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("child PID file was not created");
+    }
+
+    #[cfg(unix)]
+    fn assert_process_exited(pid: i32) {
+        for _ in 0..100 {
+            let result = unsafe { libc::kill(pid, 0) };
+            if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("descendant process {pid} is still alive");
     }
 
     fn temp_dir(name: &str) -> PathBuf {
