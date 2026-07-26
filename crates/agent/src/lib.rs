@@ -1,11 +1,11 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use flash_core::{
-    append_assistant_message, append_event, append_tool_result_message, append_user_message,
-    create_session, ContentBlock, Event, Message, Outcome, PermissionDecision, PermissionPolicy,
-    Role, ToolContext, ToolExitStatus, ToolRegistry, ToolResultStatus, ToolRisk,
+    append_assistant_message_async, append_event, append_event_async,
+    append_tool_result_message_async, append_user_message_async, create_session_async,
+    ContentBlock, Event, Message, Outcome, PermissionDecision, PermissionPolicy, Role, ToolContext,
+    ToolExitStatus, ToolRegistry, ToolResultStatus, ToolRisk,
 };
 use flash_provider::{
     ChatProvider, ChatRequest, ProviderError, ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
@@ -133,8 +133,8 @@ where
         C: FnMut() -> bool,
         A: ApprovalController,
     {
-        let session = create_session(workspace_root)?;
-        let user = append_user_message(&session, task)?;
+        let session = create_session_async(workspace_root.to_path_buf()).await?;
+        let user = append_user_message_async(session.clone(), task.to_string()).await?;
         let mut history = vec![user];
         let context = ToolContext {
             workspace_root: workspace_root.to_path_buf(),
@@ -148,14 +148,16 @@ where
                         message: "run cancelled".to_string(),
                     },
                     observer,
-                )?;
+                )
+                .await?;
                 emit_event(
                     &session,
                     Event::SessionFinished {
                         outcome: Outcome::Cancelled,
                     },
                     observer,
-                )?;
+                )
+                .await?;
                 return Ok(AgentRun {
                     session_id: session.id,
                     outcome: Outcome::Cancelled,
@@ -169,7 +171,8 @@ where
                     model: self.options.model.clone(),
                 },
                 observer,
-            )?;
+            )
+            .await?;
             let request = ChatRequest {
                 messages: project_history(&history, self.options.max_prompt_bytes),
                 tools: self
@@ -186,7 +189,9 @@ where
             let provider_events = self
                 .chat_with_retry_streaming(&session, request, observer)
                 .await?;
-            let turn_result = self.handle_provider_events(&session, provider_events, observer)?;
+            let turn_result = self
+                .handle_provider_events(&session, provider_events, observer)
+                .await?;
             let Some(turn_result) = turn_result else {
                 return Ok(AgentRun {
                     session_id: session.id,
@@ -201,29 +206,32 @@ where
                         message: "run cancelled".to_string(),
                     },
                     observer,
-                )?;
+                )
+                .await?;
                 emit_event(
                     &session,
                     Event::SessionFinished {
                         outcome: Outcome::Cancelled,
                     },
                     observer,
-                )?;
+                )
+                .await?;
                 return Ok(AgentRun {
                     session_id: session.id,
                     outcome: Outcome::Cancelled,
                 });
             }
 
-            let assistant = append_assistant_message(
-                &session,
-                &turn_result.assistant_text,
-                &turn_result
+            let assistant = append_assistant_message_async(
+                session.clone(),
+                turn_result.assistant_text.clone(),
+                turn_result
                     .tool_calls
                     .iter()
                     .map(|call| (call.call_id.clone(), call.name.clone(), call.input.clone()))
-                    .collect::<Vec<_>>(),
-            )?;
+                    .collect(),
+            )
+            .await?;
             history.push(assistant);
 
             if turn_result.tool_calls.is_empty() {
@@ -233,7 +241,8 @@ where
                         outcome: Outcome::Succeeded,
                     },
                     observer,
-                )?;
+                )
+                .await?;
                 return Ok(AgentRun {
                     session_id: session.id,
                     outcome: Outcome::Succeeded,
@@ -248,21 +257,24 @@ where
                             message: "run cancelled".to_string(),
                         },
                         observer,
-                    )?;
+                    )
+                    .await?;
                     emit_event(
                         &session,
                         Event::SessionFinished {
                             outcome: Outcome::Cancelled,
                         },
                         observer,
-                    )?;
+                    )
+                    .await?;
                     return Ok(AgentRun {
                         session_id: session.id,
                         outcome: Outcome::Cancelled,
                     });
                 }
-                let message =
-                    self.execute_tool_call(&session, &context, &call, observer, approval)?;
+                let message = self
+                    .execute_tool_call(&session, &context, &call, observer, approval)
+                    .await?;
                 history.push(message);
             }
         }
@@ -273,21 +285,23 @@ where
                 message: "max_turns exceeded".to_string(),
             },
             observer,
-        )?;
+        )
+        .await?;
         emit_event(
             &session,
             Event::SessionFinished {
                 outcome: Outcome::Failed,
             },
             observer,
-        )?;
+        )
+        .await?;
         Ok(AgentRun {
             session_id: session.id,
             outcome: Outcome::Failed,
         })
     }
 
-    fn handle_provider_events(
+    async fn handle_provider_events(
         &self,
         session: &flash_core::storage::Session,
         provider_events: Vec<ProviderEvent>,
@@ -314,7 +328,8 @@ where
                             name: call.name.clone(),
                         },
                         observer,
-                    )?;
+                    )
+                    .await?;
                     tool_calls.push(call);
                 }
                 ProviderEvent::Usage(Usage {
@@ -328,7 +343,8 @@ where
                             output_tokens,
                         },
                         observer,
-                    )?;
+                    )
+                    .await?;
                 }
                 ProviderEvent::Done(StopReason::EndTurn | StopReason::ToolUse) => {
                     saw_done = true;
@@ -341,7 +357,8 @@ where
                             message: "provider stopped at max tokens".to_string(),
                         },
                         observer,
-                    )?;
+                    )
+                    .await?;
                 }
             }
         }
@@ -353,14 +370,16 @@ where
                     message: "model stream ended before done".to_string(),
                 },
                 observer,
-            )?;
+            )
+            .await?;
             emit_event(
                 session,
                 Event::SessionFinished {
                     outcome: Outcome::Cancelled,
                 },
                 observer,
-            )?;
+            )
+            .await?;
             return Ok(None);
         }
 
@@ -395,6 +414,8 @@ where
                         _ => None,
                     };
                     if let Some(e) = agent_event {
+                        // Provider callbacks are synchronous; keep this immediate write so
+                        // live deltas are still persisted before observers see them.
                         let _ = append_event(session, e.clone());
                         observer.on_event(&e);
                     }
@@ -409,7 +430,7 @@ where
         }
     }
 
-    fn execute_tool_call(
+    async fn execute_tool_call(
         &self,
         session: &flash_core::storage::Session,
         context: &ToolContext,
@@ -424,7 +445,8 @@ where
                     message: format!("unknown tool `{}`", call.name),
                 },
                 observer,
-            )?;
+            )
+            .await?;
             emit_event(
                 session,
                 Event::ToolFinished {
@@ -432,13 +454,15 @@ where
                     status: ToolResultStatus::Error,
                 },
                 observer,
-            )?;
-            return append_tool_result_message(
-                session,
-                &call.call_id,
-                ToolResultStatus::Error,
-                "unknown tool",
             )
+            .await?;
+            return append_tool_result_message_async(
+                session.clone(),
+                call.call_id.clone(),
+                ToolResultStatus::Error,
+                "unknown tool".to_string(),
+            )
+            .await
             .map_err(AgentError::Storage);
         };
 
@@ -453,7 +477,8 @@ where
                         approved: true,
                     },
                     observer,
-                )?;
+                )
+                .await?;
                 emit_event(
                     session,
                     Event::ToolStarted {
@@ -461,9 +486,18 @@ where
                         name: call.name.clone(),
                     },
                     observer,
-                )?;
-                match tool.call(&call.input, context) {
-                    Ok(output) => self.commit_tool_output(session, call, output, observer),
+                )
+                .await?;
+                match self
+                    .tools
+                    .call_blocking(&call.name, call.input.clone(), context.clone())
+                    .await
+                    .expect("tool existence checked before call")
+                {
+                    Ok(output) => {
+                        self.commit_tool_output(session, call, output, observer)
+                            .await
+                    }
                     Err(error) => {
                         emit_event(
                             session,
@@ -471,7 +505,8 @@ where
                                 message: error.message.clone(),
                             },
                             observer,
-                        )?;
+                        )
+                        .await?;
                         emit_event(
                             session,
                             Event::ToolFinished {
@@ -479,13 +514,15 @@ where
                                 status: ToolResultStatus::Error,
                             },
                             observer,
-                        )?;
-                        append_tool_result_message(
-                            session,
-                            &call.call_id,
-                            ToolResultStatus::Error,
-                            &error.message,
                         )
+                        .await?;
+                        append_tool_result_message_async(
+                            session.clone(),
+                            call.call_id.clone(),
+                            ToolResultStatus::Error,
+                            error.message,
+                        )
+                        .await
                         .map_err(AgentError::Storage)
                     }
                 }
@@ -497,7 +534,8 @@ where
                         call_id: call.call_id.clone(),
                     },
                     observer,
-                )?;
+                )
+                .await?;
                 let approved = approval.approve(&ApprovalRequest {
                     call_id: call.call_id.clone(),
                     name: call.name.clone(),
@@ -511,7 +549,8 @@ where
                         approved,
                     },
                     observer,
-                )?;
+                )
+                .await?;
                 if approved {
                     emit_event(
                         session,
@@ -520,9 +559,18 @@ where
                             name: call.name.clone(),
                         },
                         observer,
-                    )?;
-                    return match tool.call(&call.input, context) {
-                        Ok(output) => self.commit_tool_output(session, call, output, observer),
+                    )
+                    .await?;
+                    return match self
+                        .tools
+                        .call_blocking(&call.name, call.input.clone(), context.clone())
+                        .await
+                        .expect("tool existence checked before call")
+                    {
+                        Ok(output) => {
+                            self.commit_tool_output(session, call, output, observer)
+                                .await
+                        }
                         Err(error) => {
                             emit_event(
                                 session,
@@ -530,7 +578,8 @@ where
                                     message: error.message.clone(),
                                 },
                                 observer,
-                            )?;
+                            )
+                            .await?;
                             emit_event(
                                 session,
                                 Event::ToolFinished {
@@ -538,13 +587,15 @@ where
                                     status: ToolResultStatus::Error,
                                 },
                                 observer,
-                            )?;
-                            append_tool_result_message(
-                                session,
-                                &call.call_id,
-                                ToolResultStatus::Error,
-                                &error.message,
                             )
+                            .await?;
+                            append_tool_result_message_async(
+                                session.clone(),
+                                call.call_id.clone(),
+                                ToolResultStatus::Error,
+                                error.message,
+                            )
+                            .await
                             .map_err(AgentError::Storage)
                         }
                     };
@@ -556,13 +607,15 @@ where
                         status: ToolResultStatus::Rejected,
                     },
                     observer,
-                )?;
-                append_tool_result_message(
-                    session,
-                    &call.call_id,
-                    ToolResultStatus::Rejected,
-                    "tool call rejected by permission policy",
                 )
+                .await?;
+                append_tool_result_message_async(
+                    session.clone(),
+                    call.call_id.clone(),
+                    ToolResultStatus::Rejected,
+                    "tool call rejected by permission policy".to_string(),
+                )
+                .await
                 .map_err(AgentError::Storage)
             }
             PermissionDecision::Deny => {
@@ -572,7 +625,8 @@ where
                         call_id: call.call_id.clone(),
                     },
                     observer,
-                )?;
+                )
+                .await?;
                 emit_event(
                     session,
                     Event::ApprovalResolved {
@@ -580,7 +634,8 @@ where
                         approved: false,
                     },
                     observer,
-                )?;
+                )
+                .await?;
                 emit_event(
                     session,
                     Event::ToolFinished {
@@ -588,27 +643,33 @@ where
                         status: ToolResultStatus::Rejected,
                     },
                     observer,
-                )?;
-                append_tool_result_message(
-                    session,
-                    &call.call_id,
-                    ToolResultStatus::Rejected,
-                    "tool call rejected by permission policy",
                 )
+                .await?;
+                append_tool_result_message_async(
+                    session.clone(),
+                    call.call_id.clone(),
+                    ToolResultStatus::Rejected,
+                    "tool call rejected by permission policy".to_string(),
+                )
+                .await
                 .map_err(AgentError::Storage)
             }
         }
     }
 
-    fn commit_tool_output(
+    async fn commit_tool_output(
         &self,
         session: &flash_core::storage::Session,
         call: &ToolCall,
         output: flash_core::ToolOutput,
         observer: &mut impl EventObserver,
     ) -> Result<Message, AgentError> {
-        let stdout = self.materialize_output(session, &call.call_id, "stdout", &output.stdout)?;
-        let stderr = self.materialize_output(session, &call.call_id, "stderr", &output.stderr)?;
+        let stdout = self
+            .materialize_output(session, &call.call_id, "stdout", &output.stdout)
+            .await?;
+        let stderr = self
+            .materialize_output(session, &call.call_id, "stderr", &output.stderr)
+            .await?;
         if !stdout.is_empty() {
             emit_event(
                 session,
@@ -618,7 +679,8 @@ where
                     text: stdout.clone(),
                 },
                 observer,
-            )?;
+            )
+            .await?;
         }
         if !stderr.is_empty() {
             emit_event(
@@ -629,7 +691,8 @@ where
                     text: stderr.clone(),
                 },
                 observer,
-            )?;
+            )
+            .await?;
         }
         let status = match output.status {
             ToolExitStatus::Success => ToolResultStatus::Success,
@@ -643,17 +706,19 @@ where
                 status,
             },
             observer,
-        )?;
-        append_tool_result_message(
-            session,
-            &call.call_id,
-            status,
-            &format!("stdout:\n{stdout}\nstderr:\n{stderr}"),
         )
+        .await?;
+        append_tool_result_message_async(
+            session.clone(),
+            call.call_id.clone(),
+            status,
+            format!("stdout:\n{stdout}\nstderr:\n{stderr}"),
+        )
+        .await
         .map_err(AgentError::Storage)
     }
 
-    fn materialize_output(
+    async fn materialize_output(
         &self,
         session: &flash_core::storage::Session,
         call_id: &str,
@@ -665,21 +730,30 @@ where
         }
         let artifact = format!("artifacts/{call_id}.{stream}.txt");
         let path: PathBuf = session.path.join(&artifact);
-        fs::write(&path, text).map_err(flash_core::storage::StorageError::Io)?;
+        let full_text = text.to_string();
+        let artifact_text = full_text.clone();
+        tokio::task::spawn_blocking(move || std::fs::write(&path, artifact_text))
+            .await
+            .map_err(|error| {
+                AgentError::Storage(flash_core::storage::StorageError::TaskJoin(
+                    error.to_string(),
+                ))
+            })?
+            .map_err(flash_core::storage::StorageError::Io)?;
         Ok(format!(
             "{}\n[full output: {}]",
-            truncate(text, self.options.max_output_bytes),
+            truncate(&full_text, self.options.max_output_bytes),
             artifact
         ))
     }
 }
 
-fn emit_event(
+async fn emit_event(
     session: &flash_core::storage::Session,
     event: Event,
     observer: &mut impl EventObserver,
 ) -> Result<(), AgentError> {
-    append_event(session, event.clone())?;
+    append_event_async(session.clone(), event.clone()).await?;
     observer.on_event(&event);
     Ok(())
 }

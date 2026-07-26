@@ -24,6 +24,7 @@ pub struct Session {
 pub enum StorageError {
     Io(std::io::Error),
     Parse(String),
+    TaskJoin(String),
     WorkspaceMismatch { expected: PathBuf, actual: PathBuf },
 }
 
@@ -32,6 +33,7 @@ impl std::fmt::Display for StorageError {
         match self {
             Self::Io(error) => write!(formatter, "storage io error: {error}"),
             Self::Parse(message) => write!(formatter, "storage parse error: {message}"),
+            Self::TaskJoin(message) => write!(formatter, "storage task join error: {message}"),
             Self::WorkspaceMismatch { expected, actual } => write!(
                 formatter,
                 "session belongs to `{}`, current workspace is `{}`",
@@ -105,6 +107,10 @@ pub fn create_session(root: &Path) -> Result<Session, StorageError> {
     Ok(session)
 }
 
+pub async fn create_session_async(root: PathBuf) -> Result<Session, StorageError> {
+    run_blocking_storage(move || create_session(&root)).await
+}
+
 pub fn load_session(root: &Path, session_id: &str) -> Result<Session, StorageError> {
     let session_dir = root.join(".flash").join("sessions").join(session_id);
     let content = fs::read_to_string(session_dir.join("session.json"))?;
@@ -145,6 +151,13 @@ pub fn append_user_message(session: &Session, text: &str) -> Result<Message, Sto
     Ok(message)
 }
 
+pub async fn append_user_message_async(
+    session: Session,
+    text: String,
+) -> Result<Message, StorageError> {
+    run_blocking_storage(move || append_user_message(&session, &text)).await
+}
+
 pub fn append_assistant_message(
     session: &Session,
     text: &str,
@@ -182,6 +195,14 @@ pub fn append_assistant_message(
     Ok(message)
 }
 
+pub async fn append_assistant_message_async(
+    session: Session,
+    text: String,
+    tool_uses: Vec<(String, String, String)>,
+) -> Result<Message, StorageError> {
+    run_blocking_storage(move || append_assistant_message(&session, &text, &tool_uses)).await
+}
+
 pub fn append_tool_result_message(
     session: &Session,
     call_id: &str,
@@ -209,10 +230,24 @@ pub fn append_tool_result_message(
     Ok(message)
 }
 
+pub async fn append_tool_result_message_async(
+    session: Session,
+    call_id: String,
+    status: ToolResultStatus,
+    text: String,
+) -> Result<Message, StorageError> {
+    run_blocking_storage(move || append_tool_result_message(&session, &call_id, status, &text))
+        .await
+}
+
 pub fn append_event(session: &Session, event: Event) -> Result<(), StorageError> {
     let path = session.path.join("events.jsonl");
     let sequence = next_sequence(&path)?;
     append_line(&path, &event_to_jsonl(sequence, &session.id, &event)?)
+}
+
+pub async fn append_event_async(session: Session, event: Event) -> Result<(), StorageError> {
+    run_blocking_storage(move || append_event(&session, event)).await
 }
 
 pub fn replay_events(path: &Path) -> Result<Vec<String>, StorageError> {
@@ -234,6 +269,16 @@ fn append_line(path: &Path, line: &str) -> Result<(), StorageError> {
     let mut file = OpenOptions::new().append(true).create(true).open(path)?;
     writeln!(file, "{line}")?;
     Ok(())
+}
+
+async fn run_blocking_storage<T, F>(operation: F) -> Result<T, StorageError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, StorageError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| StorageError::TaskJoin(error.to_string()))?
 }
 
 fn message_to_jsonl(message: &Message) -> Result<String, StorageError> {

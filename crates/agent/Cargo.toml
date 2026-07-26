@@ -12,6 +12,7 @@ path = "src/lib.rs"
 async-trait = "0.1"
 flash-core = { path = "../core" }
 flash-provider = { path = "../provider" }
+tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]
 flash-tools = { path = "../tools" }

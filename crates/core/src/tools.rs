@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -130,7 +131,7 @@ pub struct ToolDescriptor {
 
 #[derive(Default)]
 pub struct ToolRegistry {
-    tools: BTreeMap<String, Box<dyn Tool>>,
+    tools: BTreeMap<String, Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
@@ -143,12 +144,26 @@ impl ToolRegistry {
         if self.tools.contains_key(&name) {
             return Err(ToolRegistryError::DuplicateName(name));
         }
-        self.tools.insert(name, tool);
+        self.tools.insert(name, Arc::from(tool));
         Ok(())
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.get(name).map(Box::as_ref)
+        self.tools.get(name).map(Arc::as_ref)
+    }
+
+    pub async fn call_blocking(
+        &self,
+        name: &str,
+        input: String,
+        context: ToolContext,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        let tool = Arc::clone(self.tools.get(name)?);
+        Some(
+            tokio::task::spawn_blocking(move || tool.call(&input, &context))
+                .await
+                .unwrap_or_else(|error| Err(ToolError::new(format!("tool task failed: {error}")))),
+        )
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
