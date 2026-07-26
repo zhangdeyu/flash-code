@@ -1,4 +1,7 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     System,
     User,
@@ -17,7 +20,8 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
         text: String,
@@ -37,7 +41,7 @@ pub enum ContentBlock {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub id: String,
     pub role: Role,
@@ -45,7 +49,8 @@ pub struct Message {
     pub content: Vec<ContentBlock>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolResultStatus {
     Success,
     Error,
@@ -64,7 +69,8 @@ impl ToolResultStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Outcome {
     Succeeded,
     Failed,
@@ -81,7 +87,8 @@ impl Outcome {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     Running,
     Completed,
@@ -100,7 +107,8 @@ impl SessionStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     SessionStarted {
         session_id: String,
@@ -179,28 +187,41 @@ impl Event {
     }
 }
 
-pub fn escape_json(input: &str) -> String {
-    let mut escaped = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '"' => escaped.push_str("\\\""),
-            '\\' => escaped.push_str("\\\\"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            ch if ch.is_control() => escaped.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn escape_json_should_escape_quotes_and_newlines() {
-        assert_eq!(escape_json("a\"b\nc"), "a\\\"b\\nc");
+    fn message_should_round_trip_through_serde_json() {
+        let message = Message {
+            id: "msg_1".to_string(),
+            role: Role::Assistant,
+            created_at: "123".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                call_id: "call_1".to_string(),
+                name: "Read".to_string(),
+                input: "src/lib.rs".to_string(),
+            }],
+        };
+
+        let encoded = serde_json::to_string(&message).unwrap();
+        let decoded: Message = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn event_should_use_snake_case_tagged_schema() {
+        let event = Event::ToolFinished {
+            call_id: "call_1".to_string(),
+            status: ToolResultStatus::Success,
+        };
+
+        let encoded = serde_json::to_string(&event).unwrap();
+
+        assert_eq!(
+            encoded,
+            r#"{"type":"tool_finished","call_id":"call_1","status":"success"}"#
+        );
     }
 }

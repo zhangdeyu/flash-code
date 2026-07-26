@@ -3,9 +3,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::protocol::{
-    escape_json, ContentBlock, Event, Message, Role, SessionStatus, ToolResultStatus,
-};
+use serde::{Deserialize, Serialize};
+
+use crate::protocol::{ContentBlock, Event, Message, Role, SessionStatus, ToolResultStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workspace {
@@ -50,6 +50,12 @@ impl From<std::io::Error> for StorageError {
     }
 }
 
+impl From<serde_json::Error> for StorageError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Parse(error.to_string())
+    }
+}
+
 pub fn init_workspace(root: &Path) -> Result<Workspace, StorageError> {
     let flash_dir = root.join(".flash");
     let sessions_dir = flash_dir.join("sessions");
@@ -58,12 +64,15 @@ pub fn init_workspace(root: &Path) -> Result<Workspace, StorageError> {
         id: format!("workspace_{}", stable_workspace_id(root)),
         root: root.to_path_buf(),
     };
-    let workspace_json = format!(
-        "{{\"version\":\"1\",\"workspace_id\":\"{}\",\"root\":\"{}\"}}\n",
-        escape_json(&workspace.id),
-        escape_json(&root.display().to_string())
-    );
-    fs::write(flash_dir.join("workspace.json"), workspace_json)?;
+    let workspace_json = serde_json::to_string(&WorkspaceRecord {
+        version: "1".to_string(),
+        workspace_id: workspace.id.clone(),
+        root: root.display().to_string(),
+    })?;
+    fs::write(
+        flash_dir.join("workspace.json"),
+        format!("{workspace_json}\n"),
+    )?;
     Ok(workspace)
 }
 
@@ -78,24 +87,18 @@ pub fn create_session(root: &Path) -> Result<Session, StorageError> {
         path: session_dir.clone(),
     };
     let now = timestamp();
-    let session_json = format!(
-        concat!(
-            "{{",
-            "\"version\":\"1\",",
-            "\"session_id\":\"{}\",",
-            "\"workspace_root\":\"{}\",",
-            "\"created_at\":\"{}\",",
-            "\"updated_at\":\"{}\",",
-            "\"status\":\"{}\"",
-            "}}\n"
-        ),
-        escape_json(&id),
-        escape_json(&root.display().to_string()),
-        now,
-        now,
-        SessionStatus::Running.as_str()
-    );
-    fs::write(session_dir.join("session.json"), session_json)?;
+    let session_json = serde_json::to_string(&SessionRecord {
+        version: "1".to_string(),
+        session_id: id.clone(),
+        workspace_root: root.display().to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        status: SessionStatus::Running,
+    })?;
+    fs::write(
+        session_dir.join("session.json"),
+        format!("{session_json}\n"),
+    )?;
     fs::write(session_dir.join("messages.jsonl"), "")?;
     fs::write(session_dir.join("events.jsonl"), "")?;
     append_event(&session, Event::SessionStarted { session_id: id })?;
@@ -105,9 +108,8 @@ pub fn create_session(root: &Path) -> Result<Session, StorageError> {
 pub fn load_session(root: &Path, session_id: &str) -> Result<Session, StorageError> {
     let session_dir = root.join(".flash").join("sessions").join(session_id);
     let content = fs::read_to_string(session_dir.join("session.json"))?;
-    let workspace_root = find_json_string(&content, "workspace_root")
-        .ok_or_else(|| StorageError::Parse("missing workspace_root".to_string()))?;
-    let expected = PathBuf::from(workspace_root);
+    let record: SessionRecord = serde_json::from_str(&content)?;
+    let expected = PathBuf::from(record.workspace_root);
     if expected != root {
         return Err(StorageError::WorkspaceMismatch {
             expected,
@@ -132,7 +134,7 @@ pub fn append_user_message(session: &Session, text: &str) -> Result<Message, Sto
     };
     append_line(
         &session.path.join("messages.jsonl"),
-        &message_to_jsonl(&message),
+        &message_to_jsonl(&message)?,
     )?;
     append_event(
         session,
@@ -169,7 +171,7 @@ pub fn append_assistant_message(
     };
     append_line(
         &session.path.join("messages.jsonl"),
-        &message_to_jsonl(&message),
+        &message_to_jsonl(&message)?,
     )?;
     append_event(
         session,
@@ -202,7 +204,7 @@ pub fn append_tool_result_message(
     };
     append_line(
         &session.path.join("messages.jsonl"),
-        &message_to_jsonl(&message),
+        &message_to_jsonl(&message)?,
     )?;
     Ok(message)
 }
@@ -210,19 +212,22 @@ pub fn append_tool_result_message(
 pub fn append_event(session: &Session, event: Event) -> Result<(), StorageError> {
     let path = session.path.join("events.jsonl");
     let sequence = next_sequence(&path)?;
-    append_line(&path, &event_to_jsonl(sequence, &session.id, &event))
+    append_line(&path, &event_to_jsonl(sequence, &session.id, &event)?)
 }
 
 pub fn replay_events(path: &Path) -> Result<Vec<String>, StorageError> {
     let content = fs::read_to_string(path)?;
-    Ok(content
+    content
         .lines()
-        .filter_map(|line| {
-            let sequence = find_json_number(line, "sequence")?;
-            let event_type = find_json_string(line, "type")?;
-            Some(format!("{sequence}: {event_type}"))
+        .map(|line| {
+            let record: EventRecord = serde_json::from_str(line)?;
+            Ok(format!(
+                "{}: {}",
+                record.sequence,
+                record.event.event_type()
+            ))
         })
-        .collect())
+        .collect()
 }
 
 fn append_line(path: &Path, line: &str) -> Result<(), StorageError> {
@@ -231,151 +236,21 @@ fn append_line(path: &Path, line: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn message_to_jsonl(message: &Message) -> String {
-    let content = message
-        .content
-        .iter()
-        .map(content_block_to_json)
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        concat!(
-            "{{\"version\":\"1\",\"message\":{{",
-            "\"id\":\"{}\",",
-            "\"role\":\"{}\",",
-            "\"created_at\":\"{}\",",
-            "\"content\":[{}]",
-            "}}}}"
-        ),
-        escape_json(&message.id),
-        message.role.as_str(),
-        escape_json(&message.created_at),
-        content
-    )
+fn message_to_jsonl(message: &Message) -> Result<String, StorageError> {
+    Ok(serde_json::to_string(&MessageRecord {
+        version: "1".to_string(),
+        message: message.clone(),
+    })?)
 }
 
-fn content_block_to_json(block: &ContentBlock) -> String {
-    match block {
-        ContentBlock::Text { text } => {
-            format!("{{\"type\":\"text\",\"text\":\"{}\"}}", escape_json(text))
-        }
-        ContentBlock::Reasoning { text } => {
-            format!(
-                "{{\"type\":\"reasoning\",\"text\":\"{}\"}}",
-                escape_json(text)
-            )
-        }
-        ContentBlock::ToolUse { call_id, name, input } => format!(
-            "{{\"type\":\"tool_use\",\"call_id\":\"{}\",\"name\":\"{}\",\"input\":\"{}\"}}",
-            escape_json(call_id),
-            escape_json(name),
-            escape_json(input)
-        ),
-        ContentBlock::ToolResult { call_id, status } => format!(
-            "{{\"type\":\"tool_result\",\"call_id\":\"{}\",\"status\":\"{}\"}}",
-            escape_json(call_id),
-            status.as_str()
-        ),
-    }
-}
-
-fn event_to_jsonl(sequence: u64, session_id: &str, event: &Event) -> String {
-    let body = match event {
-        Event::SessionStarted { session_id } => {
-            format!(
-                "{{\"type\":\"session_started\",\"session_id\":\"{}\"}}",
-                escape_json(session_id)
-            )
-        }
-        Event::UserMessageAppended { message_id } => {
-            format!(
-                "{{\"type\":\"user_message_appended\",\"message_id\":\"{}\"}}",
-                escape_json(message_id)
-            )
-        }
-        Event::ModelRequestStarted { request_id, model } => format!(
-            "{{\"type\":\"model_request_started\",\"request_id\":\"{}\",\"model\":\"{}\"}}",
-            escape_json(request_id),
-            escape_json(model)
-        ),
-        Event::AssistantMessageCompleted { message_id } => format!(
-            "{{\"type\":\"assistant_message_completed\",\"message_id\":\"{}\"}}",
-            escape_json(message_id)
-        ),
-        Event::Error { message } => {
-            format!(
-                "{{\"type\":\"error\",\"message\":\"{}\"}}",
-                escape_json(message)
-            )
-        }
-        Event::ReasoningDelta { text } => format!(
-            "{{\"type\":\"reasoning_delta\",\"text\":\"{}\"}}",
-            escape_json(text)
-        ),
-        Event::AssistantDelta { text } => format!(
-            "{{\"type\":\"assistant_delta\",\"text\":\"{}\"}}",
-            escape_json(text)
-        ),
-        Event::ToolCallRequested { call_id, name } => format!(
-            "{{\"type\":\"tool_call_requested\",\"call_id\":\"{}\",\"name\":\"{}\"}}",
-            escape_json(call_id),
-            escape_json(name)
-        ),
-        Event::ApprovalRequired { call_id } => format!(
-            "{{\"type\":\"approval_required\",\"call_id\":\"{}\"}}",
-            escape_json(call_id)
-        ),
-        Event::ApprovalResolved { call_id, approved } => format!(
-            "{{\"type\":\"approval_resolved\",\"call_id\":\"{}\",\"approved\":{}}}",
-            escape_json(call_id),
-            approved
-        ),
-        Event::ToolStarted { call_id, name } => format!(
-            "{{\"type\":\"tool_started\",\"call_id\":\"{}\",\"name\":\"{}\"}}",
-            escape_json(call_id),
-            escape_json(name)
-        ),
-        Event::ToolOutputDelta {
-            call_id,
-            stream,
-            text,
-        } => format!(
-            "{{\"type\":\"tool_output_delta\",\"call_id\":\"{}\",\"stream\":\"{}\",\"text\":\"{}\"}}",
-            escape_json(call_id),
-            escape_json(stream),
-            escape_json(text)
-        ),
-        Event::ToolFinished { call_id, status } => format!(
-            "{{\"type\":\"tool_finished\",\"call_id\":\"{}\",\"status\":\"{}\"}}",
-            escape_json(call_id),
-            status.as_str()
-        ),
-        Event::UsageRecorded {
-            input_tokens,
-            output_tokens,
-        } => format!(
-            "{{\"type\":\"usage_recorded\",\"input_tokens\":{},\"output_tokens\":{}}}",
-            input_tokens, output_tokens
-        ),
-        Event::SessionFinished { outcome } => format!(
-            "{{\"type\":\"session_finished\",\"outcome\":\"{}\"}}",
-            outcome.as_str()
-        ),
-    };
-    format!(
-        concat!(
-            "{{\"version\":\"1\",",
-            "\"sequence\":{},",
-            "\"timestamp\":\"{}\",",
-            "\"session_id\":\"{}\",",
-            "\"event\":{}",
-            "}}"
-        ),
+fn event_to_jsonl(sequence: u64, session_id: &str, event: &Event) -> Result<String, StorageError> {
+    Ok(serde_json::to_string(&EventRecord {
+        version: "1".to_string(),
         sequence,
-        timestamp(),
-        escape_json(session_id),
-        body
-    )
+        timestamp: timestamp(),
+        session_id: session_id.to_string(),
+        event: event.clone(),
+    })?)
 }
 
 fn next_sequence(path: &Path) -> Result<u64, StorageError> {
@@ -386,24 +261,6 @@ fn next_sequence(path: &Path) -> Result<u64, StorageError> {
     Ok(content.lines().count() as u64 + 1)
 }
 
-fn find_json_string(content: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":\"");
-    let start = content.find(&needle)? + needle.len();
-    let rest = &content[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
-}
-
-fn find_json_number(content: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":");
-    let start = content.find(&needle)? + needle.len();
-    let rest = &content[start..];
-    let end = rest
-        .find(|ch: char| !ch.is_ascii_digit())
-        .unwrap_or(rest.len());
-    Some(rest[..end].to_string())
-}
-
 fn stable_workspace_id(root: &Path) -> u64 {
     root.display()
         .to_string()
@@ -411,6 +268,38 @@ fn stable_workspace_id(root: &Path) -> u64 {
         .fold(14_695_981_039_346_656_037_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(1_099_511_628_211)
         })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WorkspaceRecord {
+    version: String,
+    workspace_id: String,
+    root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionRecord {
+    version: String,
+    session_id: String,
+    workspace_root: String,
+    created_at: String,
+    updated_at: String,
+    status: SessionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MessageRecord {
+    version: String,
+    message: Message,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct EventRecord {
+    version: String,
+    sequence: u64,
+    timestamp: String,
+    session_id: String,
+    event: Event,
 }
 
 fn new_id(prefix: &str) -> String {
@@ -601,7 +490,11 @@ mod tests {
         append_assistant_message(
             &session,
             "I will read",
-            &[("call_1".to_string(), "Read".to_string(), "src/lib.rs".to_string())],
+            &[(
+                "call_1".to_string(),
+                "Read".to_string(),
+                "src/lib.rs".to_string(),
+            )],
         )
         .unwrap();
         append_tool_result_message(&session, "call_1", ToolResultStatus::Success, "done").unwrap();

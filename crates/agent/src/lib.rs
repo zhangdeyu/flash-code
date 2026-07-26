@@ -175,8 +175,7 @@ where
                     .collect(),
                 model: self.options.model.clone(),
             };
-            let provider_events =
-                self.chat_with_retry_streaming(&session, request, observer)?;
+            let provider_events = self.chat_with_retry_streaming(&session, request, observer)?;
             let turn_result = self.handle_provider_events(&session, provider_events, observer)?;
             let Some(turn_result) = turn_result else {
                 return Ok(AgentRun {
@@ -375,12 +374,12 @@ where
                 // Real-time streaming: emit ReasoningDelta and AssistantDelta immediately
                 // so TUI / CLI observers see output as it arrives.
                 let agent_event = match &event {
-                    ProviderEvent::ReasoningDelta(text) => Some(Event::ReasoningDelta {
-                        text: text.clone(),
-                    }),
-                    ProviderEvent::TextDelta(text) => Some(Event::AssistantDelta {
-                        text: text.clone(),
-                    }),
+                    ProviderEvent::ReasoningDelta(text) => {
+                        Some(Event::ReasoningDelta { text: text.clone() })
+                    }
+                    ProviderEvent::TextDelta(text) => {
+                        Some(Event::AssistantDelta { text: text.clone() })
+                    }
                     _ => None,
                 };
                 if let Some(e) = agent_event {
@@ -755,7 +754,11 @@ fn message_size(message: &Message) -> usize {
         .iter()
         .map(|block| match block {
             ContentBlock::Text { text } | ContentBlock::Reasoning { text } => text.len(),
-            ContentBlock::ToolUse { call_id, name, input } => call_id.len() + name.len() + input.len(),
+            ContentBlock::ToolUse {
+                call_id,
+                name,
+                input,
+            } => call_id.len() + name.len() + input.len(),
             ContentBlock::ToolResult { call_id, .. } => call_id.len(),
         })
         .sum()

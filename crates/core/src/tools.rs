@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolRisk {
     Read,
     Write,
@@ -10,14 +13,16 @@ pub enum ToolRisk {
     Destructive,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ApprovalMode {
     Confirm,
     Yolo,
     Human,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PermissionDecision {
     Allow,
     Ask,
@@ -78,7 +83,8 @@ impl ToolOutput {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolExitStatus {
     Success,
     Error,
@@ -322,5 +328,21 @@ mod tests {
         for (mode, risk, expected) in cases {
             assert_eq!(PermissionPolicy::new(mode).decide(risk), expected);
         }
+    }
+
+    #[test]
+    fn permission_enums_should_use_stable_snake_case_json_names() {
+        assert_eq!(
+            serde_json::to_string(&ToolRisk::Destructive).unwrap(),
+            r#""destructive""#
+        );
+        assert_eq!(
+            serde_json::from_str::<ApprovalMode>(r#""yolo""#).unwrap(),
+            ApprovalMode::Yolo
+        );
+        assert_eq!(
+            serde_json::from_str::<PermissionDecision>(r#""ask""#).unwrap(),
+            PermissionDecision::Ask
+        );
     }
 }
