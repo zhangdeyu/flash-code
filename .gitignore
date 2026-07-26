@@ -17,3 +17,6 @@ Thumbs.db
 
 # Flash Code local state
 .flash/
+
+# Claude Code agent worktrees (local working copies, never track)
+.claude/worktrees/
