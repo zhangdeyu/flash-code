@@ -1,9 +1,14 @@
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use async_trait::async_trait;
+use crossterm::cursor::{Hide, Show};
+use crossterm::event::{self, Event as TerminalEvent, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use flash_core::storage::load_session;
 use flash_core::{discover_workspace_root, init_workspace, Event};
 
@@ -97,17 +102,18 @@ async fn input_loop(
     state: &mut AppState,
     runner: &mut impl TaskRunner,
 ) -> Result<(), TuiError> {
-    let mut stdin = io::stdin();
-    let mut buffer = [0_u8; 1];
     loop {
-        let read = stdin.read(&mut buffer)?;
-        if read == 0 || matches!(buffer[0], 3 | 27) {
-            state.cancel();
-            render_frame(stdout, state)?;
-            break;
-        }
-        match buffer[0] {
-            b'\r' | b'\n' => {
+        let TerminalEvent::Key(key) = event::read()? else {
+            continue;
+        };
+        match input_action_for_key(key, state.input.is_empty()) {
+            InputAction::Cancel => {
+                state.cancel();
+                render_frame(stdout, state)?;
+                break;
+            }
+            InputAction::Quit => break,
+            InputAction::Submit => {
                 if !state.input.is_empty() {
                     let task = state.input.clone();
                     state.input.clear();
@@ -119,19 +125,45 @@ async fn input_loop(
                     }
                 }
             }
-            8 | 127 => {
+            InputAction::Backspace => {
                 state.input.pop();
                 render_frame(stdout, state)?;
             }
-            b'q' | b'Q' if state.input.is_empty() => break,
-            byte if byte.is_ascii_graphic() || byte == b' ' => {
-                state.input.push(byte as char);
+            InputAction::Char(ch) => {
+                state.input.push(ch);
                 render_frame(stdout, state)?;
             }
-            _ => {}
+            InputAction::Ignore => {}
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputAction {
+    Char(char),
+    Submit,
+    Backspace,
+    Cancel,
+    Quit,
+    Ignore,
+}
+
+fn input_action_for_key(key: KeyEvent, input_is_empty: bool) -> InputAction {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
+    {
+        return InputAction::Cancel;
+    }
+    match key.code {
+        KeyCode::Esc => InputAction::Cancel,
+        KeyCode::Enter => InputAction::Submit,
+        KeyCode::Backspace => InputAction::Backspace,
+        KeyCode::Char('q' | 'Q') if key.modifiers.is_empty() && input_is_empty => InputAction::Quit,
+        KeyCode::Char(ch) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+            InputAction::Char(ch)
+        }
+        _ => InputAction::Ignore,
+    }
 }
 
 async fn run_task_for_state(
@@ -205,54 +237,45 @@ fn read_approval_from_stdin() -> bool {
     if !io::stdin().is_terminal() {
         return false;
     }
-    let mut stdin = io::stdin();
-    let mut buffer = [0_u8; 1];
     loop {
-        let Ok(read) = stdin.read(&mut buffer) else {
+        let Ok(TerminalEvent::Key(key)) = event::read() else {
             return false;
         };
-        if read == 0 {
-            return false;
-        }
-        match buffer[0] {
-            b'y' | b'Y' => return true,
-            b'n' | b'N' | 3 | 27 => return false,
+        match input_action_for_key(key, false) {
+            InputAction::Char('y' | 'Y') => return true,
+            InputAction::Char('n' | 'N') | InputAction::Cancel => return false,
             _ => {}
         }
     }
 }
 
 struct TerminalGuard {
-    restore_raw_mode: bool,
+    raw_mode_enabled: bool,
+    alternate_screen_entered: bool,
 }
 
 impl TerminalGuard {
     fn enter() -> Result<Self, TuiError> {
-        let restore_raw_mode = set_raw_mode();
         let mut stdout = io::stdout();
-        write!(stdout, "\x1b[?1049h\x1b[?25l")?;
-        stdout.flush()?;
-        Ok(Self { restore_raw_mode })
+        enable_raw_mode()?;
+        execute!(stdout, EnterAlternateScreen, Hide)?;
+        Ok(Self {
+            raw_mode_enabled: true,
+            alternate_screen_entered: true,
+        })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        if self.restore_raw_mode {
-            let _status = Command::new("stty").arg("sane").status();
-        }
         let mut stdout = io::stdout();
-        let _result = write!(stdout, "\x1b[?25h\x1b[?1049l");
-        let _result = stdout.flush();
+        if self.alternate_screen_entered {
+            let _result = execute!(stdout, Show, LeaveAlternateScreen);
+        }
+        if self.raw_mode_enabled {
+            let _result = disable_raw_mode();
+        }
     }
-}
-
-fn set_raw_mode() -> bool {
-    Command::new("stty")
-        .args(["raw", "-echo"])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1090,6 +1113,41 @@ mod tests {
         let entry = parse_event_line(line).unwrap();
 
         assert_eq!(entry.kind, TranscriptKind::User);
+    }
+
+    #[test]
+    fn input_action_should_cover_crossterm_keyboard_controls() {
+        assert_eq!(
+            input_action_for_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), false),
+            InputAction::Char('a')
+        );
+        assert_eq!(
+            input_action_for_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), false),
+            InputAction::Submit
+        );
+        assert_eq!(
+            input_action_for_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), false),
+            InputAction::Backspace
+        );
+        assert_eq!(
+            input_action_for_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), false),
+            InputAction::Cancel
+        );
+        assert_eq!(
+            input_action_for_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                false
+            ),
+            InputAction::Cancel
+        );
+        assert_eq!(
+            input_action_for_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), true),
+            InputAction::Quit
+        );
+        assert_eq!(
+            input_action_for_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), false),
+            InputAction::Char('q')
+        );
     }
 
     #[test]
