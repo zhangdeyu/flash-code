@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use flash_core::Message;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,10 +18,11 @@ pub trait Provider {
     fn capabilities(&self) -> &ModelCapabilities;
 }
 
+#[async_trait(?Send)]
 pub trait ChatProvider {
     /// Send a chat request and emit events via `on_event` as they arrive.
     /// The callback is called for each `ProviderEvent` in streaming order.
-    fn chat(
+    async fn chat(
         &mut self,
         request: ChatRequest,
         on_event: &mut dyn FnMut(ProviderEvent),
@@ -124,8 +126,9 @@ mod tests {
 
     struct EchoProvider;
 
+    #[async_trait(?Send)]
     impl ChatProvider for EchoProvider {
-        fn chat(
+        async fn chat(
             &mut self,
             _request: ChatRequest,
             on_event: &mut dyn FnMut(ProviderEvent),
@@ -153,8 +156,8 @@ mod tests {
         assert!(provider.capabilities().supports_tool_calls);
     }
 
-    #[test]
-    fn chat_provider_should_emit_events_via_callback() {
+    #[tokio::test]
+    async fn chat_provider_should_emit_events_via_callback() {
         let mut provider = EchoProvider;
         let mut events = Vec::new();
         provider
@@ -166,6 +169,7 @@ mod tests {
                 },
                 &mut |event| events.push(event),
             )
+            .await
             .unwrap();
         assert_eq!(events.len(), 2);
     }

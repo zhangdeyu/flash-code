@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
 
+use async_trait::async_trait;
 use clap::{Args, Parser, Subcommand};
 use flash_agent::{AgentOptions, AgentRuntime, ApprovalController, ApprovalRequest, SmokeProvider};
 use flash_core::{
@@ -10,8 +11,9 @@ use flash_core::{
     PermissionPolicy,
 };
 
-fn main() {
-    if let Err(error) = run(Cli::parse()) {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    if let Err(error) = run(Cli::parse()).await {
         eprintln!("error: {error}");
         std::process::exit(1);
     }
@@ -83,25 +85,28 @@ struct ResumeArgs {
     session_id: String,
 }
 
-fn run(cli: Cli) -> Result<(), CliError> {
+async fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
-        None | Some(CliCommand::Tui) => tui(),
+        None | Some(CliCommand::Tui) => tui().await,
         Some(CliCommand::Init) => init(),
         Some(CliCommand::Doctor) => doctor(),
-        Some(CliCommand::Run(args)) => run_task(&args.task),
-        Some(CliCommand::Eval { command }) => eval(command),
+        Some(CliCommand::Run(args)) => run_task(&args.task).await,
+        Some(CliCommand::Eval { command }) => eval(command).await,
         Some(CliCommand::Replay(args)) => replay(&args.events_path),
         Some(CliCommand::Resume(args)) => resume(&args.session_id),
     }
 }
 
-fn tui() -> Result<(), CliError> {
+async fn tui() -> Result<(), CliError> {
     let mut runner = CliTaskRunner;
-    flash_tui::run_current_workspace(&mut runner).map_err(CliError::Tui)
+    flash_tui::run_current_workspace(&mut runner)
+        .await
+        .map_err(CliError::Tui)
 }
 
 struct CliTaskRunner;
 
+#[async_trait(?Send)]
 impl flash_tui::TaskRunner for CliTaskRunner {
     fn permission_mode(&mut self, workspace_root: &Path) -> String {
         load_config(workspace_root, &ConfigOverrides::default())
@@ -109,7 +114,7 @@ impl flash_tui::TaskRunner for CliTaskRunner {
             .unwrap_or_else(|_| "unknown".to_string())
     }
 
-    fn run_task(
+    async fn run_task(
         &mut self,
         workspace_root: &Path,
         task: &str,
@@ -142,6 +147,7 @@ impl flash_tui::TaskRunner for CliTaskRunner {
                 || controller_cell.borrow_mut().should_cancel(),
                 &mut runtime_approval,
             )
+            .await
             .map_err(|error| error.to_string())?;
         Ok(flash_tui::TuiRun {
             session_id: run.session_id,
@@ -189,7 +195,7 @@ fn doctor() -> Result<(), CliError> {
     Ok(())
 }
 
-fn run_task(task: &str) -> Result<(), CliError> {
+async fn run_task(task: &str) -> Result<(), CliError> {
     let root = discover_workspace_root(None)?;
     let config = load_config(&root, &ConfigOverrides::default())?;
     let registry = flash_tools::builtin_registry().map_err(CliError::ToolRegistry)?;
@@ -204,26 +210,26 @@ fn run_task(task: &str) -> Result<(), CliError> {
             max_prompt_bytes: 200_000,
         },
     );
-    let run = runtime.run_task(&root, task)?;
+    let run = runtime.run_task(&root, task).await?;
     println!("session: {}", run.session_id);
     println!("outcome: {}", run.outcome.as_str());
     Ok(())
 }
 
-fn eval(command: EvalCommand) -> Result<(), CliError> {
+async fn eval(command: EvalCommand) -> Result<(), CliError> {
     match command {
-        EvalCommand::Fixture(args) => eval_fixture(&args.task),
-        EvalCommand::TerminalBench(args) => eval_terminal_bench(&args.subset),
-        EvalCommand::SweBench(args) => eval_swe_bench(&args.subset, args.limit),
-        EvalCommand::Regression => eval_regression(),
+        EvalCommand::Fixture(args) => eval_fixture(&args.task).await,
+        EvalCommand::TerminalBench(args) => eval_terminal_bench(&args.subset).await,
+        EvalCommand::SweBench(args) => eval_swe_bench(&args.subset, args.limit).await,
+        EvalCommand::Regression => eval_regression().await,
     }
 }
 
-fn eval_fixture(task_id: &str) -> Result<(), CliError> {
+async fn eval_fixture(task_id: &str) -> Result<(), CliError> {
     let root = discover_workspace_root(None)?;
     init_workspace(&root)?;
     let task = flash_eval::local_fixture_task(task_id)?;
-    let result = flash_eval::run_fixture_eval(&root, task)?;
+    let result = flash_eval::run_fixture_eval(&root, task).await?;
     println!("task: {}", result.task_id);
     println!("passed: {}", result.passed);
     if let Some(session_id) = &result.session_id {
@@ -246,7 +252,7 @@ fn eval_fixture(task_id: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-fn eval_terminal_bench(subset: &str) -> Result<(), CliError> {
+async fn eval_terminal_bench(subset: &str) -> Result<(), CliError> {
     if subset != "smoke" {
         return Err(CliError::Usage(
             "usage: flash eval terminal-bench --subset smoke".to_string(),
@@ -254,7 +260,7 @@ fn eval_terminal_bench(subset: &str) -> Result<(), CliError> {
     }
     let root = discover_workspace_root(None)?;
     init_workspace(&root)?;
-    let run = flash_eval::run_terminal_bench_smoke(&root)?;
+    let run = flash_eval::run_terminal_bench_smoke(&root).await?;
     let passed = run.results.iter().filter(|result| result.passed).count();
     println!("benchmark: terminal-bench");
     println!("subset: {}", run.subset);
@@ -279,14 +285,14 @@ fn eval_terminal_bench(subset: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-fn eval_swe_bench(subset: &str, limit: usize) -> Result<(), CliError> {
+async fn eval_swe_bench(subset: &str, limit: usize) -> Result<(), CliError> {
     let usage = "usage: flash eval swe-bench --subset verified --limit 10";
     if subset != "verified" {
         return Err(CliError::Usage(usage.to_string()));
     }
     let root = discover_workspace_root(None)?;
     init_workspace(&root)?;
-    let run = flash_eval::run_swe_bench_verified(&root, limit)?;
+    let run = flash_eval::run_swe_bench_verified(&root, limit).await?;
     let summary = run.summary();
     println!("benchmark: swe-bench");
     println!("subset: {}", run.subset);
@@ -322,10 +328,10 @@ fn eval_swe_bench(subset: &str, limit: usize) -> Result<(), CliError> {
     Ok(())
 }
 
-fn eval_regression() -> Result<(), CliError> {
+async fn eval_regression() -> Result<(), CliError> {
     let root = discover_workspace_root(None)?;
     init_workspace(&root)?;
-    let run = flash_eval::run_regression(&root)?;
+    let run = flash_eval::run_regression(&root).await?;
     println!("benchmark: regression");
     println!("passed: {}/{}", run.passed, run.total);
     println!("pass_rate_bps: {}", run.pass_rate_bps);

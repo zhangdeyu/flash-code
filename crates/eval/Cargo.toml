@@ -13,5 +13,8 @@ flash-agent = { path = "../agent" }
 flash-core = { path = "../core" }
 flash-tools = { path = "../tools" }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+
 [lints]
 workspace = true

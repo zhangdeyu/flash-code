@@ -9,7 +9,11 @@ name = "flash_provider"
 path = "src/lib.rs"
 
 [dependencies]
+async-trait = "0.1"
 flash-core = { path = "../core" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
 
 [lints]
 workspace = true

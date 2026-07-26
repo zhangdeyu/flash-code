@@ -3,16 +3,18 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use async_trait::async_trait;
 use flash_core::storage::load_session;
 use flash_core::{discover_workspace_root, init_workspace, Event};
 
 const DEFAULT_WIDTH: usize = 100;
 const DEFAULT_HEIGHT: usize = 32;
 
+#[async_trait(?Send)]
 pub trait TaskRunner {
     fn permission_mode(&mut self, workspace_root: &Path) -> String;
 
-    fn run_task(
+    async fn run_task(
         &mut self,
         workspace_root: &Path,
         task: &str,
@@ -42,7 +44,7 @@ pub struct TuiRun {
     pub outcome: String,
 }
 
-pub fn run_current_workspace(runner: &mut impl TaskRunner) -> Result<(), TuiError> {
+pub async fn run_current_workspace(runner: &mut impl TaskRunner) -> Result<(), TuiError> {
     let root = discover_workspace_root(None)?;
     init_workspace(&root)?;
     let mut state = AppState::load(&root)?;
@@ -60,7 +62,8 @@ pub fn run_current_workspace(runner: &mut impl TaskRunner) -> Result<(), TuiErro
             runner,
             &task.to_string_lossy(),
             &mut stdout,
-        )?;
+        )
+        .await?;
     }
 
     if should_render_once() {
@@ -71,7 +74,7 @@ pub fn run_current_workspace(runner: &mut impl TaskRunner) -> Result<(), TuiErro
 
     let _terminal = TerminalGuard::enter()?;
     render_frame(&mut stdout, &state)?;
-    input_loop(&root, &mut stdout, &mut state, runner)?;
+    input_loop(&root, &mut stdout, &mut state, runner).await?;
     Ok(())
 }
 
@@ -88,7 +91,7 @@ fn render_frame(stdout: &mut impl Write, state: &AppState) -> Result<(), TuiErro
     Ok(())
 }
 
-fn input_loop(
+async fn input_loop(
     workspace_root: &Path,
     stdout: &mut impl Write,
     state: &mut AppState,
@@ -112,7 +115,7 @@ fn input_loop(
                         state.resume_session(workspace_root, session_id.trim());
                         render_frame(stdout, state)?;
                     } else {
-                        run_task_for_state(workspace_root, state, runner, &task, stdout)?;
+                        run_task_for_state(workspace_root, state, runner, &task, stdout).await?;
                     }
                 }
             }
@@ -131,7 +134,7 @@ fn input_loop(
     Ok(())
 }
 
-fn run_task_for_state(
+async fn run_task_for_state(
     workspace_root: &Path,
     state: &mut AppState,
     runner: &mut impl TaskRunner,
@@ -147,6 +150,7 @@ fn run_task_for_state(
     };
     let run = runner
         .run_task(workspace_root, task, &mut controller)
+        .await
         .map_err(TuiError::Runner)?;
     if let Some(error) = controller.render_error {
         return Err(error);
@@ -1110,28 +1114,32 @@ mod tests {
         assert_eq!(entry.text, "finished succeeded");
     }
 
-    #[test]
-    fn run_task_for_state_should_render_live_task_events_and_final_status() {
+    #[tokio::test]
+    async fn run_task_for_state_should_render_live_task_events_and_final_status() {
         let root = temp_dir("run_task_for_state");
         fs::create_dir_all(&root).unwrap();
         let mut state = AppState::load(&root).unwrap();
         let mut runner = FakeRunner;
         let mut output = Vec::new();
 
-        run_task_for_state(&root, &mut state, &mut runner, "list files", &mut output).unwrap();
+        run_task_for_state(&root, &mut state, &mut runner, "list files", &mut output)
+            .await
+            .unwrap();
 
         assert_eq!(state.status, RunStatus::Succeeded);
     }
 
-    #[test]
-    fn run_task_for_state_should_render_cancelled_status() {
+    #[tokio::test]
+    async fn run_task_for_state_should_render_cancelled_status() {
         let root = temp_dir("run_task_for_state_cancel");
         fs::create_dir_all(&root).unwrap();
         let mut state = AppState::load(&root).unwrap();
         let mut runner = CancelRunner;
         let mut output = Vec::new();
 
-        run_task_for_state(&root, &mut state, &mut runner, "list files", &mut output).unwrap();
+        run_task_for_state(&root, &mut state, &mut runner, "list files", &mut output)
+            .await
+            .unwrap();
 
         assert_eq!(state.status, RunStatus::Cancelled);
     }
@@ -1158,8 +1166,8 @@ mod tests {
         assert_eq!(state.transcript[0].text, "new task");
     }
 
-    #[test]
-    fn run_task_for_state_should_render_pending_approval_and_approved_status() {
+    #[tokio::test]
+    async fn run_task_for_state_should_render_pending_approval_and_approved_status() {
         let root = temp_dir("run_task_for_state_approval");
         fs::create_dir_all(&root).unwrap();
         let mut state = AppState::load(&root).unwrap();
@@ -1173,6 +1181,7 @@ mod tests {
             "needs approval",
             &mut output,
         )
+        .await
         .unwrap();
 
         assert_eq!(state.status, RunStatus::Succeeded);
@@ -1180,8 +1189,9 @@ mod tests {
 
     struct FakeRunner;
 
+    #[async_trait(?Send)]
     impl TaskRunner for FakeRunner {
-        fn run_task(
+        async fn run_task(
             &mut self,
             _workspace_root: &Path,
             _task: &str,
@@ -1209,8 +1219,9 @@ mod tests {
 
     struct CancelRunner;
 
+    #[async_trait(?Send)]
     impl TaskRunner for CancelRunner {
-        fn run_task(
+        async fn run_task(
             &mut self,
             _workspace_root: &Path,
             _task: &str,
@@ -1237,8 +1248,9 @@ mod tests {
 
     struct ApprovalRunner;
 
+    #[async_trait(?Send)]
     impl TaskRunner for ApprovalRunner {
-        fn run_task(
+        async fn run_task(
             &mut self,
             _workspace_root: &Path,
             _task: &str,

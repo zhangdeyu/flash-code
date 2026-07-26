@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use async_trait::async_trait;
 use flash_core::{
     append_assistant_message, append_event, append_tool_result_message, append_user_message,
     create_session, ContentBlock, Event, Message, Outcome, PermissionDecision, PermissionPolicy,
@@ -76,11 +77,16 @@ where
         }
     }
 
-    pub fn run_task(&mut self, workspace_root: &Path, task: &str) -> Result<AgentRun, AgentError> {
+    pub async fn run_task(
+        &mut self,
+        workspace_root: &Path,
+        task: &str,
+    ) -> Result<AgentRun, AgentError> {
         self.run_task_with_observer(workspace_root, task, NoopObserver)
+            .await
     }
 
-    pub fn run_task_with_observer<O>(
+    pub async fn run_task_with_observer<O>(
         &mut self,
         workspace_root: &Path,
         task: &str,
@@ -90,9 +96,10 @@ where
         O: EventObserver,
     {
         self.run_task_controlled(workspace_root, task, &mut observer, || false)
+            .await
     }
 
-    pub fn run_task_controlled<O, C>(
+    pub async fn run_task_controlled<O, C>(
         &mut self,
         workspace_root: &Path,
         task: &str,
@@ -110,9 +117,10 @@ where
             should_cancel,
             &mut RejectingApproval,
         )
+        .await
     }
 
-    pub fn run_task_with_controls<O, C, A>(
+    pub async fn run_task_with_controls<O, C, A>(
         &mut self,
         workspace_root: &Path,
         task: &str,
@@ -175,7 +183,9 @@ where
                     .collect(),
                 model: self.options.model.clone(),
             };
-            let provider_events = self.chat_with_retry_streaming(&session, request, observer)?;
+            let provider_events = self
+                .chat_with_retry_streaming(&session, request, observer)
+                .await?;
             let turn_result = self.handle_provider_events(&session, provider_events, observer)?;
             let Some(turn_result) = turn_result else {
                 return Ok(AgentRun {
@@ -360,7 +370,7 @@ where
         }))
     }
 
-    fn chat_with_retry_streaming<O: EventObserver>(
+    async fn chat_with_retry_streaming<O: EventObserver>(
         &mut self,
         session: &flash_core::storage::Session,
         request: ChatRequest,
@@ -370,24 +380,27 @@ where
         loop {
             attempts += 1;
             let mut collected: Vec<ProviderEvent> = Vec::new();
-            let result = self.provider.chat(request.clone(), &mut |event| {
-                // Real-time streaming: emit ReasoningDelta and AssistantDelta immediately
-                // so TUI / CLI observers see output as it arrives.
-                let agent_event = match &event {
-                    ProviderEvent::ReasoningDelta(text) => {
-                        Some(Event::ReasoningDelta { text: text.clone() })
+            let result = self
+                .provider
+                .chat(request.clone(), &mut |event| {
+                    // Real-time streaming: emit ReasoningDelta and AssistantDelta immediately
+                    // so TUI / CLI observers see output as it arrives.
+                    let agent_event = match &event {
+                        ProviderEvent::ReasoningDelta(text) => {
+                            Some(Event::ReasoningDelta { text: text.clone() })
+                        }
+                        ProviderEvent::TextDelta(text) => {
+                            Some(Event::AssistantDelta { text: text.clone() })
+                        }
+                        _ => None,
+                    };
+                    if let Some(e) = agent_event {
+                        let _ = append_event(session, e.clone());
+                        observer.on_event(&e);
                     }
-                    ProviderEvent::TextDelta(text) => {
-                        Some(Event::AssistantDelta { text: text.clone() })
-                    }
-                    _ => None,
-                };
-                if let Some(e) = agent_event {
-                    let _ = append_event(session, e.clone());
-                    observer.on_event(&e);
-                }
-                collected.push(event);
-            });
+                    collected.push(event);
+                })
+                .await;
             match result {
                 Ok(()) => return Ok(collected),
                 Err(error) if error.is_retryable() && attempts < 3 => continue,
@@ -780,8 +793,9 @@ impl Default for SmokeProvider {
     }
 }
 
+#[async_trait(?Send)]
 impl ChatProvider for SmokeProvider {
-    fn chat(
+    async fn chat(
         &mut self,
         request: ChatRequest,
         on_event: &mut dyn FnMut(ProviderEvent),
@@ -925,8 +939,8 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn run_task_should_execute_search_tool_and_finish() {
+    #[tokio::test]
+    async fn run_task_should_execute_search_tool_and_finish() {
         let root = temp_dir("search_loop");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "").unwrap();
@@ -942,13 +956,13 @@ mod tests {
             },
         );
 
-        let run = runtime.run_task(&root, "list files").unwrap();
+        let run = runtime.run_task(&root, "list files").await.unwrap();
 
         assert_eq!(run.outcome, Outcome::Succeeded);
     }
 
-    #[test]
-    fn run_task_should_write_error_tool_result_for_unknown_tool() {
+    #[tokio::test]
+    async fn run_task_should_write_error_tool_result_for_unknown_tool() {
         let root = temp_dir("unknown_tool");
         fs::create_dir_all(&root).unwrap();
         let mut runtime = AgentRuntime::new(
@@ -963,13 +977,13 @@ mod tests {
             },
         );
 
-        let run = runtime.run_task(&root, "use missing tool").unwrap();
+        let run = runtime.run_task(&root, "use missing tool").await.unwrap();
 
         assert_eq!(run.outcome, Outcome::Failed);
     }
 
-    #[test]
-    fn run_task_should_not_commit_partial_assistant_without_done() {
+    #[tokio::test]
+    async fn run_task_should_not_commit_partial_assistant_without_done() {
         let root = temp_dir("partial");
         fs::create_dir_all(&root).unwrap();
         let mut runtime = AgentRuntime::new(
@@ -984,13 +998,13 @@ mod tests {
             },
         );
 
-        let run = runtime.run_task(&root, "partial").unwrap();
+        let run = runtime.run_task(&root, "partial").await.unwrap();
 
         assert_eq!(run.outcome, Outcome::Cancelled);
     }
 
-    #[test]
-    fn run_task_should_stop_at_max_turns() {
+    #[tokio::test]
+    async fn run_task_should_stop_at_max_turns() {
         let root = temp_dir("max_turns");
         fs::create_dir_all(&root).unwrap();
         let mut runtime = AgentRuntime::new(
@@ -1005,13 +1019,13 @@ mod tests {
             },
         );
 
-        let run = runtime.run_task(&root, "loop").unwrap();
+        let run = runtime.run_task(&root, "loop").await.unwrap();
 
         assert_eq!(run.outcome, Outcome::Failed);
     }
 
-    #[test]
-    fn run_task_should_retry_retryable_provider_errors() {
+    #[tokio::test]
+    async fn run_task_should_retry_retryable_provider_errors() {
         let root = temp_dir("retry");
         fs::create_dir_all(&root).unwrap();
         let mut runtime = AgentRuntime::new(
@@ -1026,13 +1040,13 @@ mod tests {
             },
         );
 
-        let run = runtime.run_task(&root, "retry").unwrap();
+        let run = runtime.run_task(&root, "retry").await.unwrap();
 
         assert_eq!(run.outcome, Outcome::Succeeded);
     }
 
-    #[test]
-    fn run_task_should_write_large_tool_output_to_artifact() {
+    #[tokio::test]
+    async fn run_task_should_write_large_tool_output_to_artifact() {
         let root = temp_dir("artifact");
         fs::create_dir_all(&root).unwrap();
         let mut registry = ToolRegistry::new();
@@ -1049,7 +1063,7 @@ mod tests {
             },
         );
 
-        let run = runtime.run_task(&root, "large").unwrap();
+        let run = runtime.run_task(&root, "large").await.unwrap();
 
         let artifact = root
             .join(".flash")
@@ -1066,8 +1080,8 @@ mod tests {
         assert!(messages.contains("[full output: artifacts/call_large.stdout.txt]"));
     }
 
-    #[test]
-    fn run_task_should_write_error_result_when_tool_fails() {
+    #[tokio::test]
+    async fn run_task_should_write_error_result_when_tool_fails() {
         let root = temp_dir("tool_error");
         fs::create_dir_all(&root).unwrap();
         let mut registry = ToolRegistry::new();
@@ -1084,7 +1098,7 @@ mod tests {
             },
         );
 
-        let run = runtime.run_task(&root, "error").unwrap();
+        let run = runtime.run_task(&root, "error").await.unwrap();
 
         let messages = fs::read_to_string(
             root.join(".flash")
@@ -1096,8 +1110,8 @@ mod tests {
         assert!(messages.contains("\"status\":\"error\""));
     }
 
-    #[test]
-    fn run_task_should_write_rejected_result_when_policy_denies() {
+    #[tokio::test]
+    async fn run_task_should_write_rejected_result_when_policy_denies() {
         let root = temp_dir("tool_rejected");
         fs::create_dir_all(&root).unwrap();
         let mut registry = ToolRegistry::new();
@@ -1114,7 +1128,7 @@ mod tests {
             },
         );
 
-        let run = runtime.run_task(&root, "execute").unwrap();
+        let run = runtime.run_task(&root, "execute").await.unwrap();
 
         let messages = fs::read_to_string(
             root.join(".flash")
@@ -1126,8 +1140,8 @@ mod tests {
         assert!(messages.contains("\"status\":\"rejected\""));
     }
 
-    #[test]
-    fn run_task_with_controls_should_execute_approved_tool_call() {
+    #[tokio::test]
+    async fn run_task_with_controls_should_execute_approved_tool_call() {
         let root = temp_dir("tool_approved");
         fs::create_dir_all(&root).unwrap();
         let mut registry = ToolRegistry::new();
@@ -1148,6 +1162,7 @@ mod tests {
 
         let run = runtime
             .run_task_with_controls(&root, "execute", &mut observer, || false, &mut approval)
+            .await
             .unwrap();
 
         let events = fs::read_to_string(
@@ -1160,8 +1175,8 @@ mod tests {
         assert!(events.contains("\"approved\":true"));
     }
 
-    #[test]
-    fn run_task_should_require_approval_for_destructive_tool_even_in_yolo() {
+    #[tokio::test]
+    async fn run_task_should_require_approval_for_destructive_tool_even_in_yolo() {
         let root = temp_dir("destructive_yolo");
         fs::create_dir_all(&root).unwrap();
         let mut registry = ToolRegistry::new();
@@ -1178,7 +1193,7 @@ mod tests {
             },
         );
 
-        let run = runtime.run_task(&root, "destructive").unwrap();
+        let run = runtime.run_task(&root, "destructive").await.unwrap();
 
         let events = fs::read_to_string(
             root.join(".flash")
@@ -1190,8 +1205,8 @@ mod tests {
         assert!(events.contains("\"type\":\"approval_required\""));
     }
 
-    #[test]
-    fn run_task_should_write_cancelled_result_when_tool_cancels() {
+    #[tokio::test]
+    async fn run_task_should_write_cancelled_result_when_tool_cancels() {
         let root = temp_dir("tool_cancelled");
         fs::create_dir_all(&root).unwrap();
         let mut registry = ToolRegistry::new();
@@ -1208,7 +1223,7 @@ mod tests {
             },
         );
 
-        let run = runtime.run_task(&root, "cancel").unwrap();
+        let run = runtime.run_task(&root, "cancel").await.unwrap();
 
         let messages = fs::read_to_string(
             root.join(".flash")
@@ -1220,8 +1235,8 @@ mod tests {
         assert!(messages.contains("\"status\":\"cancelled\""));
     }
 
-    #[test]
-    fn run_task_with_observer_should_emit_live_events_after_storage_commit() {
+    #[tokio::test]
+    async fn run_task_with_observer_should_emit_live_events_after_storage_commit() {
         let root = temp_dir("observer");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "").unwrap();
@@ -1242,6 +1257,7 @@ mod tests {
             .run_task_with_observer(&root, "list files", |event: &Event| {
                 observed.push(event.event_type().to_string());
             })
+            .await
             .unwrap();
 
         let events = fs::read_to_string(
@@ -1254,8 +1270,8 @@ mod tests {
         assert!(events.contains(observed.first().unwrap()));
     }
 
-    #[test]
-    fn mock_provider_scenarios_should_cover_loop_outcomes() {
+    #[tokio::test]
+    async fn mock_provider_scenarios_should_cover_loop_outcomes() {
         let scenarios = [
             (
                 "success",
@@ -1273,6 +1289,7 @@ mod tests {
                     },
                 )
                 .run_task(&prepared_workspace("scenario_success"), "list files")
+                .await
                 .unwrap()
                 .outcome,
                 Outcome::Succeeded,
@@ -1296,6 +1313,7 @@ mod tests {
                     &prepared_workspace("scenario_unknown_tool"),
                     "use missing tool",
                 )
+                .await
                 .unwrap()
                 .outcome,
                 Outcome::Failed,
@@ -1320,6 +1338,7 @@ mod tests {
                         },
                     )
                     .run_task(&root, "error")
+                    .await
                     .unwrap()
                     .outcome
                 },
@@ -1341,6 +1360,7 @@ mod tests {
                     },
                 )
                 .run_task(&prepared_workspace("scenario_max_turns"), "loop")
+                .await
                 .unwrap()
                 .outcome,
                 Outcome::Failed,
@@ -1365,6 +1385,7 @@ mod tests {
                     let mut observer = NoopObserver;
                     runtime
                         .run_task_controlled(&root, "list files", &mut observer, || true)
+                        .await
                         .unwrap()
                         .outcome
                 },
@@ -1377,8 +1398,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rust_fixture_smoke_should_fix_failing_test_and_keep_diff() {
+    #[tokio::test]
+    async fn rust_fixture_smoke_should_fix_failing_test_and_keep_diff() {
         let root = temp_dir("fixture_fix");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(
@@ -1425,7 +1446,7 @@ mod tests {
             },
         );
 
-        let run = runtime.run_task(&root, "fix failing tests").unwrap();
+        let run = runtime.run_task(&root, "fix failing tests").await.unwrap();
 
         assert_eq!(run.outcome, Outcome::Succeeded);
         let test_output = std::process::Command::new("cargo")
@@ -1445,8 +1466,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_task_controlled_should_cancel_without_committing_assistant_message() {
+    #[tokio::test]
+    async fn run_task_controlled_should_cancel_without_committing_assistant_message() {
         let root = temp_dir("controlled_cancel");
         fs::create_dir_all(&root).unwrap();
         let mut runtime = AgentRuntime::new(
@@ -1464,6 +1485,7 @@ mod tests {
 
         let run = runtime
             .run_task_controlled(&root, "list files", &mut observer, || true)
+            .await
             .unwrap();
 
         let messages = fs::read_to_string(
@@ -1476,8 +1498,8 @@ mod tests {
         assert!(!messages.contains("\"role\":\"assistant\""));
     }
 
-    #[test]
-    fn project_history_should_keep_recent_messages_within_budget() {
+    #[tokio::test]
+    async fn project_history_should_keep_recent_messages_within_budget() {
         let old = test_message("old text");
         let recent = test_message("new");
 
@@ -1488,8 +1510,9 @@ mod tests {
 
     struct UnknownToolProvider;
 
+    #[async_trait(?Send)]
     impl ChatProvider for UnknownToolProvider {
-        fn chat(
+        async fn chat(
             &mut self,
             _request: ChatRequest,
             on_event: &mut dyn FnMut(ProviderEvent),
@@ -1506,8 +1529,9 @@ mod tests {
 
     struct PartialProvider;
 
+    #[async_trait(?Send)]
     impl ChatProvider for PartialProvider {
-        fn chat(
+        async fn chat(
             &mut self,
             _request: ChatRequest,
             on_event: &mut dyn FnMut(ProviderEvent),
@@ -1519,8 +1543,9 @@ mod tests {
 
     struct LoopProvider;
 
+    #[async_trait(?Send)]
     impl ChatProvider for LoopProvider {
-        fn chat(
+        async fn chat(
             &mut self,
             _request: ChatRequest,
             on_event: &mut dyn FnMut(ProviderEvent),
@@ -1539,8 +1564,9 @@ mod tests {
         calls: u32,
     }
 
+    #[async_trait(?Send)]
     impl ChatProvider for RetryProvider {
-        fn chat(
+        async fn chat(
             &mut self,
             _request: ChatRequest,
             on_event: &mut dyn FnMut(ProviderEvent),
@@ -1557,8 +1583,9 @@ mod tests {
 
     struct LargeToolProvider;
 
+    #[async_trait(?Send)]
     impl ChatProvider for LargeToolProvider {
-        fn chat(
+        async fn chat(
             &mut self,
             _request: ChatRequest,
             on_event: &mut dyn FnMut(ProviderEvent),
@@ -1575,8 +1602,9 @@ mod tests {
 
     struct ErrorToolProvider;
 
+    #[async_trait(?Send)]
     impl ChatProvider for ErrorToolProvider {
-        fn chat(
+        async fn chat(
             &mut self,
             _request: ChatRequest,
             on_event: &mut dyn FnMut(ProviderEvent),
@@ -1593,8 +1621,9 @@ mod tests {
 
     struct ExecuteToolProvider;
 
+    #[async_trait(?Send)]
     impl ChatProvider for ExecuteToolProvider {
-        fn chat(
+        async fn chat(
             &mut self,
             _request: ChatRequest,
             on_event: &mut dyn FnMut(ProviderEvent),
@@ -1611,8 +1640,9 @@ mod tests {
 
     struct CancelToolProvider;
 
+    #[async_trait(?Send)]
     impl ChatProvider for CancelToolProvider {
-        fn chat(
+        async fn chat(
             &mut self,
             _request: ChatRequest,
             on_event: &mut dyn FnMut(ProviderEvent),
@@ -1629,8 +1659,9 @@ mod tests {
 
     struct DestructiveToolProvider;
 
+    #[async_trait(?Send)]
     impl ChatProvider for DestructiveToolProvider {
-        fn chat(
+        async fn chat(
             &mut self,
             _request: ChatRequest,
             on_event: &mut dyn FnMut(ProviderEvent),

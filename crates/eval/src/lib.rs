@@ -266,15 +266,15 @@ pub fn swe_bench_verified_tasks() -> Result<Vec<SweBenchTask>, EvalError> {
     parse_swe_bench_verified_lock(include_str!("../fixtures/swe_bench_verified_smoke.lock"))
 }
 
-pub fn run_fixture_eval(root: &Path, task: EvalTask) -> Result<EvalResult, EvalError> {
+pub async fn run_fixture_eval(root: &Path, task: EvalTask) -> Result<EvalResult, EvalError> {
     let run = create_eval_run(root)?;
-    let result = run_task_in_eval_run(&run, &task)?;
+    let result = run_task_in_eval_run(&run, &task).await?;
     write_result_json(&run, &result)?;
     write_report_markdown(&run, &result)?;
     Ok(result)
 }
 
-pub fn run_terminal_bench_smoke(root: &Path) -> Result<TerminalBenchRun, EvalError> {
+pub async fn run_terminal_bench_smoke(root: &Path) -> Result<TerminalBenchRun, EvalError> {
     let run = create_eval_run(root)?;
     let lock_content = include_str!("../fixtures/terminal_bench_smoke.lock");
     fs::write(run.path.join("terminal_bench_smoke.lock"), lock_content)?;
@@ -286,7 +286,7 @@ pub fn run_terminal_bench_smoke(root: &Path) -> Result<TerminalBenchRun, EvalErr
             path: run.path.join("tasks").join(sanitize_id(&task.id)),
         };
         fs::create_dir_all(&task_run.path)?;
-        let result = run_task_in_eval_run(&task_run, &task)?;
+        let result = run_task_in_eval_run(&task_run, &task).await?;
         write_result_json(&task_run, &result)?;
         write_report_markdown(&task_run, &result)?;
         results.push(result);
@@ -303,7 +303,7 @@ pub fn run_terminal_bench_smoke(root: &Path) -> Result<TerminalBenchRun, EvalErr
     Ok(terminal_run)
 }
 
-pub fn run_swe_bench_verified(root: &Path, limit: usize) -> Result<SweBenchRun, EvalError> {
+pub async fn run_swe_bench_verified(root: &Path, limit: usize) -> Result<SweBenchRun, EvalError> {
     let run = create_eval_run(root)?;
     let lock_content = include_str!("../fixtures/swe_bench_verified_smoke.lock");
     fs::write(run.path.join("swe_bench_verified_smoke.lock"), lock_content)?;
@@ -316,7 +316,7 @@ pub fn run_swe_bench_verified(root: &Path, limit: usize) -> Result<SweBenchRun, 
             path: run.path.join("tasks").join(sanitize_id(&task.instance_id)),
         };
         fs::create_dir_all(&task_run.path)?;
-        let result = run_swe_bench_task(&task_run, &task)?;
+        let result = run_swe_bench_task(&task_run, &task).await?;
         write_swe_bench_task_result(&task_run, &result)?;
         results.push(result);
     }
@@ -333,19 +333,19 @@ pub fn run_swe_bench_verified(root: &Path, limit: usize) -> Result<SweBenchRun, 
     Ok(swe_run)
 }
 
-pub fn run_regression(root: &Path) -> Result<RegressionRun, EvalError> {
-    run_regression_with_swe_limit(root, 10)
+pub async fn run_regression(root: &Path) -> Result<RegressionRun, EvalError> {
+    run_regression_with_swe_limit(root, 10).await
 }
 
-fn run_regression_with_swe_limit(
+async fn run_regression_with_swe_limit(
     root: &Path,
     swe_limit: usize,
 ) -> Result<RegressionRun, EvalError> {
     let run = create_eval_run(root)?;
     let previous = latest_previous_regression(root, &run.path)?;
-    let fixture = run_fixture_eval(root, local_fixture_task("fix-rust")?)?;
-    let terminal = run_terminal_bench_smoke(root)?;
-    let swe = run_swe_bench_verified(root, swe_limit)?;
+    let fixture = run_fixture_eval(root, local_fixture_task("fix-rust")?).await?;
+    let terminal = run_terminal_bench_smoke(root).await?;
+    let swe = run_swe_bench_verified(root, swe_limit).await?;
     let benchmarks = vec![
         regression_from_fixture(&fixture),
         regression_from_terminal_bench(&terminal),
@@ -392,7 +392,7 @@ fn create_eval_run(root: &Path) -> Result<EvalRun, EvalError> {
     Ok(EvalRun { id, path })
 }
 
-fn run_task_in_eval_run(run: &EvalRun, task: &EvalTask) -> Result<EvalResult, EvalError> {
+async fn run_task_in_eval_run(run: &EvalRun, task: &EvalTask) -> Result<EvalResult, EvalError> {
     let started = Instant::now();
     let workspace_path = run.path.join("workspace");
     fs::create_dir_all(&workspace_path)?;
@@ -427,7 +427,7 @@ fn run_task_in_eval_run(run: &EvalRun, task: &EvalTask) -> Result<EvalResult, Ev
             max_prompt_bytes: 200_000,
         },
     );
-    let agent_run = match runtime.run_task(&workspace_path, &task.instruction) {
+    let agent_run = match runtime.run_task(&workspace_path, &task.instruction).await {
         Ok(run) => run,
         Err(error) => {
             return Ok(EvalResult {
@@ -616,7 +616,10 @@ fn parse_csv(value: &str) -> Vec<String> {
     value.split(',').map(str::to_string).collect()
 }
 
-fn run_swe_bench_task(run: &EvalRun, task: &SweBenchTask) -> Result<SweBenchResult, EvalError> {
+async fn run_swe_bench_task(
+    run: &EvalRun,
+    task: &SweBenchTask,
+) -> Result<SweBenchResult, EvalError> {
     let started = Instant::now();
     let workspace_path = run.path.join("workspace");
     if task.timeout_secs == 0 {
@@ -666,7 +669,7 @@ fn run_swe_bench_task(run: &EvalRun, task: &SweBenchTask) -> Result<SweBenchResu
             max_prompt_bytes: 200_000,
         },
     );
-    let agent_run = match runtime.run_task(&workspace_path, &issue_prompt) {
+    let agent_run = match runtime.run_task(&workspace_path, &issue_prompt).await {
         Ok(run) => run,
         Err(error) => {
             return Ok(SweBenchResult {
@@ -1859,12 +1862,14 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn run_fixture_eval_should_write_result_report_and_events() {
+    #[tokio::test]
+    async fn run_fixture_eval_should_write_result_report_and_events() {
         let root = temp_dir("fixture_eval");
         fs::create_dir_all(&root).unwrap();
 
-        let result = run_fixture_eval(&root, local_fixture_task("fix-rust").unwrap()).unwrap();
+        let result = run_fixture_eval(&root, local_fixture_task("fix-rust").unwrap())
+            .await
+            .unwrap();
 
         assert!(result.passed);
         assert!(result.events_path.as_ref().unwrap().exists());
@@ -1879,12 +1884,12 @@ mod tests {
         assert!(eval_dir.join("grader.stderr.txt").exists());
     }
 
-    #[test]
-    fn terminal_bench_smoke_should_write_summary_and_task_results() {
+    #[tokio::test]
+    async fn terminal_bench_smoke_should_write_summary_and_task_results() {
         let root = temp_dir("terminal_bench_smoke");
         fs::create_dir_all(&root).unwrap();
 
-        let run = run_terminal_bench_smoke(&root).unwrap();
+        let run = run_terminal_bench_smoke(&root).await.unwrap();
 
         assert_eq!(run.subset, "smoke");
         assert_eq!(run.results.len(), 1);
@@ -1912,12 +1917,12 @@ mod tests {
         assert_eq!(tasks[0].fail_to_pass, vec!["answer_should_be_42"]);
     }
 
-    #[test]
-    fn run_swe_bench_verified_should_write_patch_events_and_grader_logs() {
+    #[tokio::test]
+    async fn run_swe_bench_verified_should_write_patch_events_and_grader_logs() {
         let root = temp_dir("swe_bench_verified");
         fs::create_dir_all(&root).unwrap();
 
-        let run = run_swe_bench_verified(&root, 1).unwrap();
+        let run = run_swe_bench_verified(&root, 1).await.unwrap();
 
         assert_eq!(run.subset, "verified");
         assert_eq!(run.results.len(), 1);
@@ -1936,12 +1941,12 @@ mod tests {
         assert!(fs::read_to_string(patch_path).unwrap().contains("+    42"));
     }
 
-    #[test]
-    fn run_swe_bench_verified_should_run_fixed_10_task_subset() {
+    #[tokio::test]
+    async fn run_swe_bench_verified_should_run_fixed_10_task_subset() {
         let root = temp_dir("swe_bench_verified_10");
         fs::create_dir_all(&root).unwrap();
 
-        let run = run_swe_bench_verified(&root, 10).unwrap();
+        let run = run_swe_bench_verified(&root, 10).await.unwrap();
         let summary = run.summary();
 
         assert_eq!(run.results.len(), 10);
@@ -1955,12 +1960,12 @@ mod tests {
             .all(|result| result.patch_path.as_ref().is_some_and(|path| path.exists())));
     }
 
-    #[test]
-    fn run_regression_should_write_report_trend_and_replay_links() {
+    #[tokio::test]
+    async fn run_regression_should_write_report_trend_and_replay_links() {
         let root = temp_dir("regression");
         fs::create_dir_all(&root).unwrap();
 
-        let run = run_regression_with_swe_limit(&root, 1).unwrap();
+        let run = run_regression_with_swe_limit(&root, 1).await.unwrap();
 
         assert_eq!(run.total, 3);
         assert_eq!(run.passed, 3);
@@ -1977,13 +1982,13 @@ mod tests {
             .contains("\"kind\":\"regression\""));
     }
 
-    #[test]
-    fn run_regression_should_compare_against_previous_result() {
+    #[tokio::test]
+    async fn run_regression_should_compare_against_previous_result() {
         let root = temp_dir("regression_previous");
         fs::create_dir_all(&root).unwrap();
 
-        let first = run_regression_with_swe_limit(&root, 1).unwrap();
-        let second = run_regression_with_swe_limit(&root, 1).unwrap();
+        let first = run_regression_with_swe_limit(&root, 1).await.unwrap();
+        let second = run_regression_with_swe_limit(&root, 1).await.unwrap();
 
         assert_eq!(second.previous_pass_rate_bps, Some(first.pass_rate_bps));
         assert!(second.new_failures.is_empty());
@@ -2018,8 +2023,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn swe_bench_task_should_record_timeout_before_execution() {
+    #[tokio::test]
+    async fn swe_bench_task_should_record_timeout_before_execution() {
         let root = temp_dir("swe_bench_timeout");
         let run = EvalRun {
             id: "timeout".to_string(),
@@ -2029,7 +2034,7 @@ mod tests {
         let mut task = swe_bench_verified_tasks().unwrap().remove(0);
         task.timeout_secs = 0;
 
-        let result = run_swe_bench_task(&run, &task).unwrap();
+        let result = run_swe_bench_task(&run, &task).await.unwrap();
 
         assert!(!result.resolved);
         assert_eq!(result.failure_kind, Some(SweBenchFailureKind::Timeout));
