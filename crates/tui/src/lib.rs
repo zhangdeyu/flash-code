@@ -11,6 +11,12 @@ use crossterm::terminal::{
 };
 use flash_core::storage::load_session;
 use flash_core::{discover_workspace_root, init_workspace, Event};
+use ratatui::backend::{CrosstermBackend, TestBackend};
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::{Frame, Terminal};
 
 const DEFAULT_WIDTH: usize = 100;
 const DEFAULT_HEIGHT: usize = 32;
@@ -90,9 +96,9 @@ fn should_render_once() -> bool {
 }
 
 fn render_frame(stdout: &mut impl Write, state: &AppState) -> Result<(), TuiError> {
-    write!(stdout, "\x1b[2J\x1b[H")?;
-    stdout.write_all(render_to_string(state, DEFAULT_WIDTH, DEFAULT_HEIGHT).as_bytes())?;
-    stdout.flush()?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.draw(|frame| render_app(frame, state))?;
     Ok(())
 }
 
@@ -470,89 +476,12 @@ enum TranscriptKind {
 }
 
 pub fn render_to_string(state: &AppState, width: usize, height: usize) -> String {
-    let width = width.max(40);
-    let height = height.max(12);
-    let content_width = width.saturating_sub(4);
-    let mut lines = Vec::new();
-
-    lines.push(horizontal(width));
-    lines.push(row(width, "Flash Code"));
-    lines.push(row(
-        width,
-        &format!("Workspace: {}", state.workspace_root.display()),
-    ));
-    lines.push(row(
-        width,
-        &format!(
-            "Status: {}{}",
-            state.status.as_str(),
-            state
-                .current_session_id
-                .as_ref()
-                .map(|session_id| format!("  Session: {session_id}"))
-                .unwrap_or_default()
-        ),
-    ));
-    lines.push(row(
-        width,
-        &format!("Permission: {}", state.permission_mode),
-    ));
-    if let Some(prompt) = &state.pending_approval {
-        lines.push(row(
-            width,
-            &format!(
-                "Approval: {} {} risk={}  y approve / n reject",
-                prompt.name, prompt.call_id, prompt.risk
-            ),
-        ));
-    }
-    lines.push(horizontal(width));
-    lines.push(row(width, "Sessions"));
-
-    if state.sessions.is_empty() {
-        lines.push(row(width, "  No sessions in this workspace yet."));
-    } else {
-        for session in state.sessions.iter().take(5) {
-            lines.push(row(
-                width,
-                &format!(
-                    "  {}  {}  {}",
-                    session.session_id, session.status, session.updated_at
-                ),
-            ));
-        }
-    }
-
-    lines.push(horizontal(width));
-    lines.push(row(width, "Transcript"));
-
-    if state.transcript.is_empty() {
-        lines.push(row(width, "  No events to display."));
-    } else {
-        for entry in state
-            .transcript
-            .iter()
-            .flat_map(|entry| render_entry(entry, content_width))
-        {
-            lines.push(row(width, &entry));
-            if lines.len() + 1 >= height {
-                break;
-            }
-        }
-    }
-
-    lines.push(horizontal(width));
-    lines.push(row(width, &format!("Input: {}", state.input)));
-    lines.push(row(
-        width,
-        "Enter submits, q quits, Esc/Ctrl-C cancels before submit.",
-    ));
-
-    while lines.len() + 1 < height {
-        lines.push(row(width, ""));
-    }
-    lines.push(horizontal(width));
-    lines.join("\n") + "\n"
+    let backend = TestBackend::new(width.max(1) as u16, height.max(1) as u16);
+    let mut terminal = Terminal::new(backend).expect("test backend should initialize");
+    terminal
+        .draw(|frame| render_app(frame, state))
+        .expect("test backend should render");
+    buffer_to_string(terminal.backend())
 }
 
 fn render_entry(entry: &TranscriptLine, width: usize) -> Vec<String> {
@@ -567,16 +496,6 @@ fn render_entry(entry: &TranscriptLine, width: usize) -> Vec<String> {
         TranscriptKind::Session => "session",
     };
     wrap(&format!("{label}: {}", entry.text), width)
-}
-
-fn horizontal(width: usize) -> String {
-    format!("+{}+", "-".repeat(width.saturating_sub(2)))
-}
-
-fn row(width: usize, text: &str) -> String {
-    let content_width = width.saturating_sub(4);
-    let clipped = clip(text, content_width);
-    format!("| {clipped:<content_width$} |")
 }
 
 fn wrap(text: &str, width: usize) -> Vec<String> {
@@ -624,18 +543,110 @@ fn split_long_line(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn clip(text: &str, width: usize) -> String {
-    text.chars()
-        .scan(0, |used, ch| {
-            let len = ch.len_utf8();
-            if *used + len > width {
-                None
+fn render_app(frame: &mut Frame<'_>, state: &AppState) {
+    let area = frame.area();
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(3),
+            Constraint::Length(if state.pending_approval.is_some() {
+                3
             } else {
-                *used += len;
-                Some(ch)
-            }
-        })
-        .collect()
+                0
+            }),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    let session = state
+        .current_session_id
+        .as_ref()
+        .map(|session_id| format!(" session={session_id}"))
+        .unwrap_or_default();
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(
+                "Flash Code",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("  status={}{}", state.status.as_str(), session)),
+        ]),
+        Line::from(format!("workspace: {}", state.workspace_root.display())),
+        Line::from(format!("permission: {}", state.permission_mode)),
+    ])
+    .block(Block::default().borders(Borders::ALL).title("Status"));
+    frame.render_widget(header, vertical[0]);
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
+        .split(vertical[1]);
+    let sessions = if state.sessions.is_empty() {
+        vec![ListItem::new("No sessions in this workspace yet.")]
+    } else {
+        state
+            .sessions
+            .iter()
+            .take(8)
+            .map(|session| {
+                ListItem::new(format!(
+                    "{}  {}  {}",
+                    session.session_id, session.status, session.updated_at
+                ))
+            })
+            .collect()
+    };
+    frame.render_widget(
+        List::new(sessions).block(Block::default().borders(Borders::ALL).title("Sessions")),
+        body[0],
+    );
+
+    let transcript = if state.transcript.is_empty() {
+        vec![Line::from("No events to display.")]
+    } else {
+        state
+            .transcript
+            .iter()
+            .flat_map(|entry| render_entry(entry, body[1].width.saturating_sub(2) as usize))
+            .map(Line::from)
+            .collect()
+    };
+    frame.render_widget(
+        Paragraph::new(transcript)
+            .block(Block::default().borders(Borders::ALL).title("Transcript"))
+            .wrap(Wrap { trim: false }),
+        body[1],
+    );
+
+    if let Some(prompt) = &state.pending_approval {
+        let approval = Paragraph::new(format!(
+            "{} {} risk={}  y approve / n reject",
+            prompt.name, prompt.call_id, prompt.risk
+        ))
+        .block(Block::default().borders(Borders::ALL).title("Approval"));
+        frame.render_widget(approval, vertical[2]);
+    }
+
+    let input = Paragraph::new(format!("{}_", state.input))
+        .block(Block::default().borders(Borders::ALL).title("Input"))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(input, vertical[3]);
+}
+
+fn buffer_to_string(backend: &TestBackend) -> String {
+    let buffer = backend.buffer();
+    let area = buffer.area;
+    let mut output = String::new();
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            output.push_str(buffer[(x, y)].symbol());
+        }
+        output.push('\n');
+    }
+    output
 }
 
 fn load_sessions(workspace_root: &Path) -> Result<Vec<SessionSummary>, TuiError> {
@@ -948,7 +959,8 @@ mod tests {
 
         let output = render_to_string(&state, 60, 12);
 
-        assert!(output.contains("No sessions in this workspace yet."));
+        assert!(output.contains("No sessions"));
+        assert!(output.contains("No events"));
     }
 
     #[test]
@@ -1085,7 +1097,7 @@ mod tests {
 
         let output = render_to_string(&state, 44, 14);
 
-        assert!(output.lines().all(|line| line.len() <= 44));
+        assert!(output.lines().all(|line| line.chars().count() <= 44));
     }
 
     #[test]

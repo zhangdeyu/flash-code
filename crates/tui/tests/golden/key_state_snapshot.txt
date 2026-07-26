@@ -1,22 +1,22 @@
-+----------------------------------------------------------------------+
-| Flash Code                                                           |
-| Workspace: /tmp/project                                              |
-| Status: running  Session: session_snapshot                           |
-| Permission: confirm                                                  |
-| Approval: Edit call_2 risk=Write  y approve / n reject               |
-+----------------------------------------------------------------------+
-| Sessions                                                             |
-|   No sessions in this workspace yet.                                 |
-+----------------------------------------------------------------------+
-| Transcript                                                           |
-| assistant: streaming answer                                          |
-| reasoning: inspect workspace                                         |
-| tool: requested Bash call_1                                          |
-| tool: stdout: test ok                                                |
-| approval: call_1 approved=true                                       |
-| error: sample error                                                  |
-+----------------------------------------------------------------------+
-| Input:                                                               |
-| Enter submits, q quits, Esc/Ctrl-C cancels before submit.            |
-|                                                                      |
-+----------------------------------------------------------------------+
+┌Status────────────────────────────────────────────────────────────────┐
+│Flash Code  status=running session=session_snapshot                   │
+│workspace: /tmp/project                                               │
+│permission: confirm                                                   │
+└──────────────────────────────────────────────────────────────────────┘
+┌Sessions──────────────┐┌Transcript────────────────────────────────────┐
+│No sessions in this wo││assistant: streaming answer                   │
+│                      ││reasoning: inspect workspace                  │
+│                      ││tool: requested Bash call_1                   │
+│                      ││tool: stdout: test ok                         │
+│                      ││approval: call_1 approved=true                │
+│                      ││error: sample error                           │
+│                      ││                                              │
+│                      ││                                              │
+│                      ││                                              │
+└──────────────────────┘└──────────────────────────────────────────────┘
+┌Approval──────────────────────────────────────────────────────────────┐
+│Edit call_2 risk=Write  y approve / n reject                          │
+└──────────────────────────────────────────────────────────────────────┘
+┌Input─────────────────────────────────────────────────────────────────┐
+│_                                                                     │
+└──────────────────────────────────────────────────────────────────────┘
