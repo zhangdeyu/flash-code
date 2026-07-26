@@ -273,6 +273,7 @@ pub struct RunHandle {
 任务：
 
 - `AgentService::start` 返回 `RunHandle`，运行过程不借用 UI/CLI callback。
+- 分发策略：主路径继续使用 `AgentRuntime<P>` 静态分发；`RunHandle` 保持非泛型，泛型 `P` 被捕获在 spawned future 中、返回的 `JoinHandle` 已擦除具体 Provider 类型。当前 `ChatProvider::chat(&mut self, ...)` 配合 `#[async_trait(?Send)]` 使 future 非 `Send`，无法直接交给多线程 `tokio::spawn`，必须先将 Provider future 改为 `Send`。`start` 消费一个 run-owned runtime/provider，或通过 `ProviderFactory` 为每次 run 创建实例。只有运行时确需异构 Provider registry 时，才在 factory 边界使用 `Arc<dyn ChatProvider>`；不让 `dyn ChatProvider` 扩散进 Agent 热路径。
 - 审批改为异步 command/response，并支持 cancel 与 timeout。
 - 在行为契约测试通过后，用与 Codex 一致的 `tokio-util::sync::CancellationToken` 替换自研取消 token，统一 parent/child cancellation。
 - 现有 headless `run_task` 保留为薄封装，内部消费同一个 `RunHandle`。
@@ -305,6 +306,8 @@ Canonical AgentMessage / completed ModelOutputItem
   ↓ runtime projection
 RuntimeEvent<ItemStarted / ItemDelta / ItemCompleted>
 ```
+
+四层分阶段建设，不一次建到完整 item lifecycle：第一阶段 Provider wire 保持私有；第二阶段只实现 DeepSeek 所需的最小 `ModelStreamEvent`；第三阶段落地 role-specific canonical message；第四阶段的完整 item 交错、content index、raw/summary reasoning 区分等扩展，等第二 Provider（A6.2）证明需要再补。当前设计已预留这些位置，但 M1 不强制一次实现。
 
 #### 第一层：Provider wire 类型保持私有
 
@@ -510,6 +513,218 @@ ResponseStarted?
 - 序列化 snapshot 固定 tag、必填字段和兼容默认值；协议演进新增字段优先 optional/default，破坏性变更必须提升 schema version。
 - property/state-machine tests 覆盖乱序、重复、截断、超大 delta、UTF-8 分片、慢 consumer 和取消竞态。
 
+### A0.5 分层、短小、能力感知的 System Prompt
+
+当前 `prompts/system_default.md` 已经覆盖身份、Tool 使用、输出风格和安全提醒，Runtime 再追加 OS、shell、cwd 与 Tool 名称。它比空白 prompt 好，但仍有四个结构性问题：
+
+- 所有长期行为规则集中在一个静态 Markdown，Tool 实际增删后只有名称变化，没有同步选择指南；
+- 固定 Safety 文案与真正的 `PermissionPolicy/SandboxPlan` 分离，未来不同权限模式下容易出现“prompt 说不能、Runtime 实际允许”或相反；
+- system message 只在新 session 创建时写入，continuation、工具变化、cwd/world state 变化后可能继承陈旧快照；
+- 缺少 project instructions、来源/优先级、prompt version、size budget 和 deterministic snapshot，无法解释某次模型实际收到了什么。
+
+从 Codex 与 Pi 中分别学习：
+
+| 参考 | 应学习 | 不应照搬 |
+|---|---|---|
+| Codex | base instructions、permissions、AGENTS、skills、world state 分层；动态片段带来源；静态前缀稳定 | 当前面向多产品、多模式、多 Agent 的超长完整行为手册 |
+| Pi | 默认 prompt 短小；只列实际启用 Tool；Tool 自带 snippet/guideline；context files 清晰分隔 | 把所有 project context 和 extension rewrite 都拼成一个无法区分信任边界的大字符串 |
+
+#### Prompt 不是安全边界
+
+- System Prompt 只解释 Runtime 已经决定的能力，不能授予权限。
+- `PermissionPolicy/PermissionProfile/ProjectTrust/SandboxCapability` 的真实值由 Runtime 生成，不能由模板、仓库文件或模型文本声明。
+- Prompt 中即使出现“允许执行”，PolicyEngine 仍可 Deny；Prompt 中的安全提醒也不能替代 PathGuard、approval、sandbox 和 secret redaction。
+- `AskUserQuestion` 不负责权限审批；prompt 必须明确两者不同，但真正隔离由协议保证。
+
+#### 首版只保留五类片段
+
+```text
+1. BaseAgentContract       固定、短小、版本化
+2. ActiveToolGuidance      根据本轮实际 Tool catalog 生成
+3. RuntimePolicyContext    根据真实权限/沙箱能力生成
+4. ProjectInstructions     按目录作用域加载；M4 后叠加 ProjectTrust gate
+5. TurnWorldState          cwd/os/shell/git/task/context budget 等动态事实
+```
+
+不为每个未来功能预建 fragment 类型。Skills、MCP、multi-agent 等能力上线时再贡献自己的有界片段，并复用同一个 `PromptFragment` 接口。
+
+#### 所有权与分阶段交付
+
+A0.5 只拥有 **prompt 组装机制**：fragment 数据结构、稳定顺序、版本、digest、预算接口、Provider role 投影和 snapshot。它不拥有各片段背后的发现或决策语义：
+
+- A1.3 生产 `ProjectInstructions` 和可随 producer 扩展的 `TurnWorldState`，定义 `AGENTS.md` 作用域、来源、冲突、刷新与裁剪策略；
+- A2.x 的 `ToolRegistry/ToolSpec` 生产 `ActiveToolGuidance` 输入；
+- A2.4/A3.x 的 canonical sandbox/policy/trust 类型生产 `RuntimePolicyContext` 输入；
+- A7 的 durable `TaskState` 落地后，A1.3 才把任务摘要加入 `TurnWorldState`；
+- A6 只在 Provider contract fixture 证明需要时生产 model-specific overlay。
+
+未就绪的 producer 不创建空 fragment、占位文案或未来类型的 stub，而是从 `PreparedPrompt.fragments` 中省略；这既避免模型把占位内容当成事实，也使 M1 不依赖 M3/M4/A7 的类型。
+
+按里程碑交付：
+
+| 阶段 | A0.5 可验收范围 | 后续接入 |
+|---|---|---|
+| M1 | fragment framework、`BaseAgentContract`、基于现有 `ToolRegistry` 的最小 `ActiveToolGuidance`、OS/shell/cwd 最小 WorldState、稳定排序/version/digest/snapshot | 不要求 `PermissionProfile/ProjectTrust/SandboxCapability/TaskState` 存在 |
+| M2 | A1.3 接入有作用域的 `ProjectInstructions` 与 git/context 等当前可得的扩展 WorldState；A1.1 提供 fragment budget/cropping policy | 组装器本身不复制发现和裁剪逻辑 |
+| M3 | A2.x 的正式 `ToolSpec.prompt_snippet` 和 sandbox capability producer 接入 | 只有实际注册且模型可见的 Tool 进入 guidance |
+| M4 | A3.x 的 `ApprovalPolicy/PermissionProfile/ProjectTrust` 与 sandbox capability 共同生成 `RuntimePolicyContext` | 权限模式变化验收从此阶段开始 |
+| A7/M7 | durable `TaskState` 摘要按需进入 WorldState | 不改变已有 fragment 协议 |
+
+建议接口：
+
+```rust
+pub enum PromptFragmentKind {
+    Base,
+    ToolGuidance,
+    RuntimePolicy,
+    ProjectInstructions,
+    WorldState,
+}
+
+pub struct PromptFragment {
+    pub kind: PromptFragmentKind,
+    pub source: String,
+    pub priority: u16,
+    pub content: String,
+    pub digest: String,
+}
+
+pub struct PreparedPrompt {
+    pub version: String,
+    pub fragments: Vec<PromptFragment>,
+    pub estimated_tokens: u64,
+}
+```
+
+这里不需要复杂 type-state 或插件框架；固定 enum、稳定排序、严格 size limit 已足够。`PreparedPrompt` 是诊断/测试结构，Provider adapter 再把片段投影为其支持的 system/developer/user roles。
+
+#### 固定 BaseAgentContract
+
+基础 prompt 只表达跨模型、跨权限模式都成立的行为，建议控制在约 250-500 英文 token：
+
+```text
+You are Flash Code, a coding agent working in the user's repository.
+
+Work until the requested task is resolved or a real blocker requires user input.
+Inspect relevant files before making assumptions. Make focused changes and avoid
+unrelated refactors. Use the available tools instead of inventing results.
+
+After changing code, run the smallest relevant verification supported by the
+repository. Never claim that a command, test, or edit succeeded unless its result
+was observed. Preserve user changes and do not expose secrets.
+
+Ask a focused question only when missing information would materially change the
+result or when the runtime requires the user's decision.
+
+In the final response, lead with the outcome, mention verification performed, and
+state any remaining limitation or unverified assumption.
+```
+
+固定层不应包含：
+
+- 当前 Tool 名称、参数或不存在的能力；
+- OS、cwd、git branch、时间和 token budget；
+- 某个权限 preset 的行为；
+- Codex/Pi 自身文档路径；
+- 未来 daemon、多 Agent、MCP、skills 的操作说明；
+- 与 DeepSeek/OpenAI 某个模型 quirks 绑定的规则。
+
+#### ActiveToolGuidance
+
+Tool schema 是参数真相源，System Prompt 不重复完整 schema，只提供一行职责和必要的跨 Tool 选择规则。内容必须从**当前实际注册且模型可见**的 Tool descriptor 生成：
+
+```text
+Available tools:
+- Read: inspect file contents.
+- Glob: find files by path pattern.
+- Grep: search text or regular expressions in project files.
+- Edit: replace one unique segment in one existing file.
+- Write: create a file or intentionally replace its entire contents.
+- Bash: run a command and return its bounded output.
+
+Tool selection:
+- Use Glob for paths, Grep for contents, and Read for exact context.
+- Prefer Edit for a focused existing-file change; use Write for new files or a
+  deliberate complete rewrite.
+- Use Bash for builds, tests, version control inspection, and operations not
+  covered by a safer native tool.
+```
+
+`Agent/AskUserQuestion/TaskCreate/TaskUpdate/TaskList` 只有实际启用时才加入；Tool 未注册时不得在 prompt 中提到。M1 可用现有 Tool 描述生成最小 guidance；M3 接入正式 `ToolSpec.prompt_snippet`。跨 Tool guideline 仍由 core 维护并做 snapshot，避免扩展任意改写基础行为。
+
+#### RuntimePolicyContext
+
+学习 Codex 根据当前模式生成 permissions instructions，但 Flash Code 首版只呈现事实：
+
+```text
+Runtime policy:
+- Approval policy: on-request.
+- Permission profile: workspace-write.
+- Filesystem writes are limited to: <workspace>.
+- Network access: unavailable.
+- Commands requiring unavailable capabilities will be denied.
+```
+
+要求：
+
+- 该片段由 A3.x 的 canonical policy/trust 类型和 A2.4 的 sandbox capability 共同生产；M4 前不作为 A0.5 的完成前置；
+- 只从 canonical policy/sandbox capability 渲染；
+- 不把审批规则全文、命令 allowlist 或安全实现细节放进 prompt；
+- capability 不可兑现时明确 unavailable，不能用模糊措辞诱导模型反复尝试；
+- `FullAccess` 只说明实际能力，不鼓励扩大任务范围。
+
+#### ProjectInstructions
+
+A0.5 只负责渲染 A1.3 已发现、排序、限额并标注来源的 typed inputs，不重复定义目录发现、信任、冲突或刷新规则。M1 没有该 producer 时省略本片段；A1.3 是这组内容策略的唯一所有者。
+
+#### TurnWorldState
+
+A0.5 只负责稳定渲染调用方提供的 typed facts。M1 仅注入现有 Runtime 可直接证明的 workspace/cwd、OS 和 shell；git、context/compaction、sandbox capability 与 TaskState 等内容由 A1.3 在相应 producer 上线后加入。内容选择、刷新和脱敏策略也只在 A1.3 定义。
+
+#### Prompt 顺序、缓存与 compaction
+
+稳定顺序：
+
+```text
+BaseAgentContract
+→ ActiveToolGuidance
+→ RuntimePolicyContext
+→ ProjectInstructions（浅到深）
+→ TurnWorldState
+→ UserMessage
+```
+
+- Base 和未变化的 Tool/Policy/Project 片段保持 byte-identical，保护 prompt cache。
+- 每个 fragment 有独立 token/byte budget；`ProjectInstructions/WorldState` 的优先级与裁剪算法由 A1.1 `ContextBudget` 和 A1.3 内容策略共同定义，A0.5 只执行确定性的预算结果。Base 与 RuntimePolicy 不裁剪。
+- Compaction 只总结 conversation history，不总结或改写 Base、Policy、当前 ProjectInstructions 和当前 WorldState；压缩后重新注入 canonical fragments。
+- Session 记录 prompt version、fragment source/digest 和 model profile，不默认记录可能含敏感内容的完整动态正文。
+
+#### Model-specific overlay
+
+首版以 DeepSeek 行为为准，但不复制一份 DeepSeek 专用大 prompt。只有 contract fixture 证明必要时才增加小型、版本化 overlay，例如 tool-call 参数稳定性或 reasoning channel 规则；第二 Provider 上线后验证这些规则应该留在共享 base、Provider adapter 还是 model profile。
+
+#### 验收与评测
+
+机制不变量：
+
+- 相同 fragment 输入生成 byte-identical fragment content 和 digest；整份 prompt 只有在完整 fragment 集合及顺序都相同时才要求 byte-identical。
+- 未注册 Tool、未加载 project source 不出现在 prompt；capability 只能来自 canonical producer，可明确呈现 unavailable，但不能编造未授予能力。
+- M1 snapshot 只验收 Base、现有 Tool guidance、最小 WorldState、顺序/version/digest；缺少 producer 的 fragment 必须不存在而非空占位。
+- M2 增加 project instruction 作用域、优先级、长度、delimiter、冲突和 WorldState 刷新 snapshot。
+- M4 增加“权限模式变化生成新 policy fragment，旧 session record 不被篡改”的验收。
+- compaction 后只重新注入当时存在的 canonical Base/Tool/Policy/Project/WorldState，并保持顺序正确。
+
+真实任务指标：
+
+- Tool 选择错误率和不存在 Tool 调用率；
+- 不必要 `AskUserQuestion` 次数；
+- 未验证成功声明率；
+- 无关文件修改率；
+- prompt token 占比；
+- 有/无 Tool guidance、ProjectInstructions、model overlay 的消融对比。
+
+只有 eval 证明新增 prompt 规则改善指标，才进入 BaseAgentContract；临时模型 workaround 优先放 model overlay，并带删除条件。
+
 ## 5. P0：Context 与长任务能力
 
 ### A1.1 建立 ContextManager
@@ -519,7 +734,7 @@ ResponseStarted?
 任务：
 
 - 定义 `ContextBudget`：模型 context window、reserved output、tool schema、system prompt、history 分别计费。
-- Provider 暴露 token estimator；缺失时使用保守 fallback，不再只依赖 bytes。
+- Provider 暴露 token estimator；缺失时使用保守 fallback，不再只依赖 bytes。DeepSeek 可加载官方 `tokenizer.json`（Hugging Face Rust `tokenizers`），但完整请求 token 还涉及 chat template、Tool schema 和 Provider framing，离线估算只能作为投影。流程为：projected provider request -> provider-specific estimator -> conservative safety margin -> 实际 `prompt_tokens` 回填 -> 按 model/profile/version 校准误差分布。必须启用 `stream_options.include_usage=true` 才能稳定获得 streaming usage 用于回填（当前 `DeepSeekChatRequest` 未设置该字段，是待修缺口）；不能用 `cl100k` 冒充 DeepSeek 精确计数，引入 tokenizer 后仍须用包含 Tool schema 的真实 API usage 验证误差。
 - 将 context 组装拆为：system instructions、workspace state、durable memory、recent turns、pending tool turn。
 - 每次请求产生 `ContextPrepared` 诊断数据：预算、保留/移除 turn、估算 token，不必将完整敏感内容写入事件。
 
@@ -537,29 +752,49 @@ ResponseStarted?
 - 保存并累计 read/modified file 集合，避免多次 compaction 后丢失关键文件足迹。
 - compaction 后按模式重新注入 canonical instructions 与 World State；pre-turn 和 mid-turn 的插入位置必须有 snapshot test。
 - 尽量保留稳定 prompt prefix；上下文项顺序或内容没有变化时不得每轮重写，以保护 Provider prompt cache。
+- “禁止编造成功”不全部交给摘要模型：工具执行状态、验证结果和文件变更从 durable event 生成结构化 facts，compactor 只压缩叙述，不能改写这些事实。
 
-验收：
+验收分两类，不得混在同一断言集中：
+
+机制不变量（可断言保证）：
 
 - 小 context fixture 能连续运行超过原 projection 极限。
-- ToolTurn 永不被拆开。
+- ToolTurn 永不被拆开，不产生孤立 ToolResult。
 - 单个超长 turn 能安全压缩或明确失败，不会永久卡在 overflow/retry。
-- compaction 后继续任务仍能正确引用早期约束和关键文件。
 - compaction 失败、超时和无效输出不会污染 messages。
+- compaction 记录可恢复；最多一次 overflow recovery。
+- canonical instructions 重新注入位置正确，pre-turn 与 mid-turn 有 snapshot test。
+
+语义保真（只能通过真实任务 eval 衡量，且为概率指标）：
+
+- 关键约束保留率。
+- 关键文件/决策召回率。
+- unsupported success claim rate（编造成功状态的比例）。
+- compaction 前后任务成功率差值。
+- 多次运行的均值、方差和置信区间。
 
 ### A1.3 分层指令与 World State
 
+A1.3 是 `ProjectInstructions` 与 `TurnWorldState` 的内容生产者；A0.5 只负责接收 typed inputs 并确定性渲染，不在两处重复维护发现和内容规则。
+
 任务：
 
-- 实现 user → workspace → directory 的指令发现与优先级，支持 `AGENTS.md` 类文件。
-- 注入当前 workspace、git branch/dirty state、平台/sandbox 能力等结构化 world state。
-- 只在状态变化时刷新，避免每轮重复扩大 prompt。
-- 明确指令来源和冲突规则；不将不可信仓库内容升级为系统权限。
+- 实现 user → workspace root → 当前工作目录的指令发现与优先级，支持 `AGENTS.md` 类文件；更深目录只覆盖其目录树内更浅层的规则。
+- 普通 workspace `AGENTS.md` 只能作为有来源、受限额的低优先级工程上下文，不能替换 `BaseAgentContract/RuntimePolicyContext` 或授予能力。M4 的 `ProjectTrust` 额外门控 workspace-local prompt override、Hook、Skill、MCP 等可执行/扩展资源。
+- 每段 project instruction 使用明确 delimiter 和绝对或工作区相对 source path；正文中的 “system/developer” 字样不改变真实优先级。用户当前请求更高，冲突时记录诊断并遵循更高优先级来源。
+- 拒绝 workspace 外符号链接和超出作用域的 instruction source。
+- 注入只影响本轮决策的 typed world state：workspace/cwd、OS、shell、git branch/dirty summary、context/compaction 状态；sandbox capability 和 durable `TaskState` 只在各自 producer 上线后加入。
+- Tool catalog 不在 WorldState 重复；时间、完整环境变量、无界 git diff、完整 task history 和 secret 永不注入。
+- 只在 source/digest 或 typed state 变化时产生新 snapshot，不能重写已提交的旧 system message。
+- `ProjectInstructions/WorldState` 的 token/byte 配额、优先级和确定性裁剪由 A1.1 `ContextBudget` 提供；本节定义内容保留优先级和合法截断边界。具体算法在 A1.1 实现时用 fixture 决定，不在 A0.5 临时选择 LRU、recency 或任意字符串截断。
 
 验收：
 
 - 嵌套目录任务拿到正确作用域指令。
 - 指令冲突和 workspace 外符号链接有回归测试。
-- prompt snapshot 能解释每段上下文的来源。
+- 相同发现结果和 world-state 输入生成相同 source/digest；没有变化时不重复刷新。
+- 超预算裁剪保留来源边界、不截断为伪造指令，并能解释每段保留/移除原因。
+- prompt snapshot 能解释每段上下文的来源；M4 后额外覆盖 ProjectTrust 与 capability 变化。
 
 ## 6. P1：Tool 执行系统
 
@@ -610,6 +845,14 @@ Provider ToolCall
 `ToolRegistration` 至少包含：
 
 ```rust
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+    pub output_schema: Option<serde_json::Value>,
+    pub prompt_snippet: Option<String>,
+}
+
 pub struct ToolRegistration {
     pub identity: ToolIdentity,
     pub source: ToolSource,             // Builtin / Mcp / Extension / Hosted
@@ -619,6 +862,8 @@ pub struct ToolRegistration {
     pub executor: Arc<dyn ErasedToolExecutor>,
 }
 ```
+
+`prompt_snippet` 是有严格字节上限的模型可见选择提示，不是第二份 schema、权限说明或可执行模板。只有当前 step 实际暴露的 Tool 才能把它贡献给 A0.5 `ActiveToolGuidance`；缺失时使用 `description` 的有界摘要，不要求所有 Tool 编写 snippet。
 
 动态分发只保留在异构 Registry 边界；每个内置 Tool 内部仍使用强类型 input/output 和静态分发。用 `TypedToolAdapter<T>` 擦除具体类型，避免业务代码到处操作 `serde_json::Value`，也避免为追求泛型而让整个 Runtime 携带复杂类型参数。
 
@@ -654,7 +899,7 @@ pub trait TypedTool: Send + Sync + 'static {
 - Exec 的 exit code/stdout/stderr、Edit 的 diff/patch、Search 的 match/truncation 分别放在对应 details 中，不能把所有 Tool 伪装成命令执行。
 - Bash stdout/stderr 在运行中发出 bounded delta，而不是结束后一次性发送。
 - schema 使用 `schemars` derive 生成，并通过 `jsonschema` 在注册时编译、调用时验证，减少 serde input struct 与手写 schema 漂移。
-- Registry 启动时拒绝重复规范名、非法 namespace、无效 schema、超过大小预算的直接暴露 Tool。
+- Registry 启动时拒绝重复规范名、非法 namespace、无效 schema、超过大小预算的直接暴露 Tool，以及超过长度/格式限制的 `prompt_snippet`。
 - call id、timeout、cancellation、artifact quota 成为统一 ToolContext 字段。
 - Tool 错误分类为 `InvalidInput/NotFound/PermissionDenied/PolicyDenied/Cancelled/TimedOut/OutputLimit/Backend/Protocol`；每个 terminal ToolCall 恰好生成一个 ToolResultMessage，错误也不例外。
 
@@ -696,7 +941,7 @@ pub trait TypedTool: Send + Sync + 'static {
 - 同一批 Tool 可以按完成时间发 lifecycle/update 事件，但 ToolResult 必须按 Provider 原 call 顺序提交。
 - 只要批次中出现需要全局顺序的 Tool，调度器可以选择整批串行，首版优先保证语义简单。
 
-第二层在有足够测试和指标后再引入 EffectSet。不能仅凭 `ToolRisk::Read` 判断路径冲突：
+第二层为 EffectSet。注意 EffectSet 首要服务于权限系统（见 A3），并行冲突分析只是其衍生用途。默认只实现 `ParallelSafe/Sequential` 第一层；第二层路径/host 冲突分析永久保持实验性，仅在 eval 证明第一层成为并行瓶颈时才立项。不能仅凭 `ToolRisk::Read` 判断路径冲突：
 
 ```text
 EffectSet:
@@ -737,7 +982,8 @@ EffectSet:
 - macOS 保留并隔离当前 `/usr/bin/sandbox-exec`/Seatbelt backend，补 filesystem/network profile 与真实 socket/file 测试。
 - Linux 首选组合 `bubblewrap` 的 namespace/mount 隔离、`seccompiler` 的 seccomp-BPF 和 `no_new_privs`；`landlock` 仅在内核 ABI/capability 满足时作为附加限制或明确的 fallback，不把单一 crate 宣称为完整沙箱。
 - Windows 后续通过 `windows` crate 组合 restricted token、Job Object、AppContainer/ACL；在 backend 和跨平台 CI 完成前明确报告 Unsupported。
-- sandbox 启动失败、版本过低或请求能力无法兑现时 fail-closed；只有用户明确选择 `FullAccess` 且策略允许时才能走 unsandboxed plan。
+- sandbox 启动失败、版本过低或请求能力无法兑现时 fail-closed，并报告 `UnsupportedCapability`；不允许从“sandbox 不可用”静默降级为 unsandboxed。只有用户明确选择 `FullAccess` 且策略允许时才走 unsandboxed plan，这是与 sandbox 失败互不相关的另一条显式路径。
+- 平台分阶段：M3 只完成 macOS 当前 backend 的 filesystem/network/socket 测试；Linux sandbox 与 Windows sandbox 各自单列为独立里程碑，backend 未通过 bypass 语料和平台 CI 认证前确定性拒绝，不混入 M3。真正风险不是“任意命令执行”（Bash 本就在执行命令），而是突破已授予的 filesystem/network/process/credential 边界。
 - 先复用成熟原语并保持 backend 可替换，不复制 Codex 整套 sandbox 源码，也不把 `libc` syscall 拼装散落到 Tool 实现。
 
 验收：
@@ -1389,6 +1635,7 @@ Event::ApprovalResolved {
 - provider wire → ModelStreamEvent → AgentMessage → RuntimeEvent 的跨层 golden fixture。
 - role-specific AgentMessage 非法组合的 compile-time/API tests，以及 message/event serde version snapshots。
 - partial ToolCall scratch state 不进入 durable message/session 的回归测试。
+- System Prompt 契约按阶段测试：M1 覆盖 assembler/Base/当前 Tool guidance/最小 WorldState 与 source/digest；M2 增加 ProjectInstructions scope、裁剪和 compaction reinjection；M4 增加 policy/trust/capability filtering。
 - Tool schema/input/effect 契约。
 - Tool catalog exposure、namespace、alias 和 schema budget snapshot。
 - 每个文件 Tool 的 path/symlink/workspace boundary、output limit、encoding、cancellation 契约。
@@ -1411,7 +1658,7 @@ Event::ApprovalResolved {
 
 ### A9.2 真实任务评测
 
-将 eval 从“能运行”升级为可决策指标：
+将 eval 从“能运行”升级为可决策指标。扩展 `flash-eval` 现有 task/result/metric/report（已含 fixture、TerminalBench、SWE-bench、regression/trend、success/duration/command/token/failure category 和 event replay 路径），不建立第二套 harness；compaction fidelity 作为新的 benchmark suite 和 metric dimension 加入：
 
 - task success rate。
 - 首次修复成功率。
@@ -1421,7 +1668,7 @@ Event::ApprovalResolved {
 - permission ask 次数与误放行/误阻断。
 - retry、cancel、recovery 成功率。
 
-每项架构功能必须对应一个性能或可靠性指标，否则不进入默认路径。
+每个进入默认路径的功能必须绑定一种明确证据：硬性契约、不变量测试、安全语料或真实任务指标；纯优化必须证明可测收益。不是所有架构功能都要绑定业务性能指标，但都不能无证据进入默认路径。例如：四层消息绑定 terminal 唯一性、错误流拒绝、live/committed 一致性；Thread graph 绑定 fork 边界正确、恢复一致、无孤立 ToolTurn；Daemon 绑定 attach/recovery 成功率、单写者不变量、崩溃恢复；Tool 并行绑定延迟收益和结果确定性；Compaction 绑定机制不变量 + 语义保真 eval；Sandbox 绑定 bypass 语料和平台 CI。
 
 ### A9.3 可观测性
 
@@ -1444,14 +1691,18 @@ Event::ApprovalResolved {
 
 | 里程碑 | 包含任务 | 前置 | 完成信号 |
 |---|---|---|---|
-| M1 内核可演进 | A0.1-A0.4 | 无 | 模块拆分、RunHandle/control bus、canonical message 和 item stream contract 完成 |
-| M2 长任务可靠 | A1.1-A1.3 | M1 | token-aware context、事务化 compaction、分层指令可用 |
-| M3 Tool 平台 | A2.0-A2.7 | M1 | typed/erased Tool Registry、稳定 catalog、async/streaming Tool、Hook、安全调度，以及简化版 Bash/Read/Write/Edit/Glob/Grep |
-| M4 安全闭环 | A3.0-A3.6 | M3 | 分层权限、不可绕过拦截链、持久化策略、Project Trust 与统一审计 |
+| M1 内核可演进 | A0.1-A0.5（prompt 仅 M1 范围） | 无 | 模块拆分、RunHandle/control bus、canonical message、轻量 stream contract，以及 prompt assembler/Base/现有 Tool guidance/最小 WorldState 的稳定 snapshot 完成 |
+| M2 长任务可靠 | A1.1-A1.3 | M1 | token-aware context、事务化 compaction、ProjectInstructions 与当前可得的扩展 WorldState producer 接入，并有确定性预算/裁剪 |
+| M3 Tool 平台 | A2.0-A2.7 | M1 | typed/erased Tool Registry、含 `prompt_snippet` 的正式 ToolSpec、稳定 catalog、async/streaming Tool、Hook、安全调度，以及简化版 Bash/Read/Write/Edit/Glob/Grep；macOS sandbox filesystem/network/socket 验证完成，Linux/Windows 保持 fail-closed `UnsupportedCapability` |
+| M3-Linux Linux 沙箱 | Linux SandboxBackend、bubblewrap/seccomp/Landlock capability probe | M3，可与 M4/M3-Windows 并行 | Linux CI 与 bypass corpus 通过；要求沙箱的调用不再返回 UnsupportedCapability |
+| M3-Windows Windows 沙箱 | Windows SandboxBackend、restricted token/Job Object/AppContainer | M3，可与 M4/M3-Linux 并行 | Windows CI 与 bypass corpus 通过；要求沙箱的调用不再返回 UnsupportedCapability |
+| M4 安全闭环 | A3.0-A3.6 | M3 | 分层权限、不可绕过拦截链、持久化策略、Project Trust、统一审计，以及由 canonical policy/trust/sandbox capability 生成的 RuntimePolicyContext |
 | M5 会话控制 | A4.1-A4.3 | M1、M2、M4 | message-boundary fork、steering/follow-up、幂等恢复 |
 | M6 外部生态 | A5.1-A5.2 | M3、M4 | MCP stdio 工具经过统一权限链稳定运行 |
 | M7 Provider/质量 | A6、A7、A9 | M2-M4，可并行推进 | 第二 Provider 契约通过，真实任务指标改善 |
 | M8 后台与协作 | A8 | M5、M6、M7 | daemon 与多 Agent 不建立旁路状态/权限系统 |
+
+平台沙箱依赖补充：M3-Linux 与 M3-Windows 都依赖 M3 提供稳定的 `SandboxBackend/SandboxPlan` 接口，两者互不依赖、可并行，且都不阻塞 macOS 上的 M4；但任一平台在启用完整 `WorkspaceWrite` 模式前，还必须通过 M4 的 Policy/ExecutionGrant 集成测试——共享接口有依赖，平台实现无顺序依赖。
 
 关键路径：
 
@@ -1470,7 +1721,7 @@ Provider contract、eval、observability 从 M1 开始持续并行，不应等�
 
 ## 15. 近期可直接执行的任务清单
 
-建议先开以下 30 个独立、可验收任务：
+建议先开以下 31 个独立、可验收任务：
 
 1. `refactor(agent): split runtime state machine into focused modules`
 2. `refactor(storage): split session logs recovery and atomic metadata`
@@ -1502,6 +1753,7 @@ Provider contract、eval、observability 从 M1 开始持续并行，不应等�
 28. `refactor(provider): replace flat provider events with item-based model stream events`
 29. `feat(runtime): add item started delta completed lifecycle with stable correlation ids`
 30. `feat(runtime): add AskUserQuestion and persistent TaskCreate TaskUpdate TaskList tools`
+31. `refactor(prompt): add versioned prompt assembler base tool guidance minimal world-state and snapshots`
 
 每个任务都必须：
 
@@ -1545,3 +1797,4 @@ cargo test --all-features
 8. 所有新增能力在真实任务评测上证明可靠性、成功率或延迟收益。
 9. 全量质量门禁、故障注入、安全绕过语料和跨层集成测试持续通过。
 10. 基础设施优先由通过准入评审的成熟库/OS 原语承担，安全关键依赖被内部 trait 隔离，并有可替换、可降级、可审计的 backend。
+11. System Prompt 保持短小、来源可解释、能力感知且可版本化；安全由 Runtime 强制，新增规则通过 snapshot 或真实任务 eval 证明价值。
