@@ -13,6 +13,7 @@ Current default behavior:
 - `flash`: enters the TUI shell for the current workspace.
 - `flash tui`: enters the same TUI shell explicitly.
 - `flash run "<task>"`: runs one headless Agent task for automation and evaluation.
+- `flash continue <session_id> "<instruction>"`: continues history in a new child session.
 - `flash eval fixture --task fix-rust`: runs the local eval harness smoke task.
 - `flash eval terminal-bench --subset smoke`: runs the locked Terminal-Bench smoke adapter.
 - `flash eval swe-bench --subset verified --limit 10`: runs the locked SWE-bench Verified smoke adapter.

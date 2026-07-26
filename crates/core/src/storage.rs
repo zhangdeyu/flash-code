@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,8 @@ pub struct Session {
     pub id: String,
     pub workspace_root: PathBuf,
     pub path: PathBuf,
+    pub parent_session_id: Option<String>,
+    pub status: SessionStatus,
     sequence: Arc<Mutex<u64>>,
     finalizing: Arc<AtomicBool>,
 }
@@ -32,6 +35,8 @@ impl PartialEq for Session {
         self.id == other.id
             && self.workspace_root == other.workspace_root
             && self.path == other.path
+            && self.parent_session_id == other.parent_session_id
+            && self.status == other.status
     }
 }
 
@@ -52,6 +57,8 @@ pub enum StorageError {
     TaskJoin(String),
     SequenceLock,
     WorkspaceMismatch { expected: PathBuf, actual: PathBuf },
+    SessionStillRunning(String),
+    AncestryCycle(String),
 }
 
 impl std::fmt::Display for StorageError {
@@ -67,6 +74,15 @@ impl std::fmt::Display for StorageError {
                 expected.display(),
                 actual.display()
             ),
+            Self::SessionStillRunning(session_id) => {
+                write!(formatter, "session `{session_id}` is still running")
+            }
+            Self::AncestryCycle(session_id) => {
+                write!(
+                    formatter,
+                    "session ancestry contains a cycle at `{session_id}`"
+                )
+            }
         }
     }
 }
@@ -106,6 +122,26 @@ pub fn init_workspace(root: &Path) -> Result<Workspace, StorageError> {
 }
 
 pub fn create_session(root: &Path) -> Result<Session, StorageError> {
+    create_session_record(root, None)
+}
+
+pub fn create_continuation_session(
+    root: &Path,
+    parent_session_id: &str,
+) -> Result<Session, StorageError> {
+    let parent = load_session(root, parent_session_id)?;
+    if parent.status == SessionStatus::Running {
+        return Err(StorageError::SessionStillRunning(
+            parent_session_id.to_string(),
+        ));
+    }
+    create_session_record(root, Some(parent_session_id.to_string()))
+}
+
+fn create_session_record(
+    root: &Path,
+    parent_session_id: Option<String>,
+) -> Result<Session, StorageError> {
     init_workspace(root)?;
     let id = new_id("session");
     let session_dir = root.join(".flash").join("sessions").join(&id);
@@ -114,6 +150,8 @@ pub fn create_session(root: &Path) -> Result<Session, StorageError> {
         id: id.clone(),
         workspace_root: root.to_path_buf(),
         path: session_dir.clone(),
+        parent_session_id: parent_session_id.clone(),
+        status: SessionStatus::Running,
         sequence: Arc::new(Mutex::new(1)),
         finalizing: Arc::new(AtomicBool::new(false)),
     };
@@ -125,6 +163,7 @@ pub fn create_session(root: &Path) -> Result<Session, StorageError> {
         created_at: now.clone(),
         updated_at: now,
         status: SessionStatus::Running,
+        parent_session_id,
     })?;
     fs::write(
         session_dir.join("session.json"),
@@ -138,6 +177,13 @@ pub fn create_session(root: &Path) -> Result<Session, StorageError> {
 
 pub async fn create_session_async(root: PathBuf) -> Result<Session, StorageError> {
     run_blocking_storage(move || create_session(&root)).await
+}
+
+pub async fn create_continuation_session_async(
+    root: PathBuf,
+    parent_session_id: String,
+) -> Result<Session, StorageError> {
+    run_blocking_storage(move || create_continuation_session(&root, &parent_session_id)).await
 }
 
 pub fn append_system_message(session: &Session, text: &str) -> Result<Message, StorageError> {
@@ -181,9 +227,50 @@ pub fn load_session(root: &Path, session_id: &str) -> Result<Session, StorageErr
         id: session_id.to_string(),
         workspace_root: root.to_path_buf(),
         path: session_dir,
+        parent_session_id: record.parent_session_id,
+        status: record.status,
         sequence: Arc::new(Mutex::new(sequence)),
         finalizing: Arc::new(AtomicBool::new(finalized)),
     })
+}
+
+pub fn load_session_messages(session: &Session) -> Result<Vec<Message>, StorageError> {
+    let content = fs::read_to_string(session.path.join("messages.jsonl"))?;
+    content
+        .lines()
+        .map(|line| {
+            let record: MessageRecord = serde_json::from_str(line)?;
+            Ok(record.message)
+        })
+        .collect()
+}
+
+pub fn load_session_history(root: &Path, session_id: &str) -> Result<Vec<Message>, StorageError> {
+    let mut ancestry = Vec::new();
+    let mut visited = BTreeSet::new();
+    let mut current = Some(session_id.to_string());
+    while let Some(current_id) = current {
+        if !visited.insert(current_id.clone()) {
+            return Err(StorageError::AncestryCycle(current_id));
+        }
+        let session = load_session(root, &current_id)?;
+        current = session.parent_session_id.clone();
+        ancestry.push(session);
+    }
+    ancestry.reverse();
+
+    let mut history = Vec::new();
+    for session in ancestry {
+        history.extend(load_session_messages(&session)?);
+    }
+    Ok(history)
+}
+
+pub async fn load_session_history_async(
+    root: PathBuf,
+    session_id: String,
+) -> Result<Vec<Message>, StorageError> {
+    run_blocking_storage(move || load_session_history(&root, &session_id)).await
 }
 
 pub fn append_user_message(session: &Session, text: &str) -> Result<Message, StorageError> {
@@ -435,6 +522,8 @@ struct SessionRecord {
     created_at: String,
     updated_at: String,
     status: SessionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -748,6 +837,114 @@ mod tests {
             .exists());
     }
 
+    #[test]
+    fn continuation_should_create_child_without_modifying_parent() {
+        let root = temp_dir("continuation_child");
+        fs::create_dir_all(&root).unwrap();
+        let parent = create_session(&root).unwrap();
+        append_system_message(&parent, "system").unwrap();
+        append_user_message(&parent, "parent task").unwrap();
+        append_assistant_message(&parent, "", "parent answer", &[]).unwrap();
+        append_event(
+            &parent,
+            Event::SessionFinished {
+                outcome: Outcome::Succeeded,
+            },
+        )
+        .unwrap();
+        finalize_session(&parent, Outcome::Succeeded).unwrap();
+        let parent_metadata = fs::read(parent.path.join("session.json")).unwrap();
+        let parent_messages = fs::read(parent.path.join("messages.jsonl")).unwrap();
+        let parent_events = fs::read(parent.path.join("events.jsonl")).unwrap();
+
+        let child = create_continuation_session(&root, &parent.id).unwrap();
+
+        assert_eq!(child.parent_session_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(
+            fs::read(parent.path.join("session.json")).unwrap(),
+            parent_metadata
+        );
+        assert_eq!(
+            fs::read(parent.path.join("messages.jsonl")).unwrap(),
+            parent_messages
+        );
+        assert_eq!(
+            fs::read(parent.path.join("events.jsonl")).unwrap(),
+            parent_events
+        );
+        let child_metadata = fs::read_to_string(child.path.join("session.json")).unwrap();
+        assert!(child_metadata.contains(&format!("\"parent_session_id\":\"{}\"", parent.id)));
+    }
+
+    #[test]
+    fn continuation_should_reject_running_parent() {
+        let root = temp_dir("continuation_running");
+        fs::create_dir_all(&root).unwrap();
+        let parent = create_session(&root).unwrap();
+
+        let error = create_continuation_session(&root, &parent.id).unwrap_err();
+
+        assert!(matches!(error, StorageError::SessionStillRunning(id) if id == parent.id));
+    }
+
+    #[test]
+    fn history_should_follow_multiple_continuation_generations() {
+        let root = temp_dir("continuation_history");
+        fs::create_dir_all(&root).unwrap();
+        let parent = create_session(&root).unwrap();
+        append_system_message(&parent, "system").unwrap();
+        append_user_message(&parent, "parent task").unwrap();
+        append_assistant_message(&parent, "", "parent answer", &[]).unwrap();
+        finalize_session(&parent, Outcome::Succeeded).unwrap();
+
+        let child = create_continuation_session(&root, &parent.id).unwrap();
+        append_user_message(&child, "child task").unwrap();
+        append_assistant_message(&child, "", "child answer", &[]).unwrap();
+        finalize_session(&child, Outcome::Succeeded).unwrap();
+
+        let grandchild = create_continuation_session(&root, &child.id).unwrap();
+        append_user_message(&grandchild, "grandchild task").unwrap();
+
+        let history = load_session_history(&root, &grandchild.id).unwrap();
+        let texts = history
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            texts,
+            vec![
+                "system",
+                "parent task",
+                "parent answer",
+                "child task",
+                "child answer",
+                "grandchild task"
+            ]
+        );
+    }
+
+    #[test]
+    fn history_should_reject_ancestry_cycle() {
+        let root = temp_dir("continuation_cycle");
+        fs::create_dir_all(&root).unwrap();
+        let session = create_session(&root).unwrap();
+        finalize_session(&session, Outcome::Succeeded).unwrap();
+        let path = session.path.join("session.json");
+        let mut record: SessionRecord =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        record.parent_session_id = Some(session.id.clone());
+        fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+
+        let error = load_session_history(&root, &session.id).unwrap_err();
+
+        assert!(matches!(error, StorageError::AncestryCycle(id) if id == session.id));
+    }
+
     fn test_session(root: &Path, id: &str) -> Session {
         let path = root.join(".flash").join("sessions").join(id);
         fs::create_dir_all(&path).unwrap();
@@ -762,6 +959,7 @@ mod tests {
                 created_at: "0".to_string(),
                 updated_at: "0".to_string(),
                 status: SessionStatus::Running,
+                parent_session_id: None,
             })
             .unwrap(),
         )
@@ -770,6 +968,8 @@ mod tests {
             id: id.to_string(),
             workspace_root: root.to_path_buf(),
             path,
+            parent_session_id: None,
+            status: SessionStatus::Running,
             sequence: Arc::new(Mutex::new(1)),
             finalizing: Arc::new(AtomicBool::new(false)),
         }

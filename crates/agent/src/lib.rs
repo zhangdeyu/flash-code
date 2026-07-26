@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use flash_core::{
     append_assistant_message_async, append_event_async, append_system_message_async,
-    append_tool_result_message_async, append_user_message_async, create_session_async,
-    finalize_session_async, CancellationToken, ContentBlock, Event, Message, Outcome,
-    PermissionDecision, PermissionPolicy, Role, ToolContext, ToolError, ToolErrorKind,
-    ToolExitStatus, ToolRegistry, ToolResultStatus, ToolRisk,
+    append_tool_result_message_async, append_user_message_async, create_continuation_session_async,
+    create_session_async, finalize_session_async, load_session_history_async, CancellationToken,
+    ContentBlock, Event, Message, Outcome, PermissionDecision, PermissionPolicy, Role, ToolContext,
+    ToolError, ToolErrorKind, ToolExitStatus, ToolRegistry, ToolResultStatus, ToolRisk,
 };
 use flash_provider::{
     send_event, ChatProvider, ChatRequest, ProviderError, ProviderEvent, StopReason, ToolCall,
@@ -87,6 +87,68 @@ where
     ) -> Result<AgentRun, AgentError> {
         self.run_task_with_observer(workspace_root, task, NoopObserver)
             .await
+    }
+
+    pub async fn continue_task(
+        &mut self,
+        workspace_root: &Path,
+        parent_session_id: &str,
+        instruction: &str,
+    ) -> Result<AgentRun, AgentError> {
+        self.continue_task_with_observer(
+            workspace_root,
+            parent_session_id,
+            instruction,
+            NoopObserver,
+        )
+        .await
+    }
+
+    pub async fn continue_task_with_observer<O>(
+        &mut self,
+        workspace_root: &Path,
+        parent_session_id: &str,
+        instruction: &str,
+        mut observer: O,
+    ) -> Result<AgentRun, AgentError>
+    where
+        O: EventObserver,
+    {
+        self.continue_task_controlled(
+            workspace_root,
+            parent_session_id,
+            instruction,
+            &mut observer,
+            || false,
+        )
+        .await
+    }
+
+    pub async fn continue_task_controlled<O, C>(
+        &mut self,
+        workspace_root: &Path,
+        parent_session_id: &str,
+        instruction: &str,
+        observer: &mut O,
+        should_cancel: C,
+    ) -> Result<AgentRun, AgentError>
+    where
+        O: EventObserver,
+        C: FnMut() -> bool,
+    {
+        let mut approval = RejectingApproval;
+        self.run_with_start_and_controls(
+            workspace_root,
+            instruction,
+            observer,
+            SessionStart::Continue(parent_session_id.to_string()),
+            ExecutionControls {
+                cancellation: CancellationToken::new(),
+                should_cancel,
+                approval: &mut approval,
+            },
+        )
+        .await
     }
 
     pub async fn run_task_with_observer<O>(
@@ -177,7 +239,7 @@ where
         task: &str,
         observer: &mut O,
         cancellation: CancellationToken,
-        mut should_cancel: C,
+        should_cancel: C,
         approval: &mut A,
     ) -> Result<AgentRun, AgentError>
     where
@@ -185,15 +247,71 @@ where
         C: FnMut() -> bool,
         A: ApprovalController,
     {
-        let session = create_session_async(workspace_root.to_path_buf()).await?;
+        self.run_with_start_and_controls(
+            workspace_root,
+            task,
+            observer,
+            SessionStart::New,
+            ExecutionControls {
+                cancellation,
+                should_cancel,
+                approval,
+            },
+        )
+        .await
+    }
+
+    async fn run_with_start_and_controls<O, C, A>(
+        &mut self,
+        workspace_root: &Path,
+        task: &str,
+        observer: &mut O,
+        start: SessionStart,
+        controls: ExecutionControls<'_, C, A>,
+    ) -> Result<AgentRun, AgentError>
+    where
+        O: EventObserver,
+        C: FnMut() -> bool,
+        A: ApprovalController,
+    {
+        let cancellation = controls.cancellation;
+        let mut should_cancel = controls.should_cancel;
+        let approval = controls.approval;
+        let (session, inherited_history) = match start {
+            SessionStart::New => (
+                create_session_async(workspace_root.to_path_buf()).await?,
+                None,
+            ),
+            SessionStart::Continue(parent_session_id) => {
+                let history = load_session_history_async(
+                    workspace_root.to_path_buf(),
+                    parent_session_id.clone(),
+                )
+                .await?;
+                validate_tool_turns(&history)
+                    .map_err(|error| AgentError::History(error.to_string()))?;
+                let session = create_continuation_session_async(
+                    workspace_root.to_path_buf(),
+                    parent_session_id,
+                )
+                .await?;
+                (session, Some(history))
+            }
+        };
         let result = async {
-            let system = append_system_message_async(
-                session.clone(),
-                runtime_system_prompt(workspace_root, &self.tools),
-            )
-            .await?;
+            let mut history = if let Some(history) = inherited_history {
+                history
+            } else {
+                vec![
+                    append_system_message_async(
+                        session.clone(),
+                        runtime_system_prompt(workspace_root, &self.tools),
+                    )
+                    .await?,
+                ]
+            };
             let user = append_user_message_async(session.clone(), task.to_string()).await?;
-            let mut history = vec![system, user];
+            history.push(user);
             let context = ToolContext {
                 workspace_root: workspace_root.to_path_buf(),
                 cancellation: cancellation.clone(),
@@ -1143,6 +1261,7 @@ pub enum AgentError {
     Storage(flash_core::storage::StorageError),
     Provider(ProviderError),
     Tool(flash_core::ToolError),
+    History(String),
     Finalization { primary: String, finalize: String },
 }
 
@@ -1152,6 +1271,7 @@ impl std::fmt::Display for AgentError {
             Self::Storage(error) => write!(formatter, "{error}"),
             Self::Provider(error) => write!(formatter, "{error}"),
             Self::Tool(error) => write!(formatter, "tool error: {}", error.message),
+            Self::History(message) => write!(formatter, "history error: {message}"),
             Self::Finalization { primary, finalize } => {
                 write!(
                     formatter,
@@ -1160,6 +1280,17 @@ impl std::fmt::Display for AgentError {
             }
         }
     }
+}
+
+enum SessionStart {
+    New,
+    Continue(String),
+}
+
+struct ExecutionControls<'a, C, A> {
+    cancellation: CancellationToken,
+    should_cancel: C,
+    approval: &'a mut A,
 }
 
 impl std::error::Error for AgentError {}
@@ -1520,13 +1651,197 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use flash_core::{PermissionPolicy, Tool, ToolError, ToolOutput, ToolRisk};
     use serde_json::{json, Value};
 
     use super::*;
+
+    #[tokio::test]
+    async fn continue_task_should_create_child_and_send_inherited_history() {
+        let root = temp_dir("continue_history");
+        fs::create_dir_all(&root).unwrap();
+        let parent = flash_core::create_session(&root).unwrap();
+        flash_core::append_system_message(&parent, "root system").unwrap();
+        flash_core::append_user_message(&parent, "parent task").unwrap();
+        flash_core::append_assistant_message(&parent, "", "parent answer", &[]).unwrap();
+        flash_core::append_event(
+            &parent,
+            Event::ApprovalResolved {
+                call_id: "historical_approval".to_string(),
+                approved: true,
+            },
+        )
+        .unwrap();
+        flash_core::append_event(
+            &parent,
+            Event::SessionFinished {
+                outcome: Outcome::Succeeded,
+            },
+        )
+        .unwrap();
+        flash_core::finalize_session(&parent, Outcome::Succeeded).unwrap();
+        let parent_metadata = fs::read(parent.path.join("session.json")).unwrap();
+        let parent_messages = fs::read(parent.path.join("messages.jsonl")).unwrap();
+        let parent_events = fs::read(parent.path.join("events.jsonl")).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = AgentRuntime::new(
+            RecordingProvider {
+                requests: Arc::clone(&requests),
+            },
+            ToolRegistry::new(),
+            AgentOptions {
+                model: "smoke".to_string(),
+                max_turns: 1,
+                permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Yolo),
+                max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
+            },
+        );
+
+        let run = runtime
+            .continue_task(&root, &parent.id, "follow-up task")
+            .await
+            .unwrap();
+
+        assert_eq!(run.outcome, Outcome::Succeeded);
+        let child = flash_core::storage::load_session(&root, &run.session_id).unwrap();
+        assert_eq!(child.parent_session_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(
+            fs::read(parent.path.join("session.json")).unwrap(),
+            parent_metadata
+        );
+        assert_eq!(
+            fs::read(parent.path.join("messages.jsonl")).unwrap(),
+            parent_messages
+        );
+        assert_eq!(
+            fs::read(parent.path.join("events.jsonl")).unwrap(),
+            parent_events
+        );
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let texts = requests[0]
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            vec![
+                "root system",
+                "parent task",
+                "parent answer",
+                "follow-up task"
+            ]
+        );
+        assert!(!texts
+            .iter()
+            .any(|text| text.contains("historical_approval")));
+        let child_messages = fs::read_to_string(child.path.join("messages.jsonl")).unwrap();
+        assert!(child_messages.contains("follow-up task"));
+        assert!(!child_messages.contains("parent task"));
+    }
+
+    #[tokio::test]
+    async fn continue_task_should_reject_running_or_cross_workspace_parent() {
+        let root = temp_dir("continue_rejections");
+        let other = temp_dir("continue_rejections_other");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let parent = flash_core::create_session(&root).unwrap();
+        let mut runtime = AgentRuntime::new(
+            RecordingProvider {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            },
+            ToolRegistry::new(),
+            AgentOptions {
+                model: "smoke".to_string(),
+                max_turns: 1,
+                permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Yolo),
+                max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
+            },
+        );
+
+        let running_error = runtime
+            .continue_task(&root, &parent.id, "continue")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            running_error,
+            AgentError::Storage(flash_core::storage::StorageError::SessionStillRunning(_))
+        ));
+
+        flash_core::finalize_session(&parent, Outcome::Failed).unwrap();
+        let foreign_dir = other.join(".flash/sessions").join(&parent.id);
+        fs::create_dir_all(&foreign_dir).unwrap();
+        fs::copy(
+            parent.path.join("session.json"),
+            foreign_dir.join("session.json"),
+        )
+        .unwrap();
+        let cross_workspace_error = runtime
+            .continue_task(&other, &parent.id, "continue")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            cross_workspace_error,
+            AgentError::Storage(flash_core::storage::StorageError::WorkspaceMismatch { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn continue_task_should_reject_incomplete_tool_turn_before_creating_child() {
+        let root = temp_dir("continue_invalid_tool_turn");
+        fs::create_dir_all(&root).unwrap();
+        let parent = flash_core::create_session(&root).unwrap();
+        flash_core::append_system_message(&parent, "system").unwrap();
+        flash_core::append_user_message(&parent, "task").unwrap();
+        flash_core::append_assistant_message(
+            &parent,
+            "",
+            "",
+            &[(
+                "call_missing".to_string(),
+                "Read".to_string(),
+                serde_json::json!({"path": "README.md"}),
+            )],
+        )
+        .unwrap();
+        flash_core::finalize_session(&parent, Outcome::Failed).unwrap();
+        let mut runtime = AgentRuntime::new(
+            RecordingProvider {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            },
+            ToolRegistry::new(),
+            AgentOptions {
+                model: "smoke".to_string(),
+                max_turns: 1,
+                permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Yolo),
+                max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
+            },
+        );
+
+        let error = runtime
+            .continue_task(&root, &parent.id, "continue")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AgentError::History(_)));
+        assert_eq!(
+            fs::read_dir(root.join(".flash/sessions")).unwrap().count(),
+            1
+        );
+    }
 
     #[tokio::test]
     async fn run_task_should_execute_search_tool_and_finish() {
@@ -2403,6 +2718,24 @@ mod tests {
             error,
             HistoryProjectionError::OrphanToolResult("call_1".to_string())
         );
+    }
+
+    struct RecordingProvider {
+        requests: Arc<Mutex<Vec<ChatRequest>>>,
+    }
+
+    #[async_trait(?Send)]
+    impl ChatProvider for RecordingProvider {
+        async fn chat(
+            &mut self,
+            request: ChatRequest,
+            events: tokio::sync::mpsc::Sender<ProviderEvent>,
+        ) -> Result<(), ProviderError> {
+            self.requests.lock().unwrap().push(request);
+            send_event(&events, ProviderEvent::TextDelta("continued".to_string())).await?;
+            send_event(&events, ProviderEvent::Done(StopReason::EndTurn)).await?;
+            Ok(())
+        }
     }
 
     struct UnknownToolProvider;

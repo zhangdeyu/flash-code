@@ -71,7 +71,7 @@ pub async fn run_current_workspace(runner: &mut impl TaskRunner) -> Result<(), T
     state.permission_mode = runner.permission_mode(&root);
     let mut stdout = io::stdout();
 
-    if let Some(session_id) = std::env::var_os("FLASH_TUI_RESUME") {
+    if let Some(session_id) = std::env::var_os("FLASH_TUI_REPLAY") {
         state.replay_session(&root, &session_id.to_string_lossy());
     }
 

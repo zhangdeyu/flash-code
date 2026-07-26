@@ -35,6 +35,7 @@ enum CliCommand {
     Tui,
     Doctor,
     Run(RunArgs),
+    Continue(ContinueArgs),
     Eval {
         #[command(subcommand)]
         command: EvalCommand,
@@ -45,6 +46,12 @@ enum CliCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 struct RunArgs {
     task: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+struct ContinueArgs {
+    session_id: String,
+    instruction: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -87,6 +94,9 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Some(CliCommand::Init) => init(),
         Some(CliCommand::Doctor) => doctor(),
         Some(CliCommand::Run(args)) => run_task(&args.task).await,
+        Some(CliCommand::Continue(args)) => {
+            continue_task(&args.session_id, &args.instruction).await
+        }
         Some(CliCommand::Eval { command }) => eval(command).await,
         Some(CliCommand::Replay(args)) => replay(&args.session_id),
     }
@@ -228,6 +238,27 @@ fn doctor() -> Result<(), CliError> {
 async fn run_task(task: &str) -> Result<(), CliError> {
     let root = discover_workspace_root(None)?;
     let config = load_config(&root, &ConfigOverrides::default())?;
+    let mut runtime = configured_runtime(config)?;
+    let run = runtime.run_task(&root, task).await?;
+    println!("session: {}", run.session_id);
+    println!("outcome: {}", run.outcome.as_str());
+    Ok(())
+}
+
+async fn continue_task(session_id: &str, instruction: &str) -> Result<(), CliError> {
+    let root = discover_workspace_root(None)?;
+    let config = load_config(&root, &ConfigOverrides::default())?;
+    let mut runtime = configured_runtime(config)?;
+    let run = runtime
+        .continue_task(&root, session_id, instruction)
+        .await?;
+    println!("session: {}", run.session_id);
+    println!("parent_session: {session_id}");
+    println!("outcome: {}", run.outcome.as_str());
+    Ok(())
+}
+
+fn configured_runtime(config: Config) -> Result<AgentRuntime<CliProvider>, CliError> {
     let registry = flash_tools::builtin_registry_with_options(
         config.shell_timeout_secs,
         config.shell_max_output_bytes,
@@ -235,7 +266,7 @@ async fn run_task(task: &str) -> Result<(), CliError> {
     )
     .map_err(CliError::ToolRegistry)?;
     let provider = provider_from_config(&config)?;
-    let mut runtime = AgentRuntime::new(
+    Ok(AgentRuntime::new(
         provider,
         registry,
         AgentOptions {
@@ -245,11 +276,7 @@ async fn run_task(task: &str) -> Result<(), CliError> {
             max_output_bytes: config.shell_max_output_bytes,
             max_prompt_bytes: 200_000,
         },
-    );
-    let run = runtime.run_task(&root, task).await?;
-    println!("session: {}", run.session_id);
-    println!("outcome: {}", run.outcome.as_str());
-    Ok(())
+    ))
 }
 
 fn provider_from_config(config: &Config) -> Result<CliProvider, CliError> {
@@ -561,6 +588,25 @@ mod tests {
         );
         let error = Cli::try_parse_from(["flash", "resume", "session_123"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn cli_should_parse_continue_with_explicit_instruction() {
+        let cli = Cli::try_parse_from([
+            "flash",
+            "continue",
+            "session_123",
+            "finish the remaining tests",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.command,
+            Some(CliCommand::Continue(ContinueArgs {
+                session_id: "session_123".to_string(),
+                instruction: "finish the remaining tests".to_string(),
+            }))
+        );
     }
 
     #[test]
