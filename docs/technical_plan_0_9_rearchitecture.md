@@ -709,6 +709,27 @@ CLI 用 `clap` derive 表达命令和参数。CLI 不新增大型 UX。所有真
 
 ---
 
+## 10.1 0.9 完成状态
+
+截至 2026-07-26,0.9 Rust 主栈迁移已完成:
+
+- `serde`/`serde_json` 已用于 core 协议、storage JSONL、DeepSeek payload、TUI/eval JSON 读取辅助。
+- `tokio` 已用于 CLI runtime、provider/runtime async path、storage/tool blocking boundary。
+- `clap` 已接管 CLI 命令解析和 help/version。
+- `reqwest` 已用于 DeepSeek streaming provider,DeepSeek HTTP/SSE 逻辑限定在 `flash-deepseek`。
+- `crossterm` 已接管 TUI raw mode、alternate screen 和 keyboard event。
+- `ratatui` 已接管 TUI 主界面 layout/widgets 渲染。
+- CLI、TUI、Eval 均继续复用 `AgentRuntime`,没有新增独立 agent loop。
+- 每个阶段均已独立提交,提交历史可追踪阶段边界。
+
+已知后续事项:
+
+- Provider callback 当前仍是同步 callback;runtime 对 live delta 保持“同步写 event 后 notify”以维持流式可见性。若后续要完全 async 化这一路径,应将 provider event sink 升级为 async sink 或 stream API。
+- Eval JSON 报告仍保留轻量字符串模板,但 escaping/field 读取已由 `serde_json` helper 承担;若报告 schema 继续扩展,可再迁移为完整 typed report structs。
+- 0.9 不包含复杂 TUI UX、markdown/diff rendering、插件面板或 sandbox 新 crate。
+
+---
+
 ## 11. 不合理修改清单
 
 以下修改不属于 0.9 合理范围,除非另开计划:

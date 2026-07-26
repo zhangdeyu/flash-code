@@ -771,10 +771,10 @@ fn checkout_swe_bench_repo(
                 "\"version\":\"{}\"",
                 "}}\n"
             ),
-            escape_json(&task.instance_id),
-            escape_json(&task.repo),
-            escape_json(&task.base_commit),
-            escape_json(&task.version)
+            json_string(&task.instance_id),
+            json_string(&task.repo),
+            json_string(&task.base_commit),
+            json_string(&task.version)
         ),
     )?;
     Ok(())
@@ -947,17 +947,17 @@ fn write_result_json(run: &EvalRun, result: &EvalResult) -> Result<(), EvalError
             "\"failure_reason\":\"{}\"",
             "}}\n"
         ),
-        escape_json(&result.task_id),
+        json_string(&result.task_id),
         result.passed,
         result.duration_ms,
         result.command_count,
         result.input_tokens,
         result.output_tokens,
-        escape_json(&session_id),
-        escape_json(&events_path),
-        escape_json(&result.workspace_path.display().to_string()),
-        escape_json(failure_kind),
-        escape_json(&failure_reason)
+        json_string(&session_id),
+        json_string(&events_path),
+        json_string(&result.workspace_path.display().to_string()),
+        json_string(failure_kind),
+        json_string(&failure_reason)
     );
     fs::write(run.path.join("result.json"), content)?;
     Ok(())
@@ -1027,19 +1027,19 @@ fn write_terminal_bench_summary(run: &TerminalBenchRun) -> Result<(), EvalError>
                 "\"failure_reason\":\"{}\"",
                 "}}"
             ),
-            escape_json(&result.task_id),
+            json_string(&result.task_id),
             result.passed,
             result.duration_ms,
             result.command_count,
             result.input_tokens,
             result.output_tokens,
-            escape_json(
+            json_string(
                 result
                     .failure_kind
                     .map(EvalFailureKind::as_str)
                     .unwrap_or("none")
             ),
-            escape_json(result.failure_reason.as_deref().unwrap_or("none"))
+            json_string(result.failure_reason.as_deref().unwrap_or("none"))
         ));
     }
     let result_json = format!(
@@ -1053,8 +1053,8 @@ fn write_terminal_bench_summary(run: &TerminalBenchRun) -> Result<(), EvalError>
             "\"tasks\":[{}]",
             "}}\n"
         ),
-        escape_json(&run.subset),
-        escape_json(&run.lock_version),
+        json_string(&run.subset),
+        json_string(&run.lock_version),
         passed,
         total,
         json_tasks
@@ -1127,18 +1127,18 @@ fn write_swe_bench_task_result(run: &EvalRun, result: &SweBenchResult) -> Result
             "\"failure_reason\":\"{}\"",
             "}}\n"
         ),
-        escape_json(&result.instance_id),
+        json_string(&result.instance_id),
         result.resolved,
         result.duration_ms,
         result.command_count,
         result.input_tokens,
         result.output_tokens,
-        escape_json(&session_id),
-        escape_json(&events_path),
-        escape_json(&patch_path),
-        escape_json(&result.workspace_path.display().to_string()),
-        escape_json(failure_kind),
-        escape_json(&failure_reason)
+        json_string(&session_id),
+        json_string(&events_path),
+        json_string(&patch_path),
+        json_string(&result.workspace_path.display().to_string()),
+        json_string(failure_kind),
+        json_string(&failure_reason)
     );
     fs::write(run.path.join("result.json"), content)?;
 
@@ -1221,22 +1221,22 @@ fn write_swe_bench_summary(run: &SweBenchRun) -> Result<(), EvalError> {
                 "\"failure_reason\":\"{}\"",
                 "}}"
             ),
-            escape_json(&result.instance_id),
+            json_string(&result.instance_id),
             result.resolved,
             result.duration_ms,
             result.command_count,
             result.input_tokens,
             result.output_tokens,
-            escape_json(result.session_id.as_deref().unwrap_or_default()),
-            escape_json(&events_path),
-            escape_json(&patch_path),
-            escape_json(
+            json_string(result.session_id.as_deref().unwrap_or_default()),
+            json_string(&events_path),
+            json_string(&patch_path),
+            json_string(
                 result
                     .failure_kind
                     .map(SweBenchFailureKind::as_str)
                     .unwrap_or("none")
             ),
-            escape_json(result.failure_reason.as_deref().unwrap_or("none"))
+            json_string(result.failure_reason.as_deref().unwrap_or("none"))
         ));
     }
     let result_json = format!(
@@ -1254,9 +1254,9 @@ fn write_swe_bench_summary(run: &SweBenchRun) -> Result<(), EvalError> {
             "\"tasks\":[{}]",
             "}}\n"
         ),
-        escape_json(&run.subset),
+        json_string(&run.subset),
         run.limit,
-        escape_json(&run.lock_version),
+        json_string(&run.lock_version),
         summary.resolved,
         summary.unresolved,
         summary.environment_failures,
@@ -1549,7 +1549,7 @@ fn latest_previous_regression(
 }
 
 fn parse_regression_snapshot(content: &str) -> Result<Option<RegressionSnapshot>, EvalError> {
-    let Some(rate) = find_json_number(content, "pass_rate_bps") else {
+    let Some(rate) = json_number_field(content, "pass_rate_bps") else {
         return Ok(None);
     };
     let pass_rate_bps = rate
@@ -1617,16 +1617,16 @@ fn regression_result_json(run: &RegressionRun) -> String {
                 "\"result_path\":\"{}\"",
                 "}}"
             ),
-            escape_json(&benchmark.benchmark),
-            escape_json(&benchmark.subset),
-            escape_json(&benchmark.lock_version),
+            json_string(&benchmark.benchmark),
+            json_string(&benchmark.subset),
+            json_string(&benchmark.lock_version),
             benchmark.passed,
             benchmark.total,
             benchmark.agent_failures,
             benchmark.environment_failures,
             benchmark.benchmark_failures,
-            escape_json(&benchmark.report_path.display().to_string()),
-            escape_json(&benchmark.result_path.display().to_string())
+            json_string(&benchmark.report_path.display().to_string()),
+            json_string(&benchmark.result_path.display().to_string())
         ));
     }
     format!(
@@ -1670,7 +1670,7 @@ fn regression_trend_json(run: &RegressionRun) -> String {
             "\"new_failures\":{}",
             "}}\n"
         ),
-        escape_json(&run.run_id),
+        json_string(&run.run_id),
         run.pass_rate_bps,
         previous_rate,
         run.previous_pass_rate_bps
@@ -1774,7 +1774,7 @@ fn json_string_array(values: &[String]) -> String {
             content.push(',');
         }
         content.push('"');
-        content.push_str(&escape_json(value));
+        content.push_str(&json_string(value));
         content.push('"');
     }
     content.push(']');
@@ -1800,10 +1800,10 @@ fn read_event_metrics(events_path: &Path) -> Result<EventMetrics, EvalError> {
             metrics.command_count += 1;
         }
         if line.contains("\"type\":\"usage_recorded\"") {
-            metrics.input_tokens += find_json_number(line, "input_tokens")
+            metrics.input_tokens += json_number_field(line, "input_tokens")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
-            metrics.output_tokens += find_json_number(line, "output_tokens")
+            metrics.output_tokens += json_number_field(line, "output_tokens")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
         }
@@ -1811,14 +1811,8 @@ fn read_event_metrics(events_path: &Path) -> Result<EventMetrics, EvalError> {
     Ok(metrics)
 }
 
-fn find_json_number(content: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":");
-    let start = content.find(&needle)? + needle.len();
-    let rest = &content[start..];
-    let end = rest
-        .find(|ch: char| !ch.is_ascii_digit())
-        .unwrap_or(rest.len());
-    Some(rest[..end].to_string())
+fn json_number_field(content: &str, key: &str) -> Option<String> {
+    json_value_field(content, key).and_then(|value| value.as_u64().map(|number| number.to_string()))
 }
 
 fn sanitize_id(id: &str) -> String {
@@ -1833,20 +1827,21 @@ fn sanitize_id(id: &str) -> String {
         .collect()
 }
 
-fn escape_json(input: &str) -> String {
-    let mut escaped = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '"' => escaped.push_str("\\\""),
-            '\\' => escaped.push_str("\\\\"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            ch if ch.is_control() => escaped.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => escaped.push(ch),
-        }
-    }
-    escaped
+fn json_string(input: &str) -> String {
+    let encoded = serde_json::to_string(input).unwrap_or_else(|_| "\"\"".to_string());
+    encoded
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn json_value_field(content: &str, key: &str) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    value
+        .get(key)
+        .cloned()
+        .or_else(|| value.get("event").and_then(|event| event.get(key)).cloned())
 }
 
 fn timestamp_nanos() -> u128 {

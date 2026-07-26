@@ -4,4 +4,6 @@ set -eu
 cargo fmt --check
 cargo test --all-features
 cargo clippy --all-targets --all-features -- -D warnings
-cargo nextest run --all-features
+if cargo nextest --version >/dev/null 2>&1; then
+  cargo nextest run --all-features
+fi

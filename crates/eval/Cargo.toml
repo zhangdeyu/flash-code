@@ -12,6 +12,7 @@ path = "src/lib.rs"
 flash-agent = { path = "../agent" }
 flash-core = { path = "../core" }
 flash-tools = { path = "../tools" }
+serde_json = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

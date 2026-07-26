@@ -662,13 +662,13 @@ fn load_sessions(workspace_root: &Path) -> Result<Vec<SessionSummary>, TuiError>
             continue;
         }
         let content = fs::read_to_string(&session_json)?;
-        let Some(session_id) = find_json_string(&content, "session_id") else {
+        let Some(session_id) = json_string_field(&content, "session_id") else {
             continue;
         };
         sessions.push(SessionSummary {
             session_id,
-            updated_at: find_json_string(&content, "updated_at").unwrap_or_default(),
-            status: find_json_string(&content, "status").unwrap_or_else(|| "unknown".to_string()),
+            updated_at: json_string_field(&content, "updated_at").unwrap_or_default(),
+            status: json_string_field(&content, "status").unwrap_or_else(|| "unknown".to_string()),
             events_path: entry.path().join("events.jsonl"),
         });
     }
@@ -681,101 +681,101 @@ fn load_transcript(events_path: &Path) -> Result<Vec<TranscriptLine>, TuiError> 
 }
 
 fn parse_event_line(line: &str) -> Option<TranscriptLine> {
-    let event_type = find_json_string(line, "type")?;
+    let event_type = json_string_field(line, "type")?;
     match event_type.as_str() {
         "session_started" => Some(TranscriptLine {
             kind: TranscriptKind::Session,
             text: format!(
                 "started {}",
-                find_json_string(line, "session_id").unwrap_or_default()
+                json_string_field(line, "session_id").unwrap_or_default()
             ),
         }),
         "user_message_appended" => Some(TranscriptLine {
             kind: TranscriptKind::User,
             text: format!(
                 "message {} appended",
-                find_json_string(line, "message_id").unwrap_or_default()
+                json_string_field(line, "message_id").unwrap_or_default()
             ),
         }),
         "model_request_started" => Some(TranscriptLine {
             kind: TranscriptKind::Session,
             text: format!(
                 "model request {}",
-                find_json_string(line, "model").unwrap_or_default()
+                json_string_field(line, "model").unwrap_or_default()
             ),
         }),
         "reasoning_delta" => Some(TranscriptLine {
             kind: TranscriptKind::Reasoning,
-            text: find_json_string(line, "text").unwrap_or_default(),
+            text: json_string_field(line, "text").unwrap_or_default(),
         }),
         "assistant_delta" => Some(TranscriptLine {
             kind: TranscriptKind::Assistant,
-            text: find_json_string(line, "text").unwrap_or_default(),
+            text: json_string_field(line, "text").unwrap_or_default(),
         }),
         "tool_call_requested" => Some(TranscriptLine {
             kind: TranscriptKind::Tool,
             text: format!(
                 "requested {} {}",
-                find_json_string(line, "name").unwrap_or_default(),
-                find_json_string(line, "call_id").unwrap_or_default()
+                json_string_field(line, "name").unwrap_or_default(),
+                json_string_field(line, "call_id").unwrap_or_default()
             ),
         }),
         "approval_required" => Some(TranscriptLine {
             kind: TranscriptKind::Approval,
             text: format!(
                 "required for {}",
-                find_json_string(line, "call_id").unwrap_or_default()
+                json_string_field(line, "call_id").unwrap_or_default()
             ),
         }),
         "approval_resolved" => Some(TranscriptLine {
             kind: TranscriptKind::Approval,
             text: format!(
                 "{} approved={}",
-                find_json_string(line, "call_id").unwrap_or_default(),
-                find_json_bool(line, "approved").unwrap_or(false)
+                json_string_field(line, "call_id").unwrap_or_default(),
+                json_bool_field(line, "approved").unwrap_or(false)
             ),
         }),
         "tool_started" => Some(TranscriptLine {
             kind: TranscriptKind::Tool,
             text: format!(
                 "started {} {}",
-                find_json_string(line, "name").unwrap_or_default(),
-                find_json_string(line, "call_id").unwrap_or_default()
+                json_string_field(line, "name").unwrap_or_default(),
+                json_string_field(line, "call_id").unwrap_or_default()
             ),
         }),
         "tool_output_delta" => Some(TranscriptLine {
             kind: TranscriptKind::Tool,
             text: format!(
                 "{}: {}",
-                find_json_string(line, "stream").unwrap_or_default(),
-                find_json_string(line, "text").unwrap_or_default()
+                json_string_field(line, "stream").unwrap_or_default(),
+                json_string_field(line, "text").unwrap_or_default()
             ),
         }),
         "tool_finished" => Some(TranscriptLine {
             kind: TranscriptKind::Tool,
             text: format!(
                 "finished {} {}",
-                find_json_string(line, "call_id").unwrap_or_default(),
-                find_json_string(line, "status").unwrap_or_default()
+                json_string_field(line, "call_id").unwrap_or_default(),
+                json_string_field(line, "status").unwrap_or_default()
             ),
         }),
         "usage_recorded" => Some(TranscriptLine {
             kind: TranscriptKind::Session,
             text: format!(
                 "usage input={} output={}",
-                find_json_number(line, "input_tokens").unwrap_or_default(),
-                find_json_number(line, "output_tokens").unwrap_or_default()
+                json_number_field(line, "input_tokens").unwrap_or_default(),
+                json_number_field(line, "output_tokens").unwrap_or_default()
             ),
         }),
         "error" => Some(TranscriptLine {
             kind: TranscriptKind::Error,
-            text: find_json_string(line, "message").unwrap_or_default(),
+            text: json_string_field(line, "message").unwrap_or_default(),
         }),
         "session_finished" => Some(TranscriptLine {
             kind: TranscriptKind::Session,
             text: format!(
                 "finished {}",
-                find_json_string(line, "outcome").unwrap_or_default()
+                json_string_field(line, "outcome").unwrap_or_default()
             ),
         }),
         _ => None,
@@ -850,60 +850,24 @@ fn event_to_transcript(event: &Event) -> Option<TranscriptLine> {
     }
 }
 
-fn find_json_string(content: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":\"");
-    let start = content.find(&needle)? + needle.len();
-    let rest = &content[start..];
-    let end = json_string_end(rest)?;
-    Some(unescape_json_string(&rest[..end]))
+fn json_string_field(content: &str, key: &str) -> Option<String> {
+    json_value_field(content, key).and_then(|value| value.as_str().map(str::to_string))
 }
 
-fn json_string_end(value: &str) -> Option<usize> {
-    let mut escaped = false;
-    for (index, ch) in value.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => return Some(index),
-            _ => {}
-        }
-    }
-    None
+fn json_number_field(content: &str, key: &str) -> Option<String> {
+    json_value_field(content, key).and_then(|value| value.as_u64().map(|number| number.to_string()))
 }
 
-fn find_json_number(content: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":");
-    let start = content.find(&needle)? + needle.len();
-    let rest = &content[start..];
-    let end = rest
-        .find(|ch: char| !ch.is_ascii_digit())
-        .unwrap_or(rest.len());
-    Some(rest[..end].to_string())
+fn json_bool_field(content: &str, key: &str) -> Option<bool> {
+    json_value_field(content, key).and_then(|value| value.as_bool())
 }
 
-fn find_json_bool(content: &str, key: &str) -> Option<bool> {
-    let needle = format!("\"{key}\":");
-    let start = content.find(&needle)? + needle.len();
-    let rest = &content[start..];
-    if rest.starts_with("true") {
-        Some(true)
-    } else if rest.starts_with("false") {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn unescape_json_string(value: &str) -> String {
+fn json_value_field(content: &str, key: &str) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
     value
-        .replace("\\n", "\n")
-        .replace("\\r", "\r")
-        .replace("\\t", "\t")
-        .replace("\\\"", "\"")
-        .replace("\\\\", "\\")
+        .get(key)
+        .cloned()
+        .or_else(|| value.get("event").and_then(|event| event.get(key)).cloned())
 }
 
 #[derive(Debug)]
