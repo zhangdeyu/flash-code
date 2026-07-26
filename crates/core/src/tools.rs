@@ -1,8 +1,11 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::sync::Notify;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -57,13 +60,65 @@ impl PermissionPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolContext {
     pub workspace_root: PathBuf,
+    pub cancellation: CancellationToken,
+    pub artifact_dir: Option<PathBuf>,
+    pub artifact_stem: Option<String>,
 }
+
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        if !self.cancelled.swap(true, Ordering::SeqCst) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            let notified = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl PartialEq for CancellationToken {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cancelled, &other.cancelled)
+    }
+}
+
+impl Eq for CancellationToken {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutput {
     pub stdout: String,
     pub stderr: String,
     pub status: ToolExitStatus,
+    pub exit_code: Option<i32>,
+    pub signal: Option<String>,
+    pub duration_ms: u64,
+    pub timed_out: bool,
+    pub truncated: bool,
+    pub artifact: Option<String>,
 }
 
 impl ToolOutput {
@@ -72,6 +127,12 @@ impl ToolOutput {
             stdout: stdout.into(),
             stderr: String::new(),
             status: ToolExitStatus::Success,
+            exit_code: Some(0),
+            signal: None,
+            duration_ms: 0,
+            timed_out: false,
+            truncated: false,
+            artifact: None,
         }
     }
 
@@ -80,6 +141,12 @@ impl ToolOutput {
             stdout: String::new(),
             stderr: stderr.into(),
             status: ToolExitStatus::Error,
+            exit_code: None,
+            signal: None,
+            duration_ms: 0,
+            timed_out: false,
+            truncated: false,
+            artifact: None,
         }
     }
 }
@@ -94,15 +161,36 @@ pub enum ToolExitStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolError {
+    pub kind: ToolErrorKind,
     pub message: String,
 }
 
 impl ToolError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
+            kind: ToolErrorKind::Internal,
             message: message.into(),
         }
     }
+
+    pub fn with_kind(kind: ToolErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolErrorKind {
+    InvalidInput,
+    PermissionDenied,
+    Io,
+    Timeout,
+    Cancelled,
+    ProcessFailed,
+    Internal,
 }
 
 pub trait Tool: Send + Sync {
@@ -111,13 +199,12 @@ pub trait Tool: Send + Sync {
     /// One-line description of what the tool does.
     fn description(&self) -> &str;
 
-    /// JSON Schema string for the tool's input parameters.
-    /// Format: `{"type":"object","properties":{...},"required":[...]}`
-    fn parameters(&self) -> &str;
+    /// JSON Schema object for the tool's input parameters.
+    fn parameters(&self) -> Value;
 
-    fn risk(&self, input: &str) -> ToolRisk;
+    fn risk(&self, input: &Value) -> Result<ToolRisk, ToolError>;
 
-    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError>;
+    fn call(&self, input: Value, context: &ToolContext) -> Result<ToolOutput, ToolError>;
 }
 
 /// Descriptor combining a tool's name, description and JSON Schema parameters.
@@ -126,7 +213,7 @@ pub trait Tool: Send + Sync {
 pub struct ToolDescriptor {
     pub name: String,
     pub description: String,
-    pub parameters: String,
+    pub parameters: Value,
 }
 
 #[derive(Default)]
@@ -144,6 +231,10 @@ impl ToolRegistry {
         if self.tools.contains_key(&name) {
             return Err(ToolRegistryError::DuplicateName(name));
         }
+        let parameters = tool.parameters();
+        if let Err(message) = validate_parameters_schema(&parameters) {
+            return Err(ToolRegistryError::InvalidSchema { name, message });
+        }
         self.tools.insert(name, Arc::from(tool));
         Ok(())
     }
@@ -155,12 +246,12 @@ impl ToolRegistry {
     pub async fn call_blocking(
         &self,
         name: &str,
-        input: String,
+        input: Value,
         context: ToolContext,
     ) -> Option<Result<ToolOutput, ToolError>> {
         let tool = Arc::clone(self.tools.get(name)?);
         Some(
-            tokio::task::spawn_blocking(move || tool.call(&input, &context))
+            tokio::task::spawn_blocking(move || tool.call(input, &context))
                 .await
                 .unwrap_or_else(|error| Err(ToolError::new(format!("tool task failed: {error}")))),
         )
@@ -175,20 +266,53 @@ impl ToolRegistry {
         self.tools.values().map(|tool| ToolDescriptor {
             name: tool.name().to_string(),
             description: tool.description().to_string(),
-            parameters: tool.parameters().to_string(),
+            parameters: tool.parameters(),
         })
     }
+}
+
+fn validate_parameters_schema(schema: &Value) -> Result<(), String> {
+    let object = schema
+        .as_object()
+        .ok_or_else(|| "tool parameters must be a JSON object".to_string())?;
+    if object.get("type").and_then(Value::as_str) != Some("object") {
+        return Err("tool parameters root type must be `object`".to_string());
+    }
+    let properties = object
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "tool parameters must define an object `properties` map".to_string())?;
+    if let Some(required) = object.get("required") {
+        let required = required
+            .as_array()
+            .ok_or_else(|| "tool parameters `required` must be an array".to_string())?;
+        for field in required {
+            let field = field
+                .as_str()
+                .ok_or_else(|| "tool parameters `required` entries must be strings".to_string())?;
+            if !properties.contains_key(field) {
+                return Err(format!(
+                    "required tool parameter `{field}` is missing from `properties`"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolRegistryError {
     DuplicateName(String),
+    InvalidSchema { name: String, message: String },
 }
 
 impl std::fmt::Display for ToolRegistryError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DuplicateName(name) => write!(formatter, "tool `{name}` is already registered"),
+            Self::InvalidSchema { name, message } => {
+                write!(formatter, "tool `{name}` has invalid schema: {message}")
+            }
         }
     }
 }
@@ -212,16 +336,15 @@ mod tests {
             "fake tool for testing"
         }
 
-        fn parameters(&self) -> &str {
-            r#"{"type":"object","properties":{}}"
-            "#
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type":"object","properties":{}})
         }
 
-        fn risk(&self, _input: &str) -> ToolRisk {
-            ToolRisk::Read
+        fn risk(&self, _input: &Value) -> Result<ToolRisk, ToolError> {
+            Ok(ToolRisk::Read)
         }
 
-        fn call(&self, _input: &str, _context: &ToolContext) -> Result<ToolOutput, ToolError> {
+        fn call(&self, _input: Value, _context: &ToolContext) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput::success("ok"))
         }
     }
@@ -230,16 +353,71 @@ mod tests {
     fn register_should_reject_duplicate_tool_names() {
         let mut registry = ToolRegistry::new();
         registry
-            .register(Box::new(FakeTool { name: "read_file" }))
+            .register(Box::new(FakeTool { name: "fake" }))
             .unwrap();
 
         let error = registry
-            .register(Box::new(FakeTool { name: "read_file" }))
+            .register(Box::new(FakeTool { name: "fake" }))
             .unwrap_err();
+
+        assert_eq!(error, ToolRegistryError::DuplicateName("fake".to_string()));
+    }
+
+    struct InvalidSchemaTool;
+
+    impl Tool for InvalidSchemaTool {
+        fn name(&self) -> &str {
+            "bad"
+        }
+
+        fn description(&self) -> &str {
+            "bad schema"
+        }
+
+        fn parameters(&self) -> Value {
+            Value::String("not an object".to_string())
+        }
+
+        fn risk(&self, _input: &Value) -> Result<ToolRisk, ToolError> {
+            Ok(ToolRisk::Read)
+        }
+
+        fn call(&self, _input: Value, _context: &ToolContext) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::success("ok"))
+        }
+    }
+
+    #[test]
+    fn register_should_reject_non_object_schema() {
+        let mut registry = ToolRegistry::new();
+
+        let error = registry.register(Box::new(InvalidSchemaTool)).unwrap_err();
 
         assert_eq!(
             error,
-            ToolRegistryError::DuplicateName("read_file".to_string())
+            ToolRegistryError::InvalidSchema {
+                name: "bad".to_string(),
+                message: "tool parameters must be a JSON object".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn schema_validation_should_reject_invalid_root_and_required_fields() {
+        assert_eq!(
+            validate_parameters_schema(&serde_json::json!({
+                "type": "string",
+                "properties": {}
+            })),
+            Err("tool parameters root type must be `object`".to_string())
+        );
+        assert_eq!(
+            validate_parameters_schema(&serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": ["missing"]
+            })),
+            Err("required tool parameter `missing` is missing from `properties`".to_string())
         );
     }
 

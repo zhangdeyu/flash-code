@@ -1,15 +1,27 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::path::Component;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use flash_core::{
-    Tool, ToolContext, ToolError, ToolExitStatus, ToolOutput, ToolRegistry, ToolRisk,
+    CancellationToken, Tool, ToolContext, ToolError, ToolErrorKind, ToolExitStatus, ToolOutput,
+    ToolRegistry, ToolRisk,
 };
+use serde::Deserialize;
+use serde_json::{json, Value};
 
 pub fn builtin_registry() -> Result<ToolRegistry, flash_core::tools::ToolRegistryError> {
+    builtin_registry_with_options(120, 200_000, false)
+}
+
+pub fn builtin_registry_with_options(
+    shell_timeout_secs: u64,
+    shell_max_output_bytes: usize,
+    allow_network: bool,
+) -> Result<ToolRegistry, flash_core::tools::ToolRegistryError> {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ReadTool))?;
     registry.register(Box::new(EditTool))?;
@@ -17,14 +29,11 @@ pub fn builtin_registry() -> Result<ToolRegistry, flash_core::tools::ToolRegistr
     registry.register(Box::new(GlobTool))?;
     registry.register(Box::new(GrepTool))?;
     registry.register(Box::new(ListFilesTool))?;
-    registry.register(Box::new(BashTool::default()))?;
-    registry.register(Box::new(SearchTool))?;
-    registry.register(Box::new(ReadFileTool))?;
-    registry.register(Box::new(ShellTool::default()))?;
-    registry.register(Box::new(ApplyPatchTool))?;
-    registry.register(Box::new(WriteFileTool))?;
-    registry.register(Box::new(GitDiffTool))?;
-    registry.register(Box::new(RunTestsTool::default()))?;
+    registry.register(Box::new(BashTool {
+        timeout: Duration::from_secs(shell_timeout_secs),
+        max_output_bytes: shell_max_output_bytes,
+        allow_network,
+    }))?;
     Ok(registry)
 }
 
@@ -39,17 +48,25 @@ impl Tool for ReadTool {
         "Read the full or partial content of a file within the workspace."
     }
 
-    fn parameters(&self) -> &str {
-        r#"{"type":"object","properties":{"path":{"type":"string","description":"Relative path to the file to read"},"start_line":{"type":"integer","description":"First line to read (1-indexed, inclusive)"},"end_line":{"type":"integer","description":"Last line to read (1-indexed, inclusive)"}},"required":["path"]}""
-        "#
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Relative path to the file to read"},
+                "start_line": {"type": "integer", "minimum": 1, "description": "First line to read (1-indexed, inclusive)"},
+                "end_line": {"type": "integer", "minimum": 1, "description": "Last line to read (1-indexed, inclusive)"}
+            },
+            "required": ["path"]
+        })
     }
 
-    fn risk(&self, _input: &str) -> ToolRisk {
-        ToolRisk::Read
+    fn risk(&self, _input: &Value) -> Result<ToolRisk, ToolError> {
+        Ok(ToolRisk::Read)
     }
 
-    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-        read_file(input, context)
+    fn call(&self, input: Value, context: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let input: ReadInput = parse_input(input)?;
+        read_workspace_file(&input, context)
     }
 }
 
@@ -64,17 +81,25 @@ impl Tool for EditTool {
         "Make a targeted find-and-replace edit to an existing file. The find text must match exactly."
     }
 
-    fn parameters(&self) -> &str {
-        r#"{"type":"object","properties":{"path":{"type":"string","description":"Relative path to the file to edit"},"find":{"type":"string","description":"Exact text to find in the file"},"replace":{"type":"string","description":"Replacement text"}},"required":["path","find","replace"]}""
-        "#
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Relative path to the file to edit"},
+                "find": {"type": "string", "description": "Exact text to find in the file"},
+                "replace": {"type": "string", "description": "Replacement text"}
+            },
+            "required": ["path", "find", "replace"]
+        })
     }
 
-    fn risk(&self, _input: &str) -> ToolRisk {
-        ToolRisk::Write
+    fn risk(&self, _input: &Value) -> Result<ToolRisk, ToolError> {
+        Ok(ToolRisk::Write)
     }
 
-    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-        apply_replace_patch(input, context)
+    fn call(&self, input: Value, context: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let input: EditInput = parse_input(input)?;
+        apply_replace_patch(&input, context)
     }
 }
 
@@ -89,17 +114,24 @@ impl Tool for WriteTool {
         "Create a new file or completely overwrite an existing file with the given content."
     }
 
-    fn parameters(&self) -> &str {
-        r#"{"type":"object","properties":{"path":{"type":"string","description":"Relative path to the file to write"},"content":{"type":"string","description":"Full content to write to the file"}},"required":["path","content"]}""
-        "#
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Relative path to the file to write"},
+                "content": {"type": "string", "description": "Full content to write to the file"}
+            },
+            "required": ["path", "content"]
+        })
     }
 
-    fn risk(&self, _input: &str) -> ToolRisk {
-        ToolRisk::Write
+    fn risk(&self, _input: &Value) -> Result<ToolRisk, ToolError> {
+        Ok(ToolRisk::Write)
     }
 
-    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-        write_file(input, context)
+    fn call(&self, input: Value, context: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let input: WriteInput = parse_input(input)?;
+        write_workspace_file(&input, context)
     }
 }
 
@@ -114,17 +146,22 @@ impl Tool for GlobTool {
         "Find files and directories matching a glob pattern (e.g. `**/*.rs`, `src/*.toml`)."
     }
 
-    fn parameters(&self) -> &str {
-        r#"{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern to match against relative file paths"}},"required":["pattern"]}""
-        "#
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Glob pattern to match against relative file paths"}
+            },
+            "required": ["pattern"]
+        })
     }
 
-    fn risk(&self, _input: &str) -> ToolRisk {
-        ToolRisk::Read
+    fn risk(&self, _input: &Value) -> Result<ToolRisk, ToolError> {
+        Ok(ToolRisk::Read)
     }
 
-    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let pattern = input.trim();
+    fn call(&self, input: Value, context: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let input: GlobInput = parse_input(input)?;
         let mut matches = Vec::new();
         visit_files(&context.workspace_root, &mut |path| {
             if matches.len() >= 200 {
@@ -132,7 +169,7 @@ impl Tool for GlobTool {
             }
             let relative = path.strip_prefix(&context.workspace_root).unwrap_or(path);
             let relative_text = relative.display().to_string();
-            if glob_match(pattern, &relative_text) {
+            if glob_match(&input.pattern, &relative_text) {
                 matches.push(relative_text);
             }
         })?;
@@ -151,17 +188,22 @@ impl Tool for GrepTool {
         "Search for a keyword or pattern in file contents across the workspace. Returns file:line:content matches."
     }
 
-    fn parameters(&self) -> &str {
-        r#"{"type":"object","properties":{"pattern":{"type":"string","description":"Keyword or substring to search for in file contents"}},"required":["pattern"]}""
-        "#
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Keyword or substring to search for in file contents"}
+            },
+            "required": ["pattern"]
+        })
     }
 
-    fn risk(&self, _input: &str) -> ToolRisk {
-        ToolRisk::Read
+    fn risk(&self, _input: &Value) -> Result<ToolRisk, ToolError> {
+        Ok(ToolRisk::Read)
     }
 
-    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let needle = input.trim();
+    fn call(&self, input: Value, context: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let input: GrepInput = parse_input(input)?;
         let mut matches = Vec::new();
         visit_files(&context.workspace_root, &mut |path| {
             if matches.len() >= 200 {
@@ -171,7 +213,7 @@ impl Tool for GrepTool {
                 return;
             };
             for (line_index, line) in content.lines().enumerate() {
-                if line.contains(needle) {
+                if line.contains(&input.pattern) {
                     let relative = path.strip_prefix(&context.workspace_root).unwrap_or(path);
                     matches.push(format!(
                         "{}:{}:{}",
@@ -197,20 +239,25 @@ impl Tool for ListFilesTool {
         "List the immediate children (files and directories) of a path in the workspace."
     }
 
-    fn parameters(&self) -> &str {
-        r#"{"type":"object","properties":{"path":{"type":"string","description":"Relative path to the directory to list. Defaults to workspace root if omitted."}},"required":[]}""
-        "#
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Relative path to the directory to list. Defaults to workspace root if omitted."}
+            },
+            "required": []
+        })
     }
 
-    fn risk(&self, _input: &str) -> ToolRisk {
-        ToolRisk::Read
+    fn risk(&self, _input: &Value) -> Result<ToolRisk, ToolError> {
+        Ok(ToolRisk::Read)
     }
 
-    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let path = if input.trim().is_empty() || input.trim() == "." {
-            context.workspace_root.clone()
-        } else {
-            workspace_path(&context.workspace_root, input)?
+    fn call(&self, input: Value, context: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let input: ListFilesInput = parse_input(input)?;
+        let path = match input.path.as_deref() {
+            None | Some("") | Some(".") => context.workspace_root.clone(),
+            Some(path) => workspace_path(&context.workspace_root, path)?,
         };
         let mut entries = Vec::new();
         for entry in fs::read_dir(&path)
@@ -235,12 +282,16 @@ impl Tool for ListFilesTool {
 
 pub struct BashTool {
     timeout: Duration,
+    max_output_bytes: usize,
+    allow_network: bool,
 }
 
 impl Default for BashTool {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(120),
+            max_output_bytes: 200_000,
+            allow_network: false,
         }
     }
 }
@@ -251,258 +302,154 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command in the workspace directory. Use for running tests, git commands, builds, etc."
+        "Execute a shell command in the workspace directory. When network access is disabled, only explicitly allowlisted offline command forms are accepted."
     }
 
-    fn parameters(&self) -> &str {
-        r#"{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"},"timeout_secs":{"type":"integer","description":"Optional timeout in seconds (default 120)"}},"required":["command"]}""
-        "#
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Shell command to execute"},
+                "timeout_secs": {"type": "integer", "minimum": 1, "description": "Optional timeout in seconds (default 120)"}
+            },
+            "required": ["command"]
+        })
     }
 
-    fn risk(&self, input: &str) -> ToolRisk {
-        command_risk(input)
+    fn risk(&self, input: &Value) -> Result<ToolRisk, ToolError> {
+        let input: BashInput = parse_input(input.clone())?;
+        Ok(command_risk(&input.command))
     }
 
-    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-        shell_output(input, &context.workspace_root, self.timeout)
-    }
-}
-
-pub struct SearchTool;
-
-impl Tool for SearchTool {
-    fn name(&self) -> &str {
-        "search"
-    }
-
-    fn description(&self) -> &str {
-        "[Legacy] Search for files by name in the workspace."
-    }
-
-    fn parameters(&self) -> &str {
-        r#"{"type":"object","properties":{"query":{"type":"string","description":"Filename or path fragment to search for"}},"required":[]}""
-        "#
-    }
-
-    fn risk(&self, _input: &str) -> ToolRisk {
-        ToolRisk::Read
-    }
-
-    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let query = input.trim();
-        let mut matches = Vec::new();
-        visit_files(&context.workspace_root, &mut |path| {
-            if matches.len() >= 200 {
-                return;
-            }
-            let relative = path.strip_prefix(&context.workspace_root).unwrap_or(path);
-            let relative_text = relative.display().to_string();
-            if query.is_empty()
-                || query == "."
-                || relative_text.contains(query)
-                || path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.contains(query))
-            {
-                matches.push(relative_text);
-            }
-        })?;
-        Ok(ToolOutput::success(matches.join("\n")))
-    }
-}
-
-pub struct ReadFileTool;
-
-impl Tool for ReadFileTool {
-    fn name(&self) -> &str {
-        "read_file"
-    }
-
-    fn description(&self) -> &str {
-        "[Legacy] Read the content of a file."
-    }
-
-    fn parameters(&self) -> &str {
-        r#"{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"}},"required":["path"]}""
-        "#
-    }
-
-    fn risk(&self, _input: &str) -> ToolRisk {
-        ToolRisk::Read
-    }
-
-    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-        read_file(input, context)
-    }
-}
-
-pub struct ShellTool {
-    timeout: Duration,
-}
-
-pub struct ApplyPatchTool;
-
-impl Tool for ApplyPatchTool {
-    fn name(&self) -> &str {
-        "apply_patch"
-    }
-
-    fn description(&self) -> &str {
-        "[Legacy] Apply a find-and-replace patch to a file."
-    }
-
-    fn parameters(&self) -> &str {
-        r#"{"type":"object","properties":{"input":{"type":"string","description":"Patch input in legacy format"}},"required":["input"]}""
-        "#
-    }
-
-    fn risk(&self, _input: &str) -> ToolRisk {
-        ToolRisk::Write
-    }
-
-    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-        apply_replace_patch(input, context)
-    }
-}
-
-pub struct WriteFileTool;
-
-impl Tool for WriteFileTool {
-    fn name(&self) -> &str {
-        "write_file"
-    }
-
-    fn description(&self) -> &str {
-        "[Legacy] Write content to a file."
-    }
-
-    fn parameters(&self) -> &str {
-        r#"{"type":"object","properties":{"input":{"type":"string","description":"Path and content in legacy format"}},"required":["input"]}""
-        "#
-    }
-
-    fn risk(&self, _input: &str) -> ToolRisk {
-        ToolRisk::Write
-    }
-
-    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-        write_file(input, context)
-    }
-}
-
-pub struct GitDiffTool;
-
-impl Tool for GitDiffTool {
-    fn name(&self) -> &str {
-        "git_diff"
-    }
-
-    fn description(&self) -> &str {
-        "[Legacy] Show the current git diff for the workspace."
-    }
-
-    fn parameters(&self) -> &str {
-        r#"{"type":"object","properties":{},"required":[]}""
-        "#
-    }
-
-    fn risk(&self, _input: &str) -> ToolRisk {
-        ToolRisk::Read
-    }
-
-    fn call(&self, _input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-        command_output("git", &["diff", "--"], &context.workspace_root, None)
-    }
-}
-
-pub struct RunTestsTool {
-    timeout: Duration,
-}
-
-impl Default for RunTestsTool {
-    fn default() -> Self {
-        Self {
-            timeout: Duration::from_secs(120),
+    fn call(&self, input: Value, context: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let input: BashInput = parse_input(input)?;
+        let timeout = input
+            .timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(self.timeout);
+        let risk = command_risk(&input.command);
+        if !self.allow_network && risk != ToolRisk::Read {
+            return Err(ToolError::with_kind(
+                ToolErrorKind::PermissionDenied,
+                "Bash command is not in the offline allowlist while network access is disabled",
+            ));
         }
-    }
-}
-
-impl Tool for RunTestsTool {
-    fn name(&self) -> &str {
-        "run_tests"
-    }
-
-    fn description(&self) -> &str {
-        "[Legacy] Run tests using cargo test or a custom command."
-    }
-
-    fn parameters(&self) -> &str {
-        r#"{"type":"object","properties":{"command":{"type":"string","description":"Test command to run (defaults to `cargo test`)"}},"required":[]}""
-        "#
-    }
-
-    fn risk(&self, _input: &str) -> ToolRisk {
-        ToolRisk::Execute
-    }
-
-    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let command = if input.trim().is_empty() {
-            "cargo test"
-        } else {
-            input.trim()
-        };
-        shell_output(command, &context.workspace_root, self.timeout)
-    }
-}
-
-impl Default for ShellTool {
-    fn default() -> Self {
-        Self {
-            timeout: Duration::from_secs(120),
+        if context.cancellation.is_cancelled() {
+            return Err(ToolError::with_kind(
+                ToolErrorKind::Cancelled,
+                "Bash cancelled before execution",
+            ));
         }
+        shell_output(
+            &input.command,
+            &context.workspace_root,
+            timeout,
+            self.max_output_bytes,
+            &context.cancellation,
+            self.allow_network,
+            output_artifacts(context)?,
+        )
     }
 }
 
-impl Tool for ShellTool {
-    fn name(&self) -> &str {
-        "shell"
-    }
-
-    fn description(&self) -> &str {
-        "[Legacy] Execute a shell command in the workspace directory."
-    }
-
-    fn parameters(&self) -> &str {
-        r#"{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"}},"required":["command"]}""
-        "#
-    }
-
-    fn risk(&self, input: &str) -> ToolRisk {
-        command_risk(input)
-    }
-
-    fn call(&self, input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-        shell_output(input, &context.workspace_root, self.timeout)
-    }
+#[derive(Debug, Deserialize)]
+struct ReadInput {
+    path: String,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
 }
 
-fn read_file(input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-    let path = workspace_path(&context.workspace_root, input)?;
-    let content = fs::read_to_string(path)
-        .map_err(|error| ToolError::new(format!("failed to read file: {error}")))?;
-    Ok(ToolOutput::success(content))
+#[derive(Debug, Deserialize)]
+struct EditInput {
+    path: String,
+    find: String,
+    replace: String,
 }
 
-fn apply_replace_patch(input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-    let patch = ReplacePatch::parse(input)?;
-    let path = existing_workspace_path(&context.workspace_root, patch.path)?;
-    let content = fs::read_to_string(&path)
-        .map_err(|error| ToolError::new(format!("failed to read patch target: {error}")))?;
-    if !content.contains(patch.find) {
-        return Err(ToolError::new("apply_patch failed: find text not found"));
+#[derive(Debug, Deserialize)]
+struct WriteInput {
+    path: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GlobInput {
+    pattern: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GrepInput {
+    pattern: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListFilesInput {
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BashInput {
+    command: String,
+    timeout_secs: Option<u64>,
+}
+
+fn parse_input<T: for<'de> Deserialize<'de>>(input: Value) -> Result<T, ToolError> {
+    serde_json::from_value(input).map_err(|error| {
+        ToolError::with_kind(
+            ToolErrorKind::InvalidInput,
+            format!("invalid tool input: {error}"),
+        )
+    })
+}
+
+fn read_workspace_file(input: &ReadInput, context: &ToolContext) -> Result<ToolOutput, ToolError> {
+    let path = workspace_path(&context.workspace_root, &input.path)?;
+    let content = fs::read_to_string(path).map_err(|error| {
+        ToolError::with_kind(ToolErrorKind::Io, format!("failed to read file: {error}"))
+    })?;
+    let Some(start_line) = input.start_line else {
+        return Ok(ToolOutput::success(content));
+    };
+    if start_line == 0 {
+        return Err(ToolError::with_kind(
+            ToolErrorKind::InvalidInput,
+            "start_line must be greater than 0",
+        ));
     }
-    let updated = content.replacen(patch.find, patch.replace, 1);
+    let end_line = input.end_line.unwrap_or(usize::MAX);
+    if end_line < start_line {
+        return Err(ToolError::with_kind(
+            ToolErrorKind::InvalidInput,
+            "end_line must be greater than or equal to start_line",
+        ));
+    }
+    let selected = content
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line_number = index + 1;
+            (line_number >= start_line && line_number <= end_line).then_some(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(ToolOutput::success(selected))
+}
+
+fn apply_replace_patch(input: &EditInput, context: &ToolContext) -> Result<ToolOutput, ToolError> {
+    let path = existing_workspace_path(&context.workspace_root, &input.path)?;
+    let content = fs::read_to_string(&path).map_err(|error| {
+        ToolError::with_kind(
+            ToolErrorKind::Io,
+            format!("failed to read patch target: {error}"),
+        )
+    })?;
+    if !content.contains(&input.find) {
+        return Err(ToolError::with_kind(
+            ToolErrorKind::InvalidInput,
+            "edit failed: find text not found",
+        ));
+    }
+    let updated = content.replacen(&input.find, &input.replace, 1);
     fs::write(&path, updated)
         .map_err(|error| ToolError::new(format!("failed to write patch target: {error}")))?;
     let root = context
@@ -515,14 +462,12 @@ fn apply_replace_patch(input: &str, context: &ToolContext) -> Result<ToolOutput,
     )))
 }
 
-fn write_file(input: &str, context: &ToolContext) -> Result<ToolOutput, ToolError> {
-    let Some((path_text, content)) = input.split_once("\n---CONTENT---\n") else {
-        return Err(ToolError::new(
-            "write_file input must be `<path>\\n---CONTENT---\\n<content>`",
-        ));
-    };
-    let path = writable_workspace_path(&context.workspace_root, path_text)?;
-    fs::write(&path, content)
+fn write_workspace_file(
+    input: &WriteInput,
+    context: &ToolContext,
+) -> Result<ToolOutput, ToolError> {
+    let path = writable_workspace_path(&context.workspace_root, &input.path)?;
+    fs::write(&path, &input.content)
         .map_err(|error| ToolError::new(format!("failed to write file: {error}")))?;
     let root = context
         .workspace_root
@@ -535,16 +480,56 @@ fn write_file(input: &str, context: &ToolContext) -> Result<ToolOutput, ToolErro
 }
 
 fn command_risk(input: &str) -> ToolRisk {
-    let command = input.trim();
-    if command.contains("rm -rf")
+    let command = input.trim().to_ascii_lowercase();
+    if contains_command(
+        &command,
+        &["curl", "wget", "nc", "ncat", "ssh", "scp", "ftp"],
+    ) || command.contains("http://")
+        || command.contains("https://")
+    {
+        ToolRisk::Network
+    } else if command.contains("rm -rf")
         || command.starts_with("rm ")
-        || command.contains(" shutdown")
-        || command.contains(" mkfs")
+        || command.contains("git clean")
+        || command.contains("git reset --hard")
+        || command.contains("find ") && command.contains("-delete")
+        || command.contains("shutdown")
+        || command.contains("mkfs")
+        || command.contains("rmtree")
     {
         ToolRisk::Destructive
+    } else if !command.contains([';', '|', '>', '<', '`'])
+        && !command.contains("$(")
+        && is_allowlisted_command(&command)
+    {
+        ToolRisk::Read
     } else {
-        ToolRisk::Execute
+        ToolRisk::Destructive
     }
+}
+
+fn contains_command(command: &str, names: &[&str]) -> bool {
+    command
+        .split(|character: char| character.is_whitespace() || ";|&()".contains(character))
+        .any(|token| names.contains(&token))
+}
+
+fn is_allowlisted_command(command: &str) -> bool {
+    [
+        "pwd",
+        "ls",
+        "rg",
+        "git status",
+        "git diff",
+        "git log",
+        "git show",
+        "cargo test",
+        "cargo check",
+        "cargo clippy",
+        "cargo fmt",
+    ]
+    .iter()
+    .any(|allowed| command == *allowed || command.starts_with(&format!("{allowed} ")))
 }
 
 fn glob_match(pattern: &str, path: &str) -> bool {
@@ -573,15 +558,21 @@ fn glob_match(pattern: &str, path: &str) -> bool {
 }
 
 fn workspace_path(root: &Path, input: &str) -> Result<PathBuf, ToolError> {
-    let root = root
-        .canonicalize()
-        .map_err(|error| ToolError::new(format!("invalid workspace root: {error}")))?;
+    let root = root.canonicalize().map_err(|error| {
+        ToolError::with_kind(
+            ToolErrorKind::Io,
+            format!("invalid workspace root: {error}"),
+        )
+    })?;
     let path = root.join(input.trim());
-    let canonical = path
-        .canonicalize()
-        .map_err(|error| ToolError::new(format!("invalid path: {error}")))?;
+    let canonical = path.canonicalize().map_err(|error| {
+        ToolError::with_kind(ToolErrorKind::Io, format!("invalid path: {error}"))
+    })?;
     if !canonical.starts_with(root) {
-        return Err(ToolError::new("path escapes workspace"));
+        return Err(ToolError::with_kind(
+            ToolErrorKind::PermissionDenied,
+            "path escapes workspace",
+        ));
     }
     Ok(canonical)
 }
@@ -589,121 +580,321 @@ fn workspace_path(root: &Path, input: &str) -> Result<PathBuf, ToolError> {
 fn existing_workspace_path(root: &Path, input: &str) -> Result<PathBuf, ToolError> {
     let path = writable_workspace_path(root, input)?;
     path.canonicalize()
-        .map_err(|error| ToolError::new(format!("invalid path: {error}")))
+        .map_err(|error| ToolError::with_kind(ToolErrorKind::Io, format!("invalid path: {error}")))
 }
 
 fn writable_workspace_path(root: &Path, input: &str) -> Result<PathBuf, ToolError> {
-    let root = root
-        .canonicalize()
-        .map_err(|error| ToolError::new(format!("invalid workspace root: {error}")))?;
+    let root = root.canonicalize().map_err(|error| {
+        ToolError::with_kind(
+            ToolErrorKind::Io,
+            format!("invalid workspace root: {error}"),
+        )
+    })?;
     let relative = Path::new(input.trim());
     if relative.is_absolute() {
-        return Err(ToolError::new("path escapes workspace"));
+        return Err(ToolError::with_kind(
+            ToolErrorKind::PermissionDenied,
+            "path escapes workspace",
+        ));
     }
     if relative
         .components()
         .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
     {
-        return Err(ToolError::new("path escapes workspace"));
+        return Err(ToolError::with_kind(
+            ToolErrorKind::PermissionDenied,
+            "path escapes workspace",
+        ));
     }
     let path = root.join(relative);
     let parent = path
         .parent()
-        .ok_or_else(|| ToolError::new("invalid path"))?
+        .ok_or_else(|| ToolError::with_kind(ToolErrorKind::InvalidInput, "invalid path"))?
         .canonicalize()
-        .map_err(|error| ToolError::new(format!("invalid parent path: {error}")))?;
+        .map_err(|error| {
+            ToolError::with_kind(ToolErrorKind::Io, format!("invalid parent path: {error}"))
+        })?;
     if !parent.starts_with(root) {
-        return Err(ToolError::new("path escapes workspace"));
+        return Err(ToolError::with_kind(
+            ToolErrorKind::PermissionDenied,
+            "path escapes workspace",
+        ));
     }
     Ok(path)
 }
 
-fn shell_output(command: &str, root: &Path, timeout: Duration) -> Result<ToolOutput, ToolError> {
-    let mut child = Command::new("sh")
+fn shell_output(
+    command: &str,
+    root: &Path,
+    timeout: Duration,
+    max_output_bytes: usize,
+    cancellation: &CancellationToken,
+    allow_network: bool,
+    artifacts: Option<ShellArtifacts>,
+) -> Result<ToolOutput, ToolError> {
+    let mut process = shell_command(allow_network);
+    process
         .arg("-c")
         .arg(command)
         .current_dir(root)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| ToolError::new(format!("failed to spawn shell: {error}")))?;
+        .stderr(Stdio::piped());
+    if !allow_network {
+        process
+            .env("CARGO_NET_OFFLINE", "true")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("HTTP_PROXY", "http://127.0.0.1:9")
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("ALL_PROXY", "socks5://127.0.0.1:9")
+            .env("NO_PROXY", "");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        process.process_group(0);
+    }
+    let mut child = process.spawn().map_err(|error| {
+        ToolError::with_kind(ToolErrorKind::Io, format!("failed to spawn shell: {error}"))
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        ToolError::with_kind(ToolErrorKind::Internal, "shell stdout pipe is missing")
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        ToolError::with_kind(ToolErrorKind::Internal, "shell stderr pipe is missing")
+    })?;
+    let stdout_artifact = artifacts.as_ref().map(|artifacts| artifacts.stdout.clone());
+    let stderr_artifact = artifacts.map(|artifacts| artifacts.stderr);
+    let stdout_reader =
+        thread::spawn(move || read_limited(stdout, max_output_bytes, stdout_artifact));
+    let stderr_reader =
+        thread::spawn(move || read_limited(stderr, max_output_bytes, stderr_artifact));
 
     let started = Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .map_err(|error| ToolError::new(format!("failed to poll shell: {error}")))?
-            .is_some()
-        {
-            let output = child
-                .wait_with_output()
-                .map_err(|error| ToolError::new(format!("failed to collect shell: {error}")))?;
-            let status = if output.status.success() {
-                ToolExitStatus::Success
-            } else {
-                ToolExitStatus::Error
-            };
-            return Ok(ToolOutput {
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                status,
-            });
+    let (exit_status, timed_out, cancelled) = loop {
+        if let Some(status) = child.try_wait().map_err(|error| {
+            ToolError::with_kind(ToolErrorKind::Io, format!("failed to poll shell: {error}"))
+        })? {
+            break (status, false, false);
+        }
+        if cancellation.is_cancelled() {
+            terminate_process_group(&mut child)?;
+            let status = child.wait().map_err(|error| {
+                ToolError::with_kind(
+                    ToolErrorKind::Io,
+                    format!("failed to reap cancelled shell: {error}"),
+                )
+            })?;
+            break (status, false, true);
         }
         if started.elapsed() >= timeout {
-            child
-                .kill()
-                .map_err(|error| ToolError::new(format!("failed to kill shell: {error}")))?;
-            return Ok(ToolOutput {
-                stdout: String::new(),
-                stderr: "shell command timed out".to_string(),
-                status: ToolExitStatus::Error,
-            });
+            terminate_process_group(&mut child)?;
+            let status = child.wait().map_err(|error| {
+                ToolError::with_kind(
+                    ToolErrorKind::Io,
+                    format!("failed to reap timed out shell: {error}"),
+                )
+            })?;
+            break (status, true, false);
         }
         thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout_reader.join().map_err(|_| {
+        ToolError::with_kind(ToolErrorKind::Internal, "shell stdout reader panicked")
+    })??;
+    let mut stderr = stderr_reader.join().map_err(|_| {
+        ToolError::with_kind(ToolErrorKind::Internal, "shell stderr reader panicked")
+    })??;
+    if timed_out {
+        stderr
+            .preview
+            .extend_from_slice(b"\nshell command timed out");
+    } else if cancelled {
+        stderr
+            .preview
+            .extend_from_slice(b"\nshell command cancelled");
     }
-}
-
-fn command_output(
-    command: &str,
-    args: &[&str],
-    root: &Path,
-    timeout: Option<Duration>,
-) -> Result<ToolOutput, ToolError> {
-    let command_text = std::iter::once(command)
-        .chain(args.iter().copied())
+    let artifact = [stdout.artifact, stderr.artifact]
+        .into_iter()
+        .flatten()
         .collect::<Vec<_>>()
-        .join(" ");
-    shell_output(
-        &command_text,
-        root,
-        timeout.unwrap_or(Duration::from_secs(120)),
-    )
+        .join(", ");
+    Ok(ToolOutput {
+        stdout: String::from_utf8_lossy(&stdout.preview).to_string(),
+        stderr: String::from_utf8_lossy(&stderr.preview).to_string(),
+        status: if cancelled {
+            ToolExitStatus::Cancelled
+        } else if exit_status.success() && !timed_out {
+            ToolExitStatus::Success
+        } else {
+            ToolExitStatus::Error
+        },
+        exit_code: exit_status.code(),
+        signal: exit_signal(exit_status),
+        duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        timed_out,
+        truncated: stdout.truncated || stderr.truncated,
+        artifact: (!artifact.is_empty()).then_some(artifact),
+    })
 }
 
-struct ReplacePatch<'a> {
-    path: &'a str,
-    find: &'a str,
-    replace: &'a str,
-}
-
-impl<'a> ReplacePatch<'a> {
-    fn parse(input: &'a str) -> Result<Self, ToolError> {
-        let Some((path, rest)) = input.split_once("\n---FIND---\n") else {
-            return Err(ToolError::new(
-                "apply_patch input must include ---FIND--- section",
-            ));
-        };
-        let Some((find, replace)) = rest.split_once("\n---REPLACE---\n") else {
-            return Err(ToolError::new(
-                "apply_patch input must include ---REPLACE--- section",
-            ));
-        };
-        Ok(Self {
-            path: path.trim(),
-            find,
-            replace,
-        })
+fn shell_command(allow_network: bool) -> Command {
+    #[cfg(target_os = "macos")]
+    if !allow_network {
+        let mut command = Command::new("sandbox-exec");
+        command
+            .arg("-p")
+            .arg("(version 1) (allow default) (deny network*)")
+            .arg("sh");
+        return command;
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = allow_network;
+    Command::new("sh")
+}
+
+#[derive(Clone)]
+struct OutputArtifact {
+    path: PathBuf,
+    reference: String,
+}
+
+struct ShellArtifacts {
+    stdout: OutputArtifact,
+    stderr: OutputArtifact,
+}
+
+struct CapturedOutput {
+    preview: Vec<u8>,
+    truncated: bool,
+    artifact: Option<String>,
+}
+
+fn output_artifacts(context: &ToolContext) -> Result<Option<ShellArtifacts>, ToolError> {
+    let (Some(dir), Some(stem)) = (&context.artifact_dir, &context.artifact_stem) else {
+        return Ok(None);
+    };
+    if stem.is_empty()
+        || !stem
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(ToolError::with_kind(
+            ToolErrorKind::InvalidInput,
+            "invalid artifact stem",
+        ));
+    }
+    Ok(Some(ShellArtifacts {
+        stdout: OutputArtifact {
+            path: dir.join(format!("{stem}.stdout.txt")),
+            reference: format!("artifacts/{stem}.stdout.txt"),
+        },
+        stderr: OutputArtifact {
+            path: dir.join(format!("{stem}.stderr.txt")),
+            reference: format!("artifacts/{stem}.stderr.txt"),
+        },
+    }))
+}
+
+fn read_limited(
+    mut reader: impl Read,
+    max_output_bytes: usize,
+    artifact: Option<OutputArtifact>,
+) -> Result<CapturedOutput, ToolError> {
+    let mut preview = Vec::with_capacity(max_output_bytes.min(8 * 1024));
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut truncated = false;
+    let mut artifact_writer: Option<File> = None;
+    let mut artifact_reference = None;
+    loop {
+        let read = reader.read(&mut buffer).map_err(|error| {
+            ToolError::with_kind(
+                ToolErrorKind::Io,
+                format!("failed to read shell output: {error}"),
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        let remaining = max_output_bytes.saturating_sub(preview.len());
+        let keep = read.min(remaining);
+        preview.extend_from_slice(&buffer[..keep]);
+        if let Some(writer) = artifact_writer.as_mut() {
+            writer.write_all(&buffer[..read]).map_err(|error| {
+                ToolError::with_kind(
+                    ToolErrorKind::Io,
+                    format!("failed to write shell output artifact: {error}"),
+                )
+            })?;
+        } else if keep < read {
+            truncated = true;
+            if let Some(artifact) = &artifact {
+                let mut writer = File::create(&artifact.path).map_err(|error| {
+                    ToolError::with_kind(
+                        ToolErrorKind::Io,
+                        format!("failed to create shell output artifact: {error}"),
+                    )
+                })?;
+                writer.write_all(&preview).map_err(|error| {
+                    ToolError::with_kind(
+                        ToolErrorKind::Io,
+                        format!("failed to write shell output artifact: {error}"),
+                    )
+                })?;
+                writer.write_all(&buffer[keep..read]).map_err(|error| {
+                    ToolError::with_kind(
+                        ToolErrorKind::Io,
+                        format!("failed to write shell output artifact: {error}"),
+                    )
+                })?;
+                artifact_reference = Some(artifact.reference.clone());
+                artifact_writer = Some(writer);
+            }
+        }
+    }
+    Ok(CapturedOutput {
+        preview,
+        truncated,
+        artifact: artifact_reference,
+    })
+}
+
+#[cfg(unix)]
+fn terminate_process_group(child: &mut Child) -> Result<(), ToolError> {
+    let process_group = -(child.id() as i32);
+    // SAFETY: the child was placed in its own process group before spawning.
+    let result = unsafe { libc::kill(process_group, libc::SIGKILL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(ToolError::with_kind(
+            ToolErrorKind::Io,
+            format!(
+                "failed to terminate shell process group: {}",
+                std::io::Error::last_os_error()
+            ),
+        ))
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(child: &mut Child) -> Result<(), ToolError> {
+    child.kill().map_err(|error| {
+        ToolError::with_kind(
+            ToolErrorKind::Io,
+            format!("failed to terminate shell process: {error}"),
+        )
+    })
+}
+
+#[cfg(unix)]
+fn exit_signal(status: ExitStatus) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal().map(|signal| signal.to_string())
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: ExitStatus) -> Option<String> {
+    None
 }
 
 fn visit_files(root: &Path, visit: &mut impl FnMut(&Path)) -> Result<(), ToolError> {
@@ -735,26 +926,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_registry_should_expose_new_protocol_names_and_legacy_aliases() {
+    fn builtin_registry_should_expose_only_canonical_protocol_names() {
+        let registry = builtin_registry().unwrap();
+        let names = registry.names().collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec!["Bash", "Edit", "Glob", "Grep", "ListFiles", "Read", "Write"]
+        );
+    }
+
+    #[test]
+    fn builtin_registry_should_expose_json_schema_objects() {
         let registry = builtin_registry().unwrap();
 
-        for name in [
-            "Read",
-            "Edit",
-            "Write",
-            "Glob",
-            "Grep",
-            "ListFiles",
-            "Bash",
-            "read_file",
-            "apply_patch",
-            "write_file",
-            "search",
-            "shell",
-            "git_diff",
-            "run_tests",
-        ] {
-            assert!(registry.get(name).is_some(), "missing tool {name}");
+        for descriptor in registry.descriptors() {
+            assert!(descriptor.parameters.is_object(), "{}", descriptor.name);
         }
     }
 
@@ -762,43 +949,36 @@ mod tests {
     fn v1_tool_risks_should_match_protocol() {
         let registry = builtin_registry().unwrap();
         let cases = [
-            ("Read", "src/lib.rs", ToolRisk::Read),
+            ("Read", json!({"path": "src/lib.rs"}), ToolRisk::Read),
             (
                 "Edit",
-                "src/lib.rs\n---FIND---\na\n---REPLACE---\nb",
+                json!({"path": "src/lib.rs", "find": "a", "replace": "b"}),
                 ToolRisk::Write,
             ),
-            ("Write", "src/lib.rs\n---CONTENT---\n", ToolRisk::Write),
-            ("Glob", "**/*.rs", ToolRisk::Read),
-            ("Grep", "answer", ToolRisk::Read),
-            ("ListFiles", ".", ToolRisk::Read),
-            ("Bash", "cargo test", ToolRisk::Execute),
-            ("Bash", "rm -rf target", ToolRisk::Destructive),
+            (
+                "Write",
+                json!({"path": "src/lib.rs", "content": ""}),
+                ToolRisk::Write,
+            ),
+            ("Glob", json!({"pattern": "**/*.rs"}), ToolRisk::Read),
+            ("Grep", json!({"pattern": "answer"}), ToolRisk::Read),
+            ("ListFiles", json!({"path": "."}), ToolRisk::Read),
+            ("Bash", json!({"command": "cargo test"}), ToolRisk::Read),
+            (
+                "Bash",
+                json!({"command": "rm -rf target"}),
+                ToolRisk::Destructive,
+            ),
         ];
 
         for (name, input, expected) in cases {
             let tool = registry.get(name).unwrap();
-            assert_eq!(tool.risk(input), expected, "wrong risk for {name}");
+            assert_eq!(
+                tool.risk(&input).unwrap(),
+                expected,
+                "wrong risk for {name}"
+            );
         }
-    }
-
-    #[test]
-    fn search_should_find_workspace_files() {
-        let root = temp_dir("search");
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("src/lib.rs"), "pub fn ok() {}").unwrap();
-        let tool = SearchTool;
-
-        let output = tool
-            .call(
-                "lib",
-                &ToolContext {
-                    workspace_root: root,
-                },
-            )
-            .unwrap();
-
-        assert!(output.stdout.contains("src/lib.rs"));
     }
 
     #[test]
@@ -808,9 +988,28 @@ mod tests {
         fs::write(root.join("src/lib.rs"), "pub fn ok() {}").unwrap();
         let tool = ReadTool;
 
-        let output = tool.call("src/lib.rs", &context(root)).unwrap();
+        let output = tool
+            .call(json!({"path": "src/lib.rs"}), &context(root))
+            .unwrap();
 
         assert_eq!(output.stdout, "pub fn ok() {}");
+    }
+
+    #[test]
+    fn read_should_read_line_range() {
+        let root = temp_dir("read_range");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "one\ntwo\nthree\n").unwrap();
+        let tool = ReadTool;
+
+        let output = tool
+            .call(
+                json!({"path": "src/lib.rs", "start_line": 2, "end_line": 3}),
+                &context(root),
+            )
+            .unwrap();
+
+        assert_eq!(output.stdout, "two\nthree");
     }
 
     #[test]
@@ -819,9 +1018,27 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let tool = ReadTool;
 
-        let error = tool.call("missing.rs", &context(root)).unwrap_err();
+        let error = tool
+            .call(json!({"path": "missing.rs"}), &context(root))
+            .unwrap_err();
 
         assert!(error.message.contains("invalid path"));
+    }
+
+    #[test]
+    fn read_should_reject_workspace_escape() {
+        let root = temp_dir("read_escape");
+        fs::create_dir_all(&root).unwrap();
+        let outside = temp_dir("outside");
+        fs::write(&outside, "secret").unwrap();
+        let tool = ReadTool;
+
+        let error = tool
+            .call(json!({"path": outside.to_str().unwrap()}), &context(root))
+            .unwrap_err();
+
+        assert_eq!(error.message, "path escapes workspace");
+        assert_eq!(error.kind, ToolErrorKind::PermissionDenied);
     }
 
     #[test]
@@ -831,20 +1048,9 @@ mod tests {
         fs::write(root.join("Cargo.toml"), "").unwrap();
         let tool = ListFilesTool;
 
-        let output = tool.call(".", &context(root)).unwrap();
+        let output = tool.call(json!({"path": "."}), &context(root)).unwrap();
 
         assert!(output.stdout.contains("src/"));
-    }
-
-    #[test]
-    fn list_files_should_report_missing_directory() {
-        let root = temp_dir("list_files_missing");
-        fs::create_dir_all(&root).unwrap();
-        let tool = ListFilesTool;
-
-        let error = tool.call("missing", &context(root)).unwrap_err();
-
-        assert!(error.message.contains("invalid path"));
     }
 
     #[test]
@@ -854,19 +1060,11 @@ mod tests {
         fs::write(root.join("src/lib.rs"), "").unwrap();
         let tool = GlobTool;
 
-        let output = tool.call("**/*.rs", &context(root)).unwrap();
+        let output = tool
+            .call(json!({"pattern": "**/*.rs"}), &context(root))
+            .unwrap();
 
         assert!(output.stdout.contains("src/lib.rs"));
-    }
-
-    #[test]
-    fn glob_should_report_invalid_workspace_root() {
-        let root = temp_dir("glob_missing_root");
-        let tool = GlobTool;
-
-        let error = tool.call("**/*.rs", &context(root)).unwrap_err();
-
-        assert!(error.message.contains("failed to read dir"));
     }
 
     #[test]
@@ -876,51 +1074,11 @@ mod tests {
         fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 42 }").unwrap();
         let tool = GrepTool;
 
-        let output = tool.call("answer", &context(root)).unwrap();
-
-        assert!(output.stdout.contains("src/lib.rs:1"));
-    }
-
-    #[test]
-    fn grep_should_report_invalid_workspace_root() {
-        let root = temp_dir("grep_missing_root");
-        let tool = GrepTool;
-
-        let error = tool.call("answer", &context(root)).unwrap_err();
-
-        assert!(error.message.contains("failed to read dir"));
-    }
-
-    #[test]
-    fn read_file_should_reject_workspace_escape() {
-        let root = temp_dir("read_escape");
-        fs::create_dir_all(&root).unwrap();
-        let outside = temp_dir("outside");
-        fs::write(&outside, "secret").unwrap();
-        let tool = ReadFileTool;
-
-        let error = tool
-            .call(outside.to_str().unwrap(), &context(root))
-            .unwrap_err();
-
-        assert_eq!(error.message, "path escapes workspace");
-    }
-
-    #[test]
-    fn apply_patch_should_replace_text_inside_workspace() {
-        let root = temp_dir("apply_patch");
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 41 }\n").unwrap();
-        let tool = ApplyPatchTool;
-
         let output = tool
-            .call(
-                "src/lib.rs\n---FIND---\n41\n---REPLACE---\n42",
-                &context(root),
-            )
+            .call(json!({"pattern": "answer"}), &context(root))
             .unwrap();
 
-        assert!(output.stdout.contains("patched src/lib.rs"));
+        assert!(output.stdout.contains("src/lib.rs:1"));
     }
 
     #[test]
@@ -932,7 +1090,7 @@ mod tests {
 
         let output = tool
             .call(
-                "src/lib.rs\n---FIND---\n41\n---REPLACE---\n42",
+                json!({"path": "src/lib.rs", "find": "41", "replace": "42"}),
                 &context(root),
             )
             .unwrap();
@@ -949,12 +1107,13 @@ mod tests {
 
         let error = tool
             .call(
-                "src/lib.rs\n---FIND---\n41\n---REPLACE---\n42",
+                json!({"path": "src/lib.rs", "find": "41", "replace": "42"}),
                 &context(root),
             )
             .unwrap_err();
 
-        assert_eq!(error.message, "apply_patch failed: find text not found");
+        assert_eq!(error.message, "edit failed: find text not found");
+        assert_eq!(error.kind, ToolErrorKind::InvalidInput);
     }
 
     #[test]
@@ -965,29 +1124,12 @@ mod tests {
 
         let error = tool
             .call(
-                "../outside.rs\n---FIND---\nold\n---REPLACE---\nnew",
+                json!({"path": "../outside.rs", "find": "old", "replace": "new"}),
                 &context(root),
             )
             .unwrap_err();
 
         assert_eq!(error.message, "path escapes workspace");
-    }
-
-    #[test]
-    fn apply_patch_should_report_find_text_missing() {
-        let root = temp_dir("apply_patch_missing");
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 42 }\n").unwrap();
-        let tool = ApplyPatchTool;
-
-        let error = tool
-            .call(
-                "src/lib.rs\n---FIND---\n41\n---REPLACE---\n42",
-                &context(root),
-            )
-            .unwrap_err();
-
-        assert_eq!(error.message, "apply_patch failed: find text not found");
     }
 
     #[test]
@@ -998,7 +1140,7 @@ mod tests {
 
         let output = tool
             .call(
-                "src/lib.rs\n---CONTENT---\npub fn ok() {}",
+                json!({"path": "src/lib.rs", "content": "pub fn ok() {}"}),
                 &context(root.clone()),
             )
             .unwrap();
@@ -1011,54 +1153,36 @@ mod tests {
     }
 
     #[test]
-    fn write_should_report_invalid_input_shape() {
-        let root = temp_dir("write_invalid");
+    fn write_should_reject_parent_dir_escape() {
+        let root = temp_dir("write_escape_parent");
         fs::create_dir_all(&root).unwrap();
         let tool = WriteTool;
 
-        let error = tool.call("src/lib.rs", &context(root)).unwrap_err();
-
-        assert!(error.message.contains("write_file input must be"));
-    }
-
-    #[test]
-    fn write_file_should_reject_parent_dir_escape() {
-        let root = temp_dir("write_escape_parent");
-        fs::create_dir_all(&root).unwrap();
-        let tool = WriteFileTool;
-
         let error = tool
-            .call("../outside.txt\n---CONTENT---\nnope", &context(root))
+            .call(
+                json!({"path": "../outside.txt", "content": "nope"}),
+                &context(root),
+            )
             .unwrap_err();
 
         assert_eq!(error.message, "path escapes workspace");
     }
 
     #[test]
-    fn write_file_should_reject_symlink_escape() {
+    fn write_should_reject_symlink_escape() {
         let root = temp_dir("write_escape_symlink");
         let outside = temp_dir("outside_dir");
         fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(&outside).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
-        let tool = WriteFileTool;
+        let tool = WriteTool;
 
         let error = tool
-            .call("link/outside.txt\n---CONTENT---\nnope", &context(root))
-            .unwrap_err();
-
-        assert_eq!(error.message, "path escapes workspace");
-    }
-
-    #[test]
-    fn write_file_should_reject_absolute_escape() {
-        let root = temp_dir("write_escape_absolute");
-        fs::create_dir_all(&root).unwrap();
-        let tool = WriteFileTool;
-
-        let error = tool
-            .call("/tmp/outside.txt\n---CONTENT---\nnope", &context(root))
+            .call(
+                json!({"path": "link/outside.txt", "content": "nope"}),
+                &context(root),
+            )
             .unwrap_err();
 
         assert_eq!(error.message, "path escapes workspace");
@@ -1070,9 +1194,13 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let tool = BashTool {
             timeout: Duration::from_secs(1),
+            allow_network: true,
+            ..BashTool::default()
         };
 
-        let output = tool.call("printf ok", &context(root)).unwrap();
+        let output = tool
+            .call(json!({"command": "printf ok"}), &context(root))
+            .unwrap();
 
         assert_eq!(output.stdout, "ok");
     }
@@ -1083,10 +1211,15 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let tool = BashTool {
             timeout: Duration::from_secs(1),
+            allow_network: true,
+            ..BashTool::default()
         };
 
         let output = tool
-            .call("printf nope >&2; exit 7", &context(root))
+            .call(
+                json!({"command": "printf nope >&2; exit 7"}),
+                &context(root),
+            )
             .unwrap();
 
         assert_eq!(output.status, ToolExitStatus::Error);
@@ -1096,37 +1229,133 @@ mod tests {
     fn bash_risk_should_classify_destructive_commands() {
         let tool = BashTool::default();
 
-        assert_eq!(tool.risk("rm -rf target"), ToolRisk::Destructive);
+        assert_eq!(
+            tool.risk(&json!({"command": "rm -rf target"})).unwrap(),
+            ToolRisk::Destructive
+        );
     }
 
     #[test]
-    fn shell_should_return_error_on_timeout() {
+    fn bash_should_return_error_on_timeout() {
         let root = temp_dir("shell_timeout");
         fs::create_dir_all(&root).unwrap();
-        let tool = ShellTool {
+        let tool = BashTool {
             timeout: Duration::from_millis(1),
+            allow_network: true,
+            ..BashTool::default()
         };
 
-        let output = tool.call("sleep 1", &context(root)).unwrap();
+        let output = tool
+            .call(json!({"command": "sleep 1"}), &context(root))
+            .unwrap();
 
         assert_eq!(output.status, ToolExitStatus::Error);
     }
 
     #[test]
-    fn run_tests_should_preserve_failure_output() {
-        let root = temp_dir("run_tests_failure");
+    fn bash_should_drain_large_output_without_deadlock() {
+        let root = temp_dir("bash_large_output");
         fs::create_dir_all(&root).unwrap();
-        let tool = RunTestsTool::default();
+        let artifact_dir = root.join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let tool = BashTool {
+            timeout: Duration::from_secs(5),
+            max_output_bytes: 1_024,
+            allow_network: true,
+        };
+        let mut context = context(root);
+        context.artifact_dir = Some(artifact_dir.clone());
+        context.artifact_stem = Some("call_large".to_string());
 
         let output = tool
-            .call("printf failure >&2; exit 1", &context(root))
+            .call(json!({"command": "yes x | head -c 300000"}), &context)
             .unwrap();
 
-        assert!(output.stderr.contains("failure"));
+        assert_eq!(output.stdout.len(), 1_024);
+        assert!(output.truncated);
+        assert_eq!(
+            output.artifact.as_deref(),
+            Some("artifacts/call_large.stdout.txt")
+        );
+        assert_eq!(
+            fs::metadata(artifact_dir.join("call_large.stdout.txt"))
+                .unwrap()
+                .len(),
+            300_000
+        );
+    }
+
+    #[test]
+    fn bash_should_cancel_running_process_group() {
+        let root = temp_dir("bash_cancel");
+        fs::create_dir_all(&root).unwrap();
+        let tool = BashTool {
+            timeout: Duration::from_secs(10),
+            allow_network: true,
+            ..BashTool::default()
+        };
+        let context = context(root);
+        let cancellation = context.cancellation.clone();
+        let cancel_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            cancellation.cancel();
+        });
+
+        let output = tool.call(json!({"command": "sleep 30"}), &context).unwrap();
+        cancel_thread.join().unwrap();
+
+        assert_eq!(output.status, ToolExitStatus::Cancelled);
+        assert!(output.duration_ms < 2_000);
+    }
+
+    #[test]
+    fn bash_should_deny_network_command_when_network_is_disabled() {
+        let root = temp_dir("bash_network_disabled");
+        fs::create_dir_all(&root).unwrap();
+        let tool = BashTool::default();
+
+        let error = tool
+            .call(
+                json!({"command": "curl https://example.com"}),
+                &context(root),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind, ToolErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn bash_risk_should_require_approval_for_unrecognized_command() {
+        let tool = BashTool::default();
+
+        let risk = tool.risk(&json!({"command": "python script.py"})).unwrap();
+
+        assert_eq!(risk, ToolRisk::Destructive);
+    }
+
+    #[test]
+    fn bash_should_deny_interpreter_indirection_when_network_is_disabled() {
+        let root = temp_dir("bash_interpreter_network_disabled");
+        fs::create_dir_all(&root).unwrap();
+        let tool = BashTool::default();
+
+        let error = tool
+            .call(
+                json!({"command": "python -c 'import urllib.request'"}),
+                &context(root),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind, ToolErrorKind::PermissionDenied);
     }
 
     fn context(workspace_root: PathBuf) -> ToolContext {
-        ToolContext { workspace_root }
+        ToolContext {
+            workspace_root,
+            cancellation: CancellationToken::new(),
+            artifact_dir: None,
+            artifact_stem: None,
+        }
     }
 
     fn temp_dir(name: &str) -> PathBuf {

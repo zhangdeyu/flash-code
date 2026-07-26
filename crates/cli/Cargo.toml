@@ -18,7 +18,7 @@ flash-eval = { path = "../eval" }
 flash-provider = { path = "../provider" }
 flash-tui = { path = "../tui" }
 flash-tools = { path = "../tools" }
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "sync"] }
 
 [lints]
 workspace = true

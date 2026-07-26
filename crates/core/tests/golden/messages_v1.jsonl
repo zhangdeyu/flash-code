@@ -1,3 +1,3 @@
 {"version":"1","message":{"id":"<message_id>","role":"user","created_at":"<timestamp>","content":[{"type":"text","text":"hello \"world\""}]}}
-{"version":"1","message":{"id":"<message_id>","role":"assistant","created_at":"<timestamp>","content":[{"type":"text","text":"I will read"},{"type":"tool_use","call_id":"call_1","name":"Read","input":"src/lib.rs"}]}}
+{"version":"1","message":{"id":"<message_id>","role":"assistant","created_at":"<timestamp>","content":[{"type":"text","text":"I will read"},{"type":"tool_use","call_id":"call_1","name":"Read","input":{"path":"src/lib.rs"}}]}}
 {"version":"1","message":{"id":"<message_id>","role":"tool","created_at":"<timestamp>","content":[{"type":"tool_result","call_id":"call_1","status":"success"},{"type":"text","text":"done"}]}}

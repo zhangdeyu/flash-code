@@ -17,7 +17,7 @@ Current default behavior:
 - `flash eval terminal-bench --subset smoke`: runs the locked Terminal-Bench smoke adapter.
 - `flash eval swe-bench --subset verified --limit 10`: runs the locked SWE-bench Verified smoke adapter.
 - `flash eval regression`: runs the fixed smoke regression suite and writes a trend report.
-- `flash resume <session_id>`: validates the current workspace before resuming.
+- `flash replay <session_id>`: replays a finished session in the current workspace.
 
 Current planning document:
 

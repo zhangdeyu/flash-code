@@ -1,32 +1,25 @@
 use async_trait::async_trait;
-use flash_core::Message;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelCapabilities {
-    pub supports_reasoning: bool,
-    pub supports_tool_calls: bool,
-    pub requires_reasoning_for_tool_turns: bool,
-    pub supports_json_mode: bool,
-    pub supports_prompt_cache_metrics: bool,
-    pub max_context_tokens: u32,
-    pub max_output_tokens: u32,
-}
-
-pub trait Provider {
-    fn name(&self) -> &str;
-
-    fn capabilities(&self) -> &ModelCapabilities;
-}
+use flash_core::{CancellationToken, Message};
+use serde_json::Value;
 
 #[async_trait(?Send)]
 pub trait ChatProvider {
-    /// Send a chat request and emit events via `on_event` as they arrive.
-    /// The callback is called for each `ProviderEvent` in streaming order.
+    /// Send a chat request and emit events through the bounded channel in streaming order.
     async fn chat(
         &mut self,
         request: ChatRequest,
-        on_event: &mut dyn FnMut(ProviderEvent),
+        events: tokio::sync::mpsc::Sender<ProviderEvent>,
     ) -> Result<(), ProviderError>;
+}
+
+pub async fn send_event(
+    events: &tokio::sync::mpsc::Sender<ProviderEvent>,
+    event: ProviderEvent,
+) -> Result<(), ProviderError> {
+    events
+        .send(event)
+        .await
+        .map_err(|_| ProviderError::Cancelled("provider event consumer closed".to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +27,7 @@ pub struct ChatRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
     pub model: String,
+    pub cancellation: CancellationToken,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,9 +35,8 @@ pub struct ToolSpec {
     pub name: String,
     /// Short description of what the tool does, used in the model's function-calling prompt.
     pub description: String,
-    /// JSON Schema string describing the tool's input parameters.
-    /// Format: `{"type":"object","properties":{...},"required":[...]}`
-    pub parameters: String,
+    /// JSON Schema object describing the tool's input parameters.
+    pub parameters: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +52,7 @@ pub enum ProviderEvent {
 pub struct ToolCall {
     pub call_id: String,
     pub name: String,
-    pub input: String,
+    pub input: Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,11 +61,15 @@ pub struct Usage {
     pub output_tokens: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopReason {
     EndTurn,
     ToolUse,
     MaxTokens,
+    StopSequence,
+    Refusal,
+    Cancelled,
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,12 +79,17 @@ pub enum ProviderError {
     RateLimited(String),
     Server(String),
     InvalidRequest(String),
+    Cancelled(String),
     Unrecoverable(String),
 }
 
 impl ProviderError {
     pub const fn is_retryable(&self) -> bool {
         matches!(self, Self::RateLimited(_) | Self::Server(_))
+    }
+
+    pub const fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled(_))
     }
 }
 
@@ -99,6 +101,7 @@ impl std::fmt::Display for ProviderError {
             | Self::RateLimited(message)
             | Self::Server(message)
             | Self::InvalidRequest(message)
+            | Self::Cancelled(message)
             | Self::Unrecoverable(message) => write!(formatter, "{message}"),
         }
     }
@@ -110,20 +113,6 @@ impl std::error::Error for ProviderError {}
 mod tests {
     use super::*;
 
-    struct FakeProvider {
-        capabilities: ModelCapabilities,
-    }
-
-    impl Provider for FakeProvider {
-        fn name(&self) -> &str {
-            "fake"
-        }
-
-        fn capabilities(&self) -> &ModelCapabilities {
-            &self.capabilities
-        }
-    }
-
     struct EchoProvider;
 
     #[async_trait(?Send)]
@@ -131,46 +120,34 @@ mod tests {
         async fn chat(
             &mut self,
             _request: ChatRequest,
-            on_event: &mut dyn FnMut(ProviderEvent),
+            events: tokio::sync::mpsc::Sender<ProviderEvent>,
         ) -> Result<(), ProviderError> {
-            on_event(ProviderEvent::TextDelta("hello".to_string()));
-            on_event(ProviderEvent::Done(StopReason::EndTurn));
+            send_event(&events, ProviderEvent::TextDelta("hello".to_string())).await?;
+            send_event(&events, ProviderEvent::Done(StopReason::EndTurn)).await?;
             Ok(())
         }
     }
 
-    #[test]
-    fn provider_should_expose_capabilities() {
-        let provider = FakeProvider {
-            capabilities: ModelCapabilities {
-                supports_reasoning: true,
-                supports_tool_calls: true,
-                requires_reasoning_for_tool_turns: true,
-                supports_json_mode: false,
-                supports_prompt_cache_metrics: true,
-                max_context_tokens: 64_000,
-                max_output_tokens: 8_000,
-            },
-        };
-
-        assert!(provider.capabilities().supports_tool_calls);
-    }
-
     #[tokio::test]
-    async fn chat_provider_should_emit_events_via_callback() {
+    async fn chat_provider_should_emit_events_via_channel() {
         let mut provider = EchoProvider;
-        let mut events = Vec::new();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
         provider
             .chat(
                 ChatRequest {
                     messages: Vec::new(),
                     tools: Vec::new(),
                     model: "test".to_string(),
+                    cancellation: CancellationToken::new(),
                 },
-                &mut |event| events.push(event),
+                sender,
             )
             .await
             .unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            events.push(event);
+        }
         assert_eq!(events.len(), 2);
     }
 }

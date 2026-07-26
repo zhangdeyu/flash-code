@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use flash_core::{ContentBlock, Message, Role};
 use flash_provider::{
-    ChatProvider, ChatRequest, ProviderError, ProviderEvent, StopReason, ToolCall, ToolSpec, Usage,
+    send_event, ChatProvider, ChatRequest, ProviderError, ProviderEvent, StopReason, ToolCall,
+    ToolSpec, Usage,
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -58,36 +59,54 @@ impl ChatProvider for DeepSeekProvider {
     async fn chat(
         &mut self,
         request: ChatRequest,
-        on_event: &mut dyn FnMut(ProviderEvent),
+        events: tokio::sync::mpsc::Sender<ProviderEvent>,
     ) -> Result<(), ProviderError> {
-        let response = self.post_chat(build_request_body(&request)?).await?;
-        let mut buffer = String::new();
-        let mut parser = SseParser::default();
+        let body = build_request_body(&request)?;
+        let response = tokio::select! {
+            () = request.cancellation.cancelled() => {
+                return Err(ProviderError::Cancelled("DeepSeek request cancelled".to_string()));
+            }
+            result = self.post_chat(body) => result?,
+        };
+        let mut decoder = SseDecoder::default();
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let chunk = tokio::select! {
+                () = request.cancellation.cancelled() => {
+                    return Err(ProviderError::Cancelled("DeepSeek stream cancelled".to_string()));
+                }
+                chunk = stream.next() => chunk,
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
             let chunk = chunk.map_err(map_reqwest_error)?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(line_end) = buffer.find('\n') {
-                let line = buffer[..line_end].trim_end_matches('\r').to_string();
-                buffer = buffer[line_end + 1..].to_string();
-                parser.push_line(&line, on_event)?;
+            let mut decoded = Vec::new();
+            decoder.push_bytes(&chunk, &mut |event| decoded.push(event))?;
+            for event in decoded {
+                send_event(&events, event).await?;
             }
         }
-        if !buffer.is_empty() {
-            parser.push_line(buffer.trim_end_matches('\r'), on_event)?;
+        let mut decoded = Vec::new();
+        decoder.finish(&mut |event| decoded.push(event))?;
+        for event in decoded {
+            send_event(&events, event).await?;
         }
         Ok(())
     }
 }
 
 pub fn parse_sse(input: &str) -> Result<Vec<ProviderEvent>, DeepSeekParseError> {
+    parse_sse_chunks(&[input.as_bytes()])
+}
+
+pub fn parse_sse_chunks(chunks: &[&[u8]]) -> Result<Vec<ProviderEvent>, DeepSeekParseError> {
     let mut events = Vec::new();
-    let mut parser = SseParser::default();
-    for raw_line in input.lines() {
-        parser.push_line(raw_line.trim_end_matches('\r'), &mut |event| {
-            events.push(event)
-        })?;
+    let mut decoder = SseDecoder::default();
+    for chunk in chunks {
+        decoder.push_bytes(chunk, &mut |event| events.push(event))?;
     }
+    decoder.finish(&mut |event| events.push(event))?;
     Ok(events)
 }
 
@@ -109,15 +128,36 @@ pub fn map_error(status: u16, body: &str) -> ProviderError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeepSeekParseError {
+    Utf8(String),
     Json(String),
+    ToolArguments(String),
     InvalidNumber(String),
+    MissingFinishReason,
+    PendingToolCalls,
+    UnknownFinishReason(String),
 }
 
 impl std::fmt::Display for DeepSeekParseError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Utf8(message) => write!(formatter, "invalid UTF-8 in DeepSeek SSE: {message}"),
             Self::Json(message) => write!(formatter, "invalid DeepSeek SSE JSON: {message}"),
+            Self::ToolArguments(message) => {
+                write!(formatter, "invalid DeepSeek tool arguments JSON: {message}")
+            }
             Self::InvalidNumber(value) => write!(formatter, "invalid number `{value}`"),
+            Self::MissingFinishReason => {
+                write!(
+                    formatter,
+                    "DeepSeek SSE ended without an explicit finish reason"
+                )
+            }
+            Self::PendingToolCalls => {
+                write!(formatter, "DeepSeek SSE ended with incomplete tool calls")
+            }
+            Self::UnknownFinishReason(reason) => {
+                write!(formatter, "unknown DeepSeek finish reason `{reason}`")
+            }
         }
     }
 }
@@ -131,25 +171,97 @@ impl From<DeepSeekParseError> for ProviderError {
 }
 
 #[derive(Debug, Default)]
+struct SseDecoder {
+    buffer: Vec<u8>,
+    data_lines: Vec<String>,
+    parser: SseParser,
+}
+
+impl SseDecoder {
+    fn push_bytes(
+        &mut self,
+        bytes: &[u8],
+        on_event: &mut dyn FnMut(ProviderEvent),
+    ) -> Result<(), DeepSeekParseError> {
+        self.buffer.extend_from_slice(bytes);
+        while let Some(line_end) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let mut line = self.buffer.drain(..=line_end).collect::<Vec<_>>();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            self.push_line(&line, on_event)?;
+        }
+        Ok(())
+    }
+
+    fn finish(
+        &mut self,
+        on_event: &mut dyn FnMut(ProviderEvent),
+    ) -> Result<(), DeepSeekParseError> {
+        if !self.buffer.is_empty() {
+            let mut line = std::mem::take(&mut self.buffer);
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            self.push_line(&line, on_event)?;
+        }
+        self.flush_data(on_event)?;
+        self.parser.finish()
+    }
+
+    fn push_line(
+        &mut self,
+        bytes: &[u8],
+        on_event: &mut dyn FnMut(ProviderEvent),
+    ) -> Result<(), DeepSeekParseError> {
+        let line = std::str::from_utf8(bytes)
+            .map_err(|error| DeepSeekParseError::Utf8(error.to_string()))?;
+        if line.is_empty() {
+            return self.flush_data(on_event);
+        }
+        if line.starts_with(':') {
+            return Ok(());
+        }
+        let Some(value) = line.strip_prefix("data:") else {
+            return Ok(());
+        };
+        self.data_lines
+            .push(value.strip_prefix(' ').unwrap_or(value).to_string());
+
+        let data = self.data_lines.join("\n");
+        if data == "[DONE]" || serde_json::from_str::<serde_json::Value>(&data).is_ok() {
+            self.flush_data(on_event)?;
+        }
+        Ok(())
+    }
+
+    fn flush_data(
+        &mut self,
+        on_event: &mut dyn FnMut(ProviderEvent),
+    ) -> Result<(), DeepSeekParseError> {
+        if self.data_lines.is_empty() {
+            return Ok(());
+        }
+        let data = std::mem::take(&mut self.data_lines).join("\n");
+        self.parser.push_data(&data, on_event)
+    }
+}
+
+#[derive(Debug, Default)]
 struct SseParser {
     tool_calls: BTreeMap<u64, ToolCallBuilder>,
     done_emitted: bool,
 }
 
 impl SseParser {
-    fn push_line(
+    fn push_data(
         &mut self,
-        raw_line: &str,
+        data: &str,
         on_event: &mut dyn FnMut(ProviderEvent),
     ) -> Result<(), DeepSeekParseError> {
-        let line = raw_line.trim();
-        if line.is_empty() || !line.starts_with("data:") {
-            return Ok(());
-        }
-        let data = line.trim_start_matches("data:").trim();
         if data == "[DONE]" {
-            self.emit_done_once(StopReason::EndTurn, on_event);
-            return Ok(());
+            return self.finish();
         }
         let chunk: StreamChunk = serde_json::from_str(data)
             .map_err(|error| DeepSeekParseError::Json(error.to_string()))?;
@@ -188,24 +300,38 @@ impl SseParser {
             if let Some(reason) = choice.finish_reason {
                 match reason.as_str() {
                     "tool_calls" => {
-                        self.flush_tool_calls(on_event);
+                        self.flush_tool_calls(on_event)?;
                         self.emit_done_once(StopReason::ToolUse, on_event);
                     }
                     "length" => self.emit_done_once(StopReason::MaxTokens, on_event),
                     "stop" => self.emit_done_once(StopReason::EndTurn, on_event),
-                    _ => {}
+                    _ => return Err(DeepSeekParseError::UnknownFinishReason(reason)),
                 }
             }
         }
         Ok(())
     }
 
-    fn flush_tool_calls(&mut self, on_event: &mut dyn FnMut(ProviderEvent)) {
+    fn finish(&self) -> Result<(), DeepSeekParseError> {
+        if !self.tool_calls.is_empty() {
+            return Err(DeepSeekParseError::PendingToolCalls);
+        }
+        if !self.done_emitted {
+            return Err(DeepSeekParseError::MissingFinishReason);
+        }
+        Ok(())
+    }
+
+    fn flush_tool_calls(
+        &mut self,
+        on_event: &mut dyn FnMut(ProviderEvent),
+    ) -> Result<(), DeepSeekParseError> {
         for (_, builder) in std::mem::take(&mut self.tool_calls) {
-            if let Some(call) = builder.build() {
+            if let Some(call) = builder.build()? {
                 on_event(ProviderEvent::ToolCallComplete(call));
             }
         }
+        Ok(())
     }
 
     fn emit_done_once(&mut self, reason: StopReason, on_event: &mut dyn FnMut(ProviderEvent)) {
@@ -224,19 +350,21 @@ struct ToolCallBuilder {
 }
 
 impl ToolCallBuilder {
-    fn build(self) -> Option<ToolCall> {
+    fn build(self) -> Result<Option<ToolCall>, DeepSeekParseError> {
         if self.name.is_empty() {
-            return None;
+            return Ok(None);
         }
-        Some(ToolCall {
+        let input = serde_json::from_str(&self.input)
+            .map_err(|error| DeepSeekParseError::ToolArguments(error.to_string()))?;
+        Ok(Some(ToolCall {
             call_id: if self.call_id.is_empty() {
                 "call_deepseek".to_string()
             } else {
                 self.call_id
             },
             name: self.name,
-            input: self.input,
-        })
+            input,
+        }))
     }
 }
 
@@ -295,6 +423,8 @@ struct DeepSeekMessage {
     role: &'static str,
     content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<DeepSeekAssistantToolCall>,
@@ -349,13 +479,13 @@ fn convert_message(message: &Message) -> DeepSeekMessage {
         Role::Tool => "tool",
     };
     let mut content = Vec::new();
+    let mut reasoning = Vec::new();
     let mut tool_call_id = None;
     let mut tool_calls = Vec::new();
     for block in &message.content {
         match block {
-            ContentBlock::Text { text } | ContentBlock::Reasoning { text } => {
-                content.push(text.clone());
-            }
+            ContentBlock::Text { text } => content.push(text.clone()),
+            ContentBlock::Reasoning { text } => reasoning.push(text.clone()),
             ContentBlock::ToolUse {
                 call_id,
                 name,
@@ -365,7 +495,7 @@ fn convert_message(message: &Message) -> DeepSeekMessage {
                 kind: "function",
                 function: DeepSeekAssistantToolFunction {
                     name: name.clone(),
-                    arguments: input.clone(),
+                    arguments: input.to_string(),
                 },
             }),
             ContentBlock::ToolResult { call_id, status } => {
@@ -377,24 +507,19 @@ fn convert_message(message: &Message) -> DeepSeekMessage {
     DeepSeekMessage {
         role,
         content: content.join("\n"),
+        reasoning_content: (!reasoning.is_empty()).then(|| reasoning.join("\n")),
         tool_call_id,
         tool_calls,
     }
 }
 
 fn convert_tool(tool: &ToolSpec) -> Result<DeepSeekTool, ProviderError> {
-    let parameters = serde_json::from_str(&tool.parameters).map_err(|error| {
-        ProviderError::InvalidRequest(format!(
-            "invalid JSON schema for tool `{}`: {error}",
-            tool.name
-        ))
-    })?;
     Ok(DeepSeekTool {
         kind: "function",
         function: DeepSeekToolFunction {
             name: tool.name.clone(),
             description: tool.description.clone(),
-            parameters,
+            parameters: tool.parameters.clone(),
         },
     })
 }
@@ -427,9 +552,9 @@ mod tests {
             tools: vec![ToolSpec {
                 name: "Read".to_string(),
                 description: "read a file".to_string(),
-                parameters: r#"{"type":"object","properties":{"path":{"type":"string"}}}"#
-                    .to_string(),
+                parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
             }],
+            cancellation: flash_core::CancellationToken::new(),
         };
 
         let body = serde_json::to_value(build_request_body(&request).unwrap()).unwrap();
@@ -439,6 +564,37 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn request_body_should_advertise_exactly_seven_canonical_builtin_tools() {
+        let registry = flash_tools::builtin_registry().unwrap();
+        let request = ChatRequest {
+            model: "deepseek-chat".to_string(),
+            messages: Vec::new(),
+            tools: registry
+                .descriptors()
+                .map(|descriptor| ToolSpec {
+                    name: descriptor.name,
+                    description: descriptor.description,
+                    parameters: descriptor.parameters,
+                })
+                .collect(),
+            cancellation: flash_core::CancellationToken::new(),
+        };
+
+        let body = serde_json::to_value(build_request_body(&request).unwrap()).unwrap();
+        let names = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec!["Bash", "Edit", "Glob", "Grep", "ListFiles", "Read", "Write"]
+        );
     }
 
     #[test]
@@ -465,7 +621,7 @@ mod tests {
                 ProviderEvent::ToolCallComplete(ToolCall {
                     call_id: "call_1".to_string(),
                     name: "Read".to_string(),
-                    input: "{\"path\":\"src/lib.rs\"}".to_string(),
+                    input: serde_json::json!({"path": "src/lib.rs"}),
                 }),
                 ProviderEvent::Done(StopReason::ToolUse),
             ]
@@ -479,6 +635,86 @@ mod tests {
         let events = parse_sse(sse).unwrap();
 
         assert_eq!(events, vec![ProviderEvent::Done(StopReason::MaxTokens)]);
+    }
+
+    #[test]
+    fn parse_sse_chunks_should_preserve_utf8_split_inside_code_point() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"中文🙂\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+            "data: [DONE]\n"
+        );
+        let split = sse
+            .as_bytes()
+            .iter()
+            .position(|byte| *byte >= 0x80)
+            .unwrap()
+            + 1;
+
+        let events =
+            parse_sse_chunks(&[&sse.as_bytes()[..split], &sse.as_bytes()[split..]]).unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::TextDelta("中文🙂".to_string()),
+                ProviderEvent::Done(StopReason::EndTurn),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_sse_chunks_should_support_multiline_data_crlf_comments_and_no_final_newline() {
+        let sse = concat!(
+            ": heartbeat\r\n",
+            "\r\n",
+            "data: {\"choices\":[\r\n",
+            "data: {\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}\r\n",
+            "data: ]}\r\n",
+            "\r\n",
+            "data: [DONE]"
+        );
+
+        let events = parse_sse_chunks(&[&sse.as_bytes()[..37], &sse.as_bytes()[37..]]).unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::TextDelta("hello".to_string()),
+                ProviderEvent::Done(StopReason::EndTurn),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_sse_should_reject_done_with_pending_tool_call() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}]}}]}\n",
+            "data: [DONE]\n"
+        );
+
+        let error = parse_sse(sse).unwrap_err();
+
+        assert_eq!(error, DeepSeekParseError::PendingToolCalls);
+    }
+
+    #[test]
+    fn parse_sse_should_reject_done_without_finish_reason() {
+        let error = parse_sse("data: [DONE]\n").unwrap_err();
+
+        assert_eq!(error, DeepSeekParseError::MissingFinishReason);
+    }
+
+    #[test]
+    fn parse_sse_should_reject_unknown_finish_reason() {
+        let sse = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"mystery\"}]}\n";
+
+        let error = parse_sse(sse).unwrap_err();
+
+        assert_eq!(
+            error,
+            DeepSeekParseError::UnknownFinishReason("mystery".to_string())
+        );
     }
 
     #[test]

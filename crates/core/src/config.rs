@@ -10,7 +10,6 @@ pub struct Config {
     pub deepseek_base_url: String,
     pub deepseek_api_key_env: String,
     pub deepseek_model: String,
-    pub deepseek_reasoning_effort: String,
     pub approval_mode: ApprovalMode,
     pub max_turns: u32,
     pub shell_timeout_secs: u64,
@@ -25,7 +24,6 @@ impl Default for Config {
             deepseek_base_url: "https://api.deepseek.com".to_string(),
             deepseek_api_key_env: "DEEPSEEK_API_KEY".to_string(),
             deepseek_model: "deepseek-v4-flash".to_string(),
-            deepseek_reasoning_effort: "high".to_string(),
             approval_mode: ApprovalMode::Confirm,
             max_turns: 50,
             shell_timeout_secs: 120,
@@ -119,9 +117,6 @@ impl Config {
                 self.deepseek_api_key_env = value.to_string();
             }
             ("providers.deepseek", "default_model") => self.deepseek_model = value.to_string(),
-            ("providers.deepseek", "reasoning_effort") => {
-                self.deepseek_reasoning_effort = value.to_string();
-            }
             ("agent", "approval_mode") => {
                 self.approval_mode = parse_approval_mode(value).ok_or_else(|| {
                     ConfigError::Parse(format!("invalid approval_mode `{value}`"))
@@ -147,7 +142,16 @@ impl Config {
                     ConfigError::Parse(format!("invalid shell max_output_bytes `{value}`"))
                 })?;
             }
-            _ => {}
+            _ => {
+                let qualified = if section.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{section}.{key}")
+                };
+                return Err(ConfigError::Parse(format!(
+                    "unknown config key `{qualified}`"
+                )));
+            }
         }
         Ok(())
     }
@@ -307,6 +311,30 @@ mod tests {
                 50,
             )
         );
+    }
+
+    #[test]
+    fn load_should_reject_unknown_or_removed_config_keys() {
+        let dir = temp_dir("config_unknown");
+        let workspace = dir.join("workspace.toml");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &workspace,
+            "[providers.deepseek]\nreasoning_effort = \"high\"\n",
+        )
+        .unwrap();
+
+        let error = Config::load(
+            None,
+            Some(&workspace),
+            &BTreeMap::new(),
+            &ConfigOverrides::default(),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unknown config key `providers.deepseek.reasoning_effort`"));
     }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {

@@ -320,8 +320,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "flash-core",
+ "flash-deepseek",
  "flash-provider",
  "flash-tools",
+ "serde_json",
  "tokio",
 ]
 
@@ -357,6 +359,7 @@ dependencies = [
  "async-trait",
  "flash-core",
  "flash-provider",
+ "flash-tools",
  "futures-util",
  "reqwest",
  "serde",
@@ -381,6 +384,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "flash-core",
+ "serde_json",
  "tokio",
 ]
 
@@ -389,6 +393,9 @@ name = "flash-tools"
 version = "0.1.0"
 dependencies = [
  "flash-core",
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -401,6 +408,7 @@ dependencies = [
  "ratatui",
  "serde_json",
  "tokio",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

@@ -40,7 +40,6 @@ enum CliCommand {
         command: EvalCommand,
     },
     Replay(ReplayArgs),
-    Resume(ResumeArgs),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -79,11 +78,6 @@ struct EvalSweBenchArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 struct ReplayArgs {
-    events_path: PathBuf,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Args)]
-struct ResumeArgs {
     session_id: String,
 }
 
@@ -94,8 +88,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Some(CliCommand::Doctor) => doctor(),
         Some(CliCommand::Run(args)) => run_task(&args.task).await,
         Some(CliCommand::Eval { command }) => eval(command).await,
-        Some(CliCommand::Replay(args)) => replay(&args.events_path),
-        Some(CliCommand::Resume(args)) => resume(&args.session_id),
+        Some(CliCommand::Replay(args)) => replay(&args.session_id),
     }
 }
 
@@ -118,11 +111,11 @@ impl ChatProvider for CliProvider {
     async fn chat(
         &mut self,
         request: ChatRequest,
-        on_event: &mut dyn FnMut(ProviderEvent),
+        events: tokio::sync::mpsc::Sender<ProviderEvent>,
     ) -> Result<(), ProviderError> {
         match self {
-            Self::DeepSeek(provider) => provider.chat(request, on_event).await,
-            Self::Smoke(provider) => provider.chat(request, on_event).await,
+            Self::DeepSeek(provider) => provider.chat(request, events).await,
+            Self::Smoke(provider) => provider.chat(request, events).await,
         }
     }
 }
@@ -143,7 +136,12 @@ impl flash_tui::TaskRunner for CliTaskRunner {
     ) -> Result<flash_tui::TuiRun, String> {
         let config = load_config(workspace_root, &ConfigOverrides::default())
             .map_err(|error| error.to_string())?;
-        let registry = flash_tools::builtin_registry().map_err(|error| error.to_string())?;
+        let registry = flash_tools::builtin_registry_with_options(
+            config.shell_timeout_secs,
+            config.shell_max_output_bytes,
+            config.allow_network,
+        )
+        .map_err(|error| error.to_string())?;
         let provider = provider_from_config(&config).map_err(|error| error.to_string())?;
         let mut runtime = AgentRuntime::new(
             provider,
@@ -161,12 +159,13 @@ impl flash_tui::TaskRunner for CliTaskRunner {
         let mut runtime_approval = CliApprovalController {
             controller: &controller_cell,
         };
+        let cancellation = controller_cell.borrow().cancellation_token();
         let run = runtime
-            .run_task_with_controls(
+            .run_task_with_cancellation(
                 workspace_root,
                 task,
                 &mut runtime_observer,
-                || controller_cell.borrow_mut().should_cancel(),
+                cancellation,
                 &mut runtime_approval,
             )
             .await
@@ -209,6 +208,15 @@ fn doctor() -> Result<(), CliError> {
     println!("workspace_root: {}", root.display());
     println!("provider: {}", config.provider_default);
     println!("model: {}", config.deepseek_model);
+    if config.allow_network {
+        println!("bash_network_policy: allowed after permission policy");
+    } else if cfg!(target_os = "macos") {
+        println!("bash_network_policy: denied by offline allowlist and macOS sandbox");
+    } else {
+        println!(
+            "bash_network_policy: degraded to offline allowlist; unknown commands are denied because no OS network sandbox is available"
+        );
+    }
     if env::var(&config.deepseek_api_key_env).is_ok() {
         println!("api_key_env: {} present", config.deepseek_api_key_env);
     } else {
@@ -220,7 +228,12 @@ fn doctor() -> Result<(), CliError> {
 async fn run_task(task: &str) -> Result<(), CliError> {
     let root = discover_workspace_root(None)?;
     let config = load_config(&root, &ConfigOverrides::default())?;
-    let registry = flash_tools::builtin_registry().map_err(CliError::ToolRegistry)?;
+    let registry = flash_tools::builtin_registry_with_options(
+        config.shell_timeout_secs,
+        config.shell_max_output_bytes,
+        config.allow_network,
+    )
+    .map_err(CliError::ToolRegistry)?;
     let provider = provider_from_config(&config)?;
     let mut runtime = AgentRuntime::new(
         provider,
@@ -396,17 +409,12 @@ async fn eval_regression() -> Result<(), CliError> {
     Ok(())
 }
 
-fn replay(path: &Path) -> Result<(), CliError> {
-    for line in replay_events(path)? {
-        println!("{line}");
-    }
-    Ok(())
-}
-
-fn resume(session_id: &str) -> Result<(), CliError> {
+fn replay(session_id: &str) -> Result<(), CliError> {
     let root = discover_workspace_root(None)?;
     let session = flash_core::storage::load_session(&root, session_id)?;
-    println!("resumed {}", session.id);
+    for line in replay_events(&session.path.join("events.jsonl"))? {
+        println!("{line}");
+    }
     Ok(())
 }
 
@@ -539,6 +547,20 @@ mod tests {
                 })
             })
         );
+    }
+
+    #[test]
+    fn cli_should_parse_replay_and_reject_legacy_resume() {
+        let cli = Cli::try_parse_from(["flash", "replay", "session_123"]).unwrap();
+
+        assert_eq!(
+            cli.command,
+            Some(CliCommand::Replay(ReplayArgs {
+                session_id: "session_123".to_string()
+            }))
+        );
+        let error = Cli::try_parse_from(["flash", "resume", "session_123"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 
     #[test]

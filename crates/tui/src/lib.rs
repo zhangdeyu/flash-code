@@ -1,6 +1,10 @@
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use crossterm::cursor::{Hide, Show};
@@ -10,13 +14,14 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use flash_core::storage::load_session;
-use flash_core::{discover_workspace_root, init_workspace, Event};
+use flash_core::{discover_workspace_root, init_workspace, CancellationToken, Event};
 use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const DEFAULT_WIDTH: usize = 100;
 const DEFAULT_HEIGHT: usize = 32;
@@ -39,6 +44,10 @@ pub trait RunController {
     fn approve(&mut self, prompt: &ApprovalPrompt) -> bool;
 
     fn should_cancel(&mut self) -> bool;
+
+    fn cancellation_token(&self) -> CancellationToken {
+        CancellationToken::new()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,7 +72,7 @@ pub async fn run_current_workspace(runner: &mut impl TaskRunner) -> Result<(), T
     let mut stdout = io::stdout();
 
     if let Some(session_id) = std::env::var_os("FLASH_TUI_RESUME") {
-        state.resume_session(&root, &session_id.to_string_lossy());
+        state.replay_session(&root, &session_id.to_string_lossy());
     }
 
     if let Some(task) = std::env::var_os("FLASH_TUI_TASK") {
@@ -123,8 +132,8 @@ async fn input_loop(
                 if !state.input.is_empty() {
                     let task = state.input.clone();
                     state.input.clear();
-                    if let Some(session_id) = task.strip_prefix("resume ") {
-                        state.resume_session(workspace_root, session_id.trim());
+                    if let Some(session_id) = task.strip_prefix("replay ") {
+                        state.replay_session(workspace_root, session_id.trim());
                         render_frame(stdout, state)?;
                     } else {
                         run_task_for_state(workspace_root, state, runner, &task, stdout).await?;
@@ -181,15 +190,28 @@ async fn run_task_for_state(
 ) -> Result<(), TuiError> {
     state.start_task(task);
     render_frame(stdout, state)?;
+    let cancellation = CancellationToken::new();
+    let watcher_done = Arc::new(AtomicBool::new(false));
+    let approval_active = Arc::new(AtomicBool::new(false));
+    let watcher = spawn_cancellation_watcher(
+        cancellation.clone(),
+        Arc::clone(&watcher_done),
+        Arc::clone(&approval_active),
+    );
     let mut controller = UiRunController {
         state,
         stdout,
         render_error: None,
+        cancellation,
+        approval_active,
+        last_render: Instant::now(),
     };
-    let run = runner
-        .run_task(workspace_root, task, &mut controller)
-        .await
-        .map_err(TuiError::Runner)?;
+    let run_result = runner.run_task(workspace_root, task, &mut controller).await;
+    watcher_done.store(true, Ordering::SeqCst);
+    watcher
+        .join()
+        .map_err(|_| TuiError::Runner("cancellation watcher panicked".to_string()))?;
+    let run = run_result.map_err(TuiError::Runner)?;
     if let Some(error) = controller.render_error {
         return Err(error);
     }
@@ -203,6 +225,9 @@ struct UiRunController<'a, W> {
     state: &'a mut AppState,
     stdout: &'a mut W,
     render_error: Option<TuiError>,
+    cancellation: CancellationToken,
+    approval_active: Arc<AtomicBool>,
+    last_render: Instant,
 }
 
 impl<W> RunController for UiRunController<'_, W>
@@ -211,23 +236,70 @@ where
 {
     fn on_event(&mut self, event: &Event) {
         self.state.push_event(event);
-        if let Err(error) = render_frame(self.stdout, self.state) {
-            self.render_error = Some(error);
+        let stream_delta = matches!(
+            event,
+            Event::ReasoningDelta { .. } | Event::AssistantDelta { .. }
+        );
+        if !stream_delta || self.last_render.elapsed() >= Duration::from_millis(33) {
+            if let Err(error) = render_frame(self.stdout, self.state) {
+                self.render_error = Some(error);
+            }
+            self.last_render = Instant::now();
         }
     }
 
     fn approve(&mut self, prompt: &ApprovalPrompt) -> bool {
+        self.approval_active.store(true, Ordering::SeqCst);
         self.state.set_pending_approval(prompt);
         if let Err(error) = render_frame(self.stdout, self.state) {
             self.render_error = Some(error);
+            self.approval_active.store(false, Ordering::SeqCst);
             return false;
         }
-        approval_from_env().unwrap_or_else(read_approval_from_stdin)
+        let approved =
+            approval_from_env().unwrap_or_else(|| read_approval_from_stdin(&self.cancellation));
+        self.approval_active.store(false, Ordering::SeqCst);
+        approved
     }
 
     fn should_cancel(&mut self) -> bool {
-        std::env::var_os("FLASH_TUI_CANCEL_AFTER_START").is_some()
+        if std::env::var_os("FLASH_TUI_CANCEL_AFTER_START").is_some() {
+            self.cancellation.cancel();
+        }
+        self.cancellation.is_cancelled()
     }
+
+    fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+}
+
+fn spawn_cancellation_watcher(
+    cancellation: CancellationToken,
+    done: Arc<AtomicBool>,
+    approval_active: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !done.load(Ordering::SeqCst) && !cancellation.is_cancelled() {
+            if approval_active.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            let Ok(ready) = event::poll(Duration::from_millis(50)) else {
+                cancellation.cancel();
+                return;
+            };
+            if !ready {
+                continue;
+            }
+            let Ok(TerminalEvent::Key(key)) = event::read() else {
+                continue;
+            };
+            if matches!(input_action_for_key(key, false), InputAction::Cancel) {
+                cancellation.cancel();
+            }
+        }
+    })
 }
 
 fn approval_from_env() -> Option<bool> {
@@ -239,7 +311,7 @@ fn approval_from_env() -> Option<bool> {
     })
 }
 
-fn read_approval_from_stdin() -> bool {
+fn read_approval_from_stdin(cancellation: &CancellationToken) -> bool {
     if !io::stdin().is_terminal() {
         return false;
     }
@@ -249,7 +321,11 @@ fn read_approval_from_stdin() -> bool {
         };
         match input_action_for_key(key, false) {
             InputAction::Char('y' | 'Y') => return true,
-            InputAction::Char('n' | 'N') | InputAction::Cancel => return false,
+            InputAction::Char('n' | 'N') => return false,
+            InputAction::Cancel => {
+                cancellation.cancel();
+                return false;
+            }
             _ => {}
         }
     }
@@ -294,6 +370,7 @@ pub struct AppState {
     current_session_id: Option<String>,
     pending_approval: Option<ApprovalPrompt>,
     permission_mode: String,
+    active_stream: Option<StreamKey>,
 }
 
 impl AppState {
@@ -319,6 +396,7 @@ impl AppState {
             current_session_id: None,
             pending_approval: None,
             permission_mode: "unknown".to_string(),
+            active_stream: None,
         })
     }
 
@@ -326,15 +404,13 @@ impl AppState {
         Self {
             workspace_root,
             sessions: Vec::new(),
-            transcript: events
-                .iter()
-                .filter_map(|line| parse_event_line(line))
-                .collect(),
+            transcript: transcript_from_lines(events.iter().copied()),
             input: String::new(),
             status: RunStatus::Idle,
             current_session_id: None,
             pending_approval: None,
             permission_mode: "unknown".to_string(),
+            active_stream: None,
         }
     }
 
@@ -342,6 +418,7 @@ impl AppState {
         self.status = RunStatus::Running;
         self.current_session_id = None;
         self.pending_approval = None;
+        self.active_stream = None;
         self.transcript.clear();
         self.transcript.push(TranscriptLine {
             kind: TranscriptKind::Input,
@@ -361,6 +438,7 @@ impl AppState {
 
     fn cancel(&mut self) {
         self.status = RunStatus::Cancelled;
+        self.active_stream = None;
         self.transcript.push(TranscriptLine {
             kind: TranscriptKind::Session,
             text: "cancel requested".to_string(),
@@ -369,7 +447,8 @@ impl AppState {
 
     fn push_event(&mut self, event: &Event) {
         if let Some(line) = event_to_transcript(event) {
-            self.transcript.push(line);
+            let stream = event_stream_key(event);
+            reduce_transcript(&mut self.transcript, &mut self.active_stream, line, stream);
         }
         if matches!(event, Event::ApprovalResolved { .. }) {
             self.pending_approval = None;
@@ -378,6 +457,7 @@ impl AppState {
 
     fn set_pending_approval(&mut self, prompt: &ApprovalPrompt) {
         self.pending_approval = Some(prompt.clone());
+        self.active_stream = None;
         self.transcript.push(TranscriptLine {
             kind: TranscriptKind::Approval,
             text: format!(
@@ -399,7 +479,7 @@ impl AppState {
         Ok(())
     }
 
-    fn resume_session(&mut self, workspace_root: &Path, session_id: &str) {
+    fn replay_session(&mut self, workspace_root: &Path, session_id: &str) {
         match load_session(workspace_root, session_id) {
             Ok(session) => match load_transcript(&session.path.join("events.jsonl")) {
                 Ok(transcript) => {
@@ -407,15 +487,17 @@ impl AppState {
                     self.status = RunStatus::Idle;
                     self.pending_approval = None;
                     self.transcript = transcript;
+                    self.active_stream = None;
                 }
-                Err(error) => self.replace_with_error(format!("resume failed: {error}")),
+                Err(error) => self.replace_with_error(format!("replay failed: {error}")),
             },
-            Err(error) => self.replace_with_error(format!("resume failed: {error}")),
+            Err(error) => self.replace_with_error(format!("replay failed: {error}")),
         }
     }
 
     fn push_error(&mut self, message: String) {
         self.status = RunStatus::Failed;
+        self.active_stream = None;
         self.transcript.push(TranscriptLine {
             kind: TranscriptKind::Error,
             text: message,
@@ -463,6 +545,13 @@ struct TranscriptLine {
     text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamKey {
+    request_id: String,
+    attempt: u32,
+    kind: TranscriptKind,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TranscriptKind {
     User,
@@ -502,40 +591,27 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     if text.is_empty() {
         return vec![String::new()];
     }
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        let separator = usize::from(!current.is_empty());
-        if current.len() + separator + word.len() > width && !current.is_empty() {
-            lines.push(current);
-            current = String::new();
-        }
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(word);
-    }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    lines
-        .into_iter()
-        .flat_map(|line| split_long_line(&line, width))
+    text.split('\n')
+        .flat_map(|line| split_long_line(line, width.max(1)))
         .collect()
 }
 
 fn split_long_line(text: &str, width: usize) -> Vec<String> {
-    if text.len() <= width {
+    if text.width() <= width {
         return vec![text.to_string()];
     }
     let mut lines = Vec::new();
     let mut current = String::new();
+    let mut current_width = 0;
     for ch in text.chars() {
-        if current.len() + ch.len_utf8() > width {
+        let character_width = ch.width().unwrap_or_default();
+        if current_width + character_width > width && !current.is_empty() {
             lines.push(current);
             current = String::new();
+            current_width = 0;
         }
         current.push(ch);
+        current_width += character_width;
     }
     if !current.is_empty() {
         lines.push(current);
@@ -677,7 +753,80 @@ fn load_sessions(workspace_root: &Path) -> Result<Vec<SessionSummary>, TuiError>
 
 fn load_transcript(events_path: &Path) -> Result<Vec<TranscriptLine>, TuiError> {
     let content = fs::read_to_string(events_path)?;
-    Ok(content.lines().filter_map(parse_event_line).collect())
+    Ok(transcript_from_lines(content.lines()))
+}
+
+fn transcript_from_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<TranscriptLine> {
+    let mut transcript = Vec::new();
+    let mut active_stream = None;
+    for raw in lines {
+        let Some(line) = parse_event_line(raw) else {
+            continue;
+        };
+        reduce_transcript(
+            &mut transcript,
+            &mut active_stream,
+            line,
+            event_line_stream_key(raw),
+        );
+    }
+    transcript
+}
+
+fn reduce_transcript(
+    transcript: &mut Vec<TranscriptLine>,
+    active_stream: &mut Option<StreamKey>,
+    line: TranscriptLine,
+    stream: Option<StreamKey>,
+) {
+    if stream.is_some() && stream == *active_stream {
+        if let Some(previous) = transcript.last_mut() {
+            previous.text.push_str(&line.text);
+            return;
+        }
+    }
+    *active_stream = stream;
+    transcript.push(line);
+}
+
+fn event_stream_key(event: &Event) -> Option<StreamKey> {
+    match event {
+        Event::ReasoningDelta {
+            request_id,
+            attempt,
+            ..
+        } => Some(StreamKey {
+            request_id: request_id.clone(),
+            attempt: *attempt,
+            kind: TranscriptKind::Reasoning,
+        }),
+        Event::AssistantDelta {
+            request_id,
+            attempt,
+            ..
+        } => Some(StreamKey {
+            request_id: request_id.clone(),
+            attempt: *attempt,
+            kind: TranscriptKind::Assistant,
+        }),
+        _ => None,
+    }
+}
+
+fn event_line_stream_key(line: &str) -> Option<StreamKey> {
+    let kind = match json_string_field(line, "type")?.as_str() {
+        "reasoning_delta" => TranscriptKind::Reasoning,
+        "assistant_delta" => TranscriptKind::Assistant,
+        _ => return None,
+    };
+    Some(StreamKey {
+        request_id: json_string_field(line, "request_id").unwrap_or_default(),
+        attempt: json_value_field(line, "attempt")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or_default(),
+        kind,
+    })
 }
 
 fn parse_event_line(line: &str) -> Option<TranscriptLine> {
@@ -711,6 +860,21 @@ fn parse_event_line(line: &str) -> Option<TranscriptLine> {
         "assistant_delta" => Some(TranscriptLine {
             kind: TranscriptKind::Assistant,
             text: json_string_field(line, "text").unwrap_or_default(),
+        }),
+        "model_attempt_failed" => Some(TranscriptLine {
+            kind: TranscriptKind::Error,
+            text: format!(
+                "model attempt {} failed: {}",
+                json_number_field(line, "attempt").unwrap_or_default(),
+                json_string_field(line, "message").unwrap_or_default()
+            ),
+        }),
+        "model_attempt_committed" => Some(TranscriptLine {
+            kind: TranscriptKind::Session,
+            text: format!(
+                "model attempt {} committed",
+                json_number_field(line, "attempt").unwrap_or_default()
+            ),
         }),
         "tool_call_requested" => Some(TranscriptLine {
             kind: TranscriptKind::Tool,
@@ -796,13 +960,23 @@ fn event_to_transcript(event: &Event) -> Option<TranscriptLine> {
             kind: TranscriptKind::Session,
             text: format!("model request {model}"),
         }),
-        Event::ReasoningDelta { text } => Some(TranscriptLine {
+        Event::ReasoningDelta { text, .. } => Some(TranscriptLine {
             kind: TranscriptKind::Reasoning,
             text: text.clone(),
         }),
-        Event::AssistantDelta { text } => Some(TranscriptLine {
+        Event::AssistantDelta { text, .. } => Some(TranscriptLine {
             kind: TranscriptKind::Assistant,
             text: text.clone(),
+        }),
+        Event::ModelAttemptFailed {
+            attempt, message, ..
+        } => Some(TranscriptLine {
+            kind: TranscriptKind::Error,
+            text: format!("model attempt {attempt} failed: {message}"),
+        }),
+        Event::ModelAttemptCommitted { attempt, .. } => Some(TranscriptLine {
+            kind: TranscriptKind::Session,
+            text: format!("model attempt {attempt} committed"),
         }),
         Event::AssistantMessageCompleted { message_id } => Some(TranscriptLine {
             kind: TranscriptKind::Assistant,
@@ -835,6 +1009,7 @@ fn event_to_transcript(event: &Event) -> Option<TranscriptLine> {
         Event::UsageRecorded {
             input_tokens,
             output_tokens,
+            ..
         } => Some(TranscriptLine {
             kind: TranscriptKind::Session,
             text: format!("usage input={input_tokens} output={output_tokens}"),
@@ -946,6 +1121,59 @@ mod tests {
     }
 
     #[test]
+    fn parse_event_line_should_render_attempt_transactions() {
+        let failed = parse_event_line(
+            r#"{"event":{"type":"model_attempt_failed","attempt":1,"message":"retry"}}"#,
+        )
+        .unwrap();
+        let committed =
+            parse_event_line(r#"{"event":{"type":"model_attempt_committed","attempt":2}}"#)
+                .unwrap();
+
+        assert_eq!(failed.kind, TranscriptKind::Error);
+        assert_eq!(failed.text, "model attempt 1 failed: retry");
+        assert_eq!(committed.kind, TranscriptKind::Session);
+        assert_eq!(committed.text, "model attempt 2 committed");
+    }
+
+    #[test]
+    fn transcript_reducer_should_merge_adjacent_stream_deltas_without_changing_whitespace() {
+        let events = [
+            r#"{"event":{"type":"assistant_delta","request_id":"req_1","attempt":1,"text":"hello\n"}}"#,
+            r#"{"event":{"type":"assistant_delta","request_id":"req_1","attempt":1,"text":"  world"}}"#,
+        ];
+
+        let state = AppState::from_events(PathBuf::from("/tmp/project"), &events);
+
+        assert_eq!(state.transcript.len(), 1);
+        assert_eq!(state.transcript[0].text, "hello\n  world");
+    }
+
+    #[test]
+    fn live_and_replay_should_use_identical_stream_reduction() {
+        let mut live = empty_state();
+        live.push_event(&Event::AssistantDelta {
+            request_id: "req_1".to_string(),
+            attempt: 1,
+            text: "hel".to_string(),
+        });
+        live.push_event(&Event::AssistantDelta {
+            request_id: "req_1".to_string(),
+            attempt: 1,
+            text: "lo".to_string(),
+        });
+        let replay = AppState::from_events(
+            PathBuf::from("/tmp/project"),
+            &[
+                r#"{"event":{"type":"assistant_delta","request_id":"req_1","attempt":1,"text":"hel"}}"#,
+                r#"{"event":{"type":"assistant_delta","request_id":"req_1","attempt":1,"text":"lo"}}"#,
+            ],
+        );
+
+        assert_eq!(live.transcript, replay.transcript);
+    }
+
+    #[test]
     fn app_state_load_should_scan_sessions_without_index() {
         let root = temp_dir("scan_sessions");
         fs::create_dir_all(&root).unwrap();
@@ -953,6 +1181,8 @@ mod tests {
         append_event(
             &session,
             Event::AssistantDelta {
+                request_id: "request_1".to_string(),
+                attempt: 1,
                 text: "hello from replay".to_string(),
             },
         )
@@ -964,28 +1194,30 @@ mod tests {
     }
 
     #[test]
-    fn resume_session_should_load_transcript_for_current_workspace() {
-        let root = temp_dir("resume_current");
+    fn replay_session_should_load_transcript_for_current_workspace() {
+        let root = temp_dir("replay_current");
         fs::create_dir_all(&root).unwrap();
         let session = create_session(&root).unwrap();
         append_event(
             &session,
             Event::AssistantDelta {
-                text: "hello resume".to_string(),
+                request_id: "request_1".to_string(),
+                attempt: 1,
+                text: "hello replay".to_string(),
             },
         )
         .unwrap();
         let mut state = AppState::load(&root).unwrap();
 
-        state.resume_session(&root, &session.id);
+        state.replay_session(&root, &session.id);
 
         assert_eq!(state.current_session_id, Some(session.id));
     }
 
     #[test]
-    fn resume_session_should_render_workspace_mismatch_error() {
-        let root = temp_dir("resume_a");
-        let other = temp_dir("resume_b");
+    fn replay_session_should_render_workspace_mismatch_error() {
+        let root = temp_dir("replay_a");
+        let other = temp_dir("replay_b");
         fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(&other).unwrap();
         let session = create_session(&root).unwrap();
@@ -999,7 +1231,7 @@ mod tests {
         fs::write(other_session.join("events.jsonl"), "").unwrap();
         let mut state = AppState::load(&other).unwrap();
 
-        state.resume_session(&other, &session.id);
+        state.replay_session(&other, &session.id);
 
         assert_eq!(state.status, RunStatus::Failed);
         assert!(state.transcript[0].text.contains("session belongs to"));
@@ -1061,7 +1293,27 @@ mod tests {
 
         let output = render_to_string(&state, 44, 14);
 
-        assert!(output.lines().all(|line| line.chars().count() <= 44));
+        assert!(output.lines().all(|line| line.width() <= 44));
+    }
+
+    #[test]
+    fn wrap_should_preserve_code_whitespace_and_use_cjk_display_width() {
+        let text = "assistant: ```rust\n  let  value = 1;\n\n中文中文";
+
+        let lines = wrap(text, 10);
+
+        assert_eq!(
+            lines,
+            vec![
+                "assistant:",
+                " ```rust",
+                "  let  val",
+                "ue = 1;",
+                "",
+                "中文中文"
+            ]
+        );
+        assert!(lines.iter().all(|line| line.width() <= 10));
     }
 
     #[test]
@@ -1232,9 +1484,13 @@ mod tests {
             controller: &mut dyn RunController,
         ) -> Result<TuiRun, String> {
             controller.on_event(&Event::ReasoningDelta {
+                request_id: "request_1".to_string(),
+                attempt: 1,
                 text: "thinking live".to_string(),
             });
             controller.on_event(&Event::AssistantDelta {
+                request_id: "request_1".to_string(),
+                attempt: 1,
                 text: "done live".to_string(),
             });
             controller.on_event(&Event::SessionFinished {
@@ -1263,6 +1519,7 @@ mod tests {
         ) -> Result<TuiRun, String> {
             controller.on_event(&Event::ModelRequestStarted {
                 request_id: "request_1".to_string(),
+                attempt: 1,
                 model: "smoke".to_string(),
             });
             let _cancel_requested = controller.should_cancel();
@@ -1324,6 +1581,7 @@ mod tests {
             current_session_id: None,
             pending_approval: None,
             permission_mode: "confirm".to_string(),
+            active_stream: None,
         }
     }
 

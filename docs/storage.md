@@ -113,7 +113,6 @@ default = "deepseek"
 base_url = "https://api.deepseek.com"
 api_key_env = "DEEPSEEK_API_KEY"
 default_model = "deepseek-v4-flash"
-reasoning_effort = "high"
 
 [agent]
 approval_mode = "confirm"
@@ -150,7 +149,9 @@ workspace 配置只应该保存项目相关的非敏感偏好,例如:
 
 因为 `.flash/` 默认忽略,workspace 配置主要服务本机当前 checkout。需要团队共享的默认值先写进 README 或后续模板文件,不要在 v1 里引入额外配置层。
 
-配置只保存默认策略,不保存某一次工具调用的授权结果。单次授权结果写入 `events.jsonl` 的 `approval_resolved`,这样 replay 能还原当时发生了什么,而 resume 不会把历史授权误用于新的工具调用。
+配置只保存默认策略,不保存某一次工具调用的授权结果。单次授权结果写入 `events.jsonl` 的 `approval_resolved`,这样 `replay` 能还原当时发生了什么；新的运行不会复用历史授权。
+
+`allow_network = false` 在 macOS 上同时使用离线命令允许列表和系统网络 sandbox。其他平台若没有可用的系统网络 sandbox，则退化为严格离线允许列表：解释器、管道、命令替换和未知 Bash 命令会在执行入口被拒绝。`flash doctor` 会明确显示当前策略。
 
 ### 4.3 Secret 规则
 

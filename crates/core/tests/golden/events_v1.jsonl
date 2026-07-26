@@ -1,15 +1,17 @@
 {"version":"1","sequence":1,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"session_started","session_id":"session_golden"}}
 {"version":"1","sequence":2,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"user_message_appended","message_id":"msg_user"}}
-{"version":"1","sequence":3,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"model_request_started","request_id":"req_1","model":"deepseek-test"}}
-{"version":"1","sequence":4,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"reasoning_delta","text":"think\nstep"}}
-{"version":"1","sequence":5,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"assistant_delta","text":"hello"}}
-{"version":"1","sequence":6,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"assistant_message_completed","message_id":"msg_assistant"}}
-{"version":"1","sequence":7,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"tool_call_requested","call_id":"call_1","name":"Read"}}
-{"version":"1","sequence":8,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"approval_required","call_id":"call_1"}}
-{"version":"1","sequence":9,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"approval_resolved","call_id":"call_1","approved":true}}
-{"version":"1","sequence":10,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"tool_started","call_id":"call_1","name":"Read"}}
-{"version":"1","sequence":11,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"tool_output_delta","call_id":"call_1","stream":"stdout","text":"file text"}}
-{"version":"1","sequence":12,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"tool_finished","call_id":"call_1","status":"success"}}
-{"version":"1","sequence":13,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"usage_recorded","input_tokens":11,"output_tokens":22}}
-{"version":"1","sequence":14,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"error","message":"boom"}}
-{"version":"1","sequence":15,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"session_finished","outcome":"succeeded"}}
+{"version":"1","sequence":3,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"model_request_started","request_id":"req_1","attempt":1,"model":"deepseek-test"}}
+{"version":"1","sequence":4,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"reasoning_delta","request_id":"req_1","attempt":1,"text":"think\nstep"}}
+{"version":"1","sequence":5,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"assistant_delta","request_id":"req_1","attempt":1,"text":"hello"}}
+{"version":"1","sequence":6,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"model_attempt_failed","request_id":"req_1","attempt":1,"retryable":true,"message":"retry"}}
+{"version":"1","sequence":7,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"model_attempt_committed","request_id":"req_1","attempt":2}}
+{"version":"1","sequence":8,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"assistant_message_completed","message_id":"msg_assistant"}}
+{"version":"1","sequence":9,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"tool_call_requested","call_id":"call_1","name":"Read"}}
+{"version":"1","sequence":10,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"approval_required","call_id":"call_1"}}
+{"version":"1","sequence":11,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"approval_resolved","call_id":"call_1","approved":true}}
+{"version":"1","sequence":12,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"tool_started","call_id":"call_1","name":"Read"}}
+{"version":"1","sequence":13,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"tool_output_delta","call_id":"call_1","stream":"stdout","text":"file text"}}
+{"version":"1","sequence":14,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"tool_finished","call_id":"call_1","status":"success"}}
+{"version":"1","sequence":15,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"usage_recorded","request_id":"req_1","attempt":2,"input_tokens":11,"output_tokens":22}}
+{"version":"1","sequence":16,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"error","message":"boom"}}
+{"version":"1","sequence":17,"timestamp":"<timestamp>","session_id":"session_golden","event":{"type":"session_finished","outcome":"succeeded"}}

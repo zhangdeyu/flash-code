@@ -1,11 +1,16 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use crate::protocol::{ContentBlock, Event, Message, Role, SessionStatus, ToolResultStatus};
+use crate::protocol::{
+    ContentBlock, Event, Message, Outcome, Role, SessionStatus, ToolResultStatus,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workspace {
@@ -13,11 +18,31 @@ pub struct Workspace {
     pub root: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Session {
     pub id: String,
     pub workspace_root: PathBuf,
     pub path: PathBuf,
+    sequence: Arc<Mutex<u64>>,
+    finalizing: Arc<AtomicBool>,
+}
+
+impl PartialEq for Session {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.workspace_root == other.workspace_root
+            && self.path == other.path
+    }
+}
+
+impl Eq for Session {}
+
+impl Session {
+    pub fn begin_finalize(&self) -> bool {
+        self.finalizing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
 }
 
 #[derive(Debug)]
@@ -25,6 +50,7 @@ pub enum StorageError {
     Io(std::io::Error),
     Parse(String),
     TaskJoin(String),
+    SequenceLock,
     WorkspaceMismatch { expected: PathBuf, actual: PathBuf },
 }
 
@@ -34,6 +60,7 @@ impl std::fmt::Display for StorageError {
             Self::Io(error) => write!(formatter, "storage io error: {error}"),
             Self::Parse(message) => write!(formatter, "storage parse error: {message}"),
             Self::TaskJoin(message) => write!(formatter, "storage task join error: {message}"),
+            Self::SequenceLock => write!(formatter, "storage event sequence lock is poisoned"),
             Self::WorkspaceMismatch { expected, actual } => write!(
                 formatter,
                 "session belongs to `{}`, current workspace is `{}`",
@@ -87,6 +114,8 @@ pub fn create_session(root: &Path) -> Result<Session, StorageError> {
         id: id.clone(),
         workspace_root: root.to_path_buf(),
         path: session_dir.clone(),
+        sequence: Arc::new(Mutex::new(1)),
+        finalizing: Arc::new(AtomicBool::new(false)),
     };
     let now = timestamp();
     let session_json = serde_json::to_string(&SessionRecord {
@@ -111,6 +140,30 @@ pub async fn create_session_async(root: PathBuf) -> Result<Session, StorageError
     run_blocking_storage(move || create_session(&root)).await
 }
 
+pub fn append_system_message(session: &Session, text: &str) -> Result<Message, StorageError> {
+    let message = Message {
+        id: new_id("msg"),
+        role: Role::System,
+        created_at: timestamp(),
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+        }],
+    };
+    append_line(
+        &session.path.join("messages.jsonl"),
+        &message_to_jsonl(&message)?,
+    )?;
+    touch_session(session)?;
+    Ok(message)
+}
+
+pub async fn append_system_message_async(
+    session: Session,
+    text: String,
+) -> Result<Message, StorageError> {
+    run_blocking_storage(move || append_system_message(&session, &text)).await
+}
+
 pub fn load_session(root: &Path, session_id: &str) -> Result<Session, StorageError> {
     let session_dir = root.join(".flash").join("sessions").join(session_id);
     let content = fs::read_to_string(session_dir.join("session.json"))?;
@@ -122,10 +175,14 @@ pub fn load_session(root: &Path, session_id: &str) -> Result<Session, StorageErr
             actual: root.to_path_buf(),
         });
     }
+    let sequence = next_sequence(&session_dir.join("events.jsonl"))?;
+    let finalized = record.status != SessionStatus::Running;
     Ok(Session {
         id: session_id.to_string(),
         workspace_root: root.to_path_buf(),
         path: session_dir,
+        sequence: Arc::new(Mutex::new(sequence)),
+        finalizing: Arc::new(AtomicBool::new(finalized)),
     })
 }
 
@@ -142,6 +199,7 @@ pub fn append_user_message(session: &Session, text: &str) -> Result<Message, Sto
         &session.path.join("messages.jsonl"),
         &message_to_jsonl(&message)?,
     )?;
+    touch_session(session)?;
     append_event(
         session,
         Event::UserMessageAppended {
@@ -160,10 +218,16 @@ pub async fn append_user_message_async(
 
 pub fn append_assistant_message(
     session: &Session,
+    reasoning: &str,
     text: &str,
-    tool_uses: &[(String, String, String)],
+    tool_uses: &[(String, String, Value)],
 ) -> Result<Message, StorageError> {
     let mut content = Vec::new();
+    if !reasoning.is_empty() {
+        content.push(ContentBlock::Reasoning {
+            text: reasoning.to_string(),
+        });
+    }
     if !text.is_empty() {
         content.push(ContentBlock::Text {
             text: text.to_string(),
@@ -186,6 +250,7 @@ pub fn append_assistant_message(
         &session.path.join("messages.jsonl"),
         &message_to_jsonl(&message)?,
     )?;
+    touch_session(session)?;
     append_event(
         session,
         Event::AssistantMessageCompleted {
@@ -197,10 +262,12 @@ pub fn append_assistant_message(
 
 pub async fn append_assistant_message_async(
     session: Session,
+    reasoning: String,
     text: String,
-    tool_uses: Vec<(String, String, String)>,
+    tool_uses: Vec<(String, String, Value)>,
 ) -> Result<Message, StorageError> {
-    run_blocking_storage(move || append_assistant_message(&session, &text, &tool_uses)).await
+    run_blocking_storage(move || append_assistant_message(&session, &reasoning, &text, &tool_uses))
+        .await
 }
 
 pub fn append_tool_result_message(
@@ -227,6 +294,7 @@ pub fn append_tool_result_message(
         &session.path.join("messages.jsonl"),
         &message_to_jsonl(&message)?,
     )?;
+    touch_session(session)?;
     Ok(message)
 }
 
@@ -242,12 +310,49 @@ pub async fn append_tool_result_message_async(
 
 pub fn append_event(session: &Session, event: Event) -> Result<(), StorageError> {
     let path = session.path.join("events.jsonl");
-    let sequence = next_sequence(&path)?;
-    append_line(&path, &event_to_jsonl(sequence, &session.id, &event)?)
+    let mut sequence = session
+        .sequence
+        .lock()
+        .map_err(|_| StorageError::SequenceLock)?;
+    append_line(&path, &event_to_jsonl(*sequence, &session.id, &event)?)?;
+    *sequence += 1;
+    touch_session(session)
 }
 
 pub async fn append_event_async(session: Session, event: Event) -> Result<(), StorageError> {
     run_blocking_storage(move || append_event(&session, event)).await
+}
+
+pub fn finalize_session(session: &Session, outcome: Outcome) -> Result<(), StorageError> {
+    let path = session.path.join("session.json");
+    let content = fs::read_to_string(&path)?;
+    let mut record: SessionRecord = serde_json::from_str(&content)?;
+    record.status = match outcome {
+        Outcome::Succeeded => SessionStatus::Succeeded,
+        Outcome::Failed => SessionStatus::Failed,
+        Outcome::Cancelled => SessionStatus::Cancelled,
+    };
+    record.updated_at = timestamp();
+    let session_json = serde_json::to_string(&record)?;
+    fs::write(path, format!("{session_json}\n"))?;
+    Ok(())
+}
+
+fn touch_session(session: &Session) -> Result<(), StorageError> {
+    let path = session.path.join("session.json");
+    let content = fs::read_to_string(&path)?;
+    let mut record: SessionRecord = serde_json::from_str(&content)?;
+    record.updated_at = timestamp();
+    let session_json = serde_json::to_string(&record)?;
+    fs::write(path, format!("{session_json}\n"))?;
+    Ok(())
+}
+
+pub async fn finalize_session_async(
+    session: Session,
+    outcome: Outcome,
+) -> Result<(), StorageError> {
+    run_blocking_storage(move || finalize_session(&session, outcome)).await
 }
 
 pub fn replay_events(path: &Path) -> Result<Vec<String>, StorageError> {
@@ -422,6 +527,7 @@ mod tests {
             &session,
             Event::ModelRequestStarted {
                 request_id: "req_1".to_string(),
+                attempt: 1,
                 model: "deepseek-test".to_string(),
             },
         )
@@ -429,6 +535,8 @@ mod tests {
         append_event(
             &session,
             Event::ReasoningDelta {
+                request_id: "req_1".to_string(),
+                attempt: 1,
                 text: "think\nstep".to_string(),
             },
         )
@@ -436,7 +544,27 @@ mod tests {
         append_event(
             &session,
             Event::AssistantDelta {
+                request_id: "req_1".to_string(),
+                attempt: 1,
                 text: "hello".to_string(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &session,
+            Event::ModelAttemptFailed {
+                request_id: "req_1".to_string(),
+                attempt: 1,
+                retryable: true,
+                message: "retry".to_string(),
+            },
+        )
+        .unwrap();
+        append_event(
+            &session,
+            Event::ModelAttemptCommitted {
+                request_id: "req_1".to_string(),
+                attempt: 2,
             },
         )
         .unwrap();
@@ -498,6 +626,8 @@ mod tests {
         append_event(
             &session,
             Event::UsageRecorded {
+                request_id: "req_1".to_string(),
+                attempt: 2,
                 input_tokens: 11,
                 output_tokens: 22,
             },
@@ -534,11 +664,12 @@ mod tests {
         append_user_message(&session, "hello \"world\"").unwrap();
         append_assistant_message(
             &session,
+            "",
             "I will read",
             &[(
                 "call_1".to_string(),
                 "Read".to_string(),
-                "src/lib.rs".to_string(),
+                serde_json::json!({"path": "src/lib.rs"}),
             )],
         )
         .unwrap();
@@ -563,6 +694,8 @@ mod tests {
         append_event(
             &session,
             Event::AssistantDelta {
+                request_id: "req_1".to_string(),
+                attempt: 1,
                 text: "partial answer".to_string(),
             },
         )
@@ -620,10 +753,25 @@ mod tests {
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join("events.jsonl"), "").unwrap();
         fs::write(path.join("messages.jsonl"), "").unwrap();
+        fs::write(
+            path.join("session.json"),
+            serde_json::to_string(&SessionRecord {
+                version: "1".to_string(),
+                session_id: id.to_string(),
+                workspace_root: root.display().to_string(),
+                created_at: "0".to_string(),
+                updated_at: "0".to_string(),
+                status: SessionStatus::Running,
+            })
+            .unwrap(),
+        )
+        .unwrap();
         Session {
             id: id.to_string(),
             workspace_root: root.to_path_buf(),
             path,
+            sequence: Arc::new(Mutex::new(1)),
+            finalizing: Arc::new(AtomicBool::new(false)),
         }
     }
 

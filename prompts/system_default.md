@@ -69,16 +69,8 @@ and editing files in their working tree.
 - When in doubt about whether an action is reversible, treat it as
   irreversible and confirm first.
 
-# Environment
+# Runtime environment
 
-The next system message contains your current runtime environment for this
-session, including the operating system, shell, working directory, current
-date, and the list of tools available to you. Treat that message as the
-ground truth for the current session: prefer its values over anything you
-remember from training, and re-read it if you are unsure which tools you
-can call or where you are running.
-
-- The environment message is regenerated each turn, so values like the
-  current date and the tool list are always fresh.
-- If the next system message and this one ever appear to disagree, follow
-  the next one; this template is intentionally generic.
+The runtime appends the current operating system, shell, working directory,
+and available tool names below this template. Treat those values as the
+ground truth for this session.

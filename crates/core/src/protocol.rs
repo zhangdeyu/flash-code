@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,8 +33,7 @@ pub enum ContentBlock {
     ToolUse {
         call_id: String,
         name: String,
-        /// The serialized input arguments passed to the tool (plain string, as received from provider).
-        input: String,
+        input: Value,
     },
     ToolResult {
         call_id: String,
@@ -91,18 +91,18 @@ impl Outcome {
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     Running,
-    Completed,
+    Succeeded,
     Failed,
-    Interrupted,
+    Cancelled,
 }
 
 impl SessionStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
-            Self::Completed => "completed",
+            Self::Succeeded => "succeeded",
             Self::Failed => "failed",
-            Self::Interrupted => "interrupted",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -118,13 +118,28 @@ pub enum Event {
     },
     ModelRequestStarted {
         request_id: String,
+        attempt: u32,
         model: String,
     },
     ReasoningDelta {
+        request_id: String,
+        attempt: u32,
         text: String,
     },
     AssistantDelta {
+        request_id: String,
+        attempt: u32,
         text: String,
+    },
+    ModelAttemptFailed {
+        request_id: String,
+        attempt: u32,
+        retryable: bool,
+        message: String,
+    },
+    ModelAttemptCommitted {
+        request_id: String,
+        attempt: u32,
     },
     AssistantMessageCompleted {
         message_id: String,
@@ -154,6 +169,8 @@ pub enum Event {
         status: ToolResultStatus,
     },
     UsageRecorded {
+        request_id: String,
+        attempt: u32,
         input_tokens: u64,
         output_tokens: u64,
     },
@@ -173,6 +190,8 @@ impl Event {
             Self::ModelRequestStarted { .. } => "model_request_started",
             Self::ReasoningDelta { .. } => "reasoning_delta",
             Self::AssistantDelta { .. } => "assistant_delta",
+            Self::ModelAttemptFailed { .. } => "model_attempt_failed",
+            Self::ModelAttemptCommitted { .. } => "model_attempt_committed",
             Self::AssistantMessageCompleted { .. } => "assistant_message_completed",
             Self::ToolCallRequested { .. } => "tool_call_requested",
             Self::ApprovalRequired { .. } => "approval_required",
@@ -200,7 +219,7 @@ mod tests {
             content: vec![ContentBlock::ToolUse {
                 call_id: "call_1".to_string(),
                 name: "Read".to_string(),
-                input: "src/lib.rs".to_string(),
+                input: serde_json::json!({"path": "src/lib.rs"}),
             }],
         };
 

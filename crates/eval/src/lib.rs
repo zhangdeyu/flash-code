@@ -852,6 +852,12 @@ fn run_swe_bench_grader(root: &Path, run: &EvalRun) -> Result<flash_core::ToolOu
         stdout,
         stderr,
         status,
+        exit_code: output.status.code(),
+        signal: None,
+        duration_ms: 0,
+        timed_out: false,
+        truncated: false,
+        artifact: None,
     })
 }
 
@@ -902,6 +908,12 @@ fn run_grader(root: &Path, run: &EvalRun) -> Result<flash_core::ToolOutput, Eval
         stdout,
         stderr,
         status,
+        exit_code: output.status.code(),
+        signal: None,
+        duration_ms: 0,
+        timed_out: false,
+        truncated: false,
+        artifact: None,
     })
 }
 
