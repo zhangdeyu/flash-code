@@ -13,7 +13,9 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 flash-agent = { path = "../agent" }
 flash-core = { path = "../core" }
+flash-deepseek = { path = "../deepseek" }
 flash-eval = { path = "../eval" }
+flash-provider = { path = "../provider" }
 flash-tui = { path = "../tui" }
 flash-tools = { path = "../tools" }
 tokio = { version = "1", features = ["macros", "rt"] }

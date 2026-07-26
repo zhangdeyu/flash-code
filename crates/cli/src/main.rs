@@ -10,6 +10,8 @@ use flash_core::{
     discover_workspace_root, init_workspace, replay_events, Config, ConfigOverrides, Event,
     PermissionPolicy,
 };
+use flash_deepseek::DeepSeekProvider;
+use flash_provider::{ChatProvider, ChatRequest, ProviderError, ProviderEvent};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -106,6 +108,25 @@ async fn tui() -> Result<(), CliError> {
 
 struct CliTaskRunner;
 
+enum CliProvider {
+    DeepSeek(DeepSeekProvider),
+    Smoke(SmokeProvider),
+}
+
+#[async_trait(?Send)]
+impl ChatProvider for CliProvider {
+    async fn chat(
+        &mut self,
+        request: ChatRequest,
+        on_event: &mut dyn FnMut(ProviderEvent),
+    ) -> Result<(), ProviderError> {
+        match self {
+            Self::DeepSeek(provider) => provider.chat(request, on_event).await,
+            Self::Smoke(provider) => provider.chat(request, on_event).await,
+        }
+    }
+}
+
 #[async_trait(?Send)]
 impl flash_tui::TaskRunner for CliTaskRunner {
     fn permission_mode(&mut self, workspace_root: &Path) -> String {
@@ -123,8 +144,9 @@ impl flash_tui::TaskRunner for CliTaskRunner {
         let config = load_config(workspace_root, &ConfigOverrides::default())
             .map_err(|error| error.to_string())?;
         let registry = flash_tools::builtin_registry().map_err(|error| error.to_string())?;
+        let provider = provider_from_config(&config).map_err(|error| error.to_string())?;
         let mut runtime = AgentRuntime::new(
-            SmokeProvider::new(),
+            provider,
             registry,
             AgentOptions {
                 model: config.deepseek_model,
@@ -199,8 +221,9 @@ async fn run_task(task: &str) -> Result<(), CliError> {
     let root = discover_workspace_root(None)?;
     let config = load_config(&root, &ConfigOverrides::default())?;
     let registry = flash_tools::builtin_registry().map_err(CliError::ToolRegistry)?;
+    let provider = provider_from_config(&config)?;
     let mut runtime = AgentRuntime::new(
-        SmokeProvider::new(),
+        provider,
         registry,
         AgentOptions {
             model: config.deepseek_model,
@@ -214,6 +237,19 @@ async fn run_task(task: &str) -> Result<(), CliError> {
     println!("session: {}", run.session_id);
     println!("outcome: {}", run.outcome.as_str());
     Ok(())
+}
+
+fn provider_from_config(config: &Config) -> Result<CliProvider, CliError> {
+    match config.provider_default.as_str() {
+        "deepseek" => Ok(CliProvider::DeepSeek(DeepSeekProvider::from_env(
+            &config.deepseek_base_url,
+            &config.deepseek_api_key_env,
+        )?)),
+        "smoke" => Ok(CliProvider::Smoke(SmokeProvider::new())),
+        provider => Err(CliError::Usage(format!(
+            "unsupported provider `{provider}`; expected `deepseek` or `smoke`"
+        ))),
+    }
 }
 
 async fn eval(command: EvalCommand) -> Result<(), CliError> {
@@ -404,6 +440,7 @@ enum CliError {
     Config(flash_core::config::ConfigError),
     Agent(flash_agent::AgentError),
     Eval(flash_eval::EvalError),
+    Provider(ProviderError),
     Storage(flash_core::storage::StorageError),
     ToolRegistry(flash_core::tools::ToolRegistryError),
     Tui(flash_tui::TuiError),
@@ -417,6 +454,7 @@ impl std::fmt::Display for CliError {
             Self::Config(error) => write!(formatter, "{error}"),
             Self::Agent(error) => write!(formatter, "{error}"),
             Self::Eval(error) => write!(formatter, "{error}"),
+            Self::Provider(error) => write!(formatter, "{error}"),
             Self::Storage(error) => write!(formatter, "{error}"),
             Self::ToolRegistry(error) => write!(formatter, "{error}"),
             Self::Tui(error) => write!(formatter, "{error}"),
@@ -449,6 +487,12 @@ impl From<flash_agent::AgentError> for CliError {
 impl From<flash_eval::EvalError> for CliError {
     fn from(error: flash_eval::EvalError) -> Self {
         Self::Eval(error)
+    }
+}
+
+impl From<ProviderError> for CliError {
+    fn from(error: ProviderError) -> Self {
+        Self::Provider(error)
     }
 }
 
