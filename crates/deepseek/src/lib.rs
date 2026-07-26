@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use flash_core::{ContentBlock, Message, Role};
@@ -14,15 +15,57 @@ pub struct DeepSeekProvider {
     client: reqwest::Client,
     base_url: String,
     api_key: String,
+    options: DeepSeekOptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeepSeekOptions {
+    pub connect_timeout: Duration,
+    pub first_byte_timeout: Duration,
+    pub stream_idle_timeout: Duration,
+    pub max_error_body_bytes: usize,
+    pub max_sse_frame_bytes: usize,
+    pub max_tool_arguments_bytes: usize,
+}
+
+impl Default for DeepSeekOptions {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(10),
+            first_byte_timeout: Duration::from_secs(30),
+            stream_idle_timeout: Duration::from_secs(30),
+            max_error_body_bytes: 64 * 1024,
+            max_sse_frame_bytes: 1024 * 1024,
+            max_tool_arguments_bytes: 1024 * 1024,
+        }
+    }
 }
 
 impl DeepSeekProvider {
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
-        Self {
-            client: reqwest::Client::new(),
+        Self::with_options(base_url, api_key, DeepSeekOptions::default())
+            .expect("default DeepSeek HTTP client options must be valid")
+    }
+
+    pub fn with_options(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        options: DeepSeekOptions,
+    ) -> Result<Self, ProviderError> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(options.connect_timeout)
+            .build()
+            .map_err(|error| {
+                ProviderError::InvalidRequest(format!(
+                    "failed to build DeepSeek HTTP client: {error}"
+                ))
+            })?;
+        Ok(Self {
+            client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
-        }
+            options,
+        })
     }
 
     pub fn from_env(base_url: impl Into<String>, api_key_env: &str) -> Result<Self, ProviderError> {
@@ -30,6 +73,17 @@ impl DeepSeekProvider {
             ProviderError::Authentication(format!("missing DeepSeek API key: set {api_key_env}"))
         })?;
         Ok(Self::new(base_url, api_key))
+    }
+
+    pub fn from_env_with_options(
+        base_url: impl Into<String>,
+        api_key_env: &str,
+        options: DeepSeekOptions,
+    ) -> Result<Self, ProviderError> {
+        let api_key = std::env::var(api_key_env).map_err(|_| {
+            ProviderError::Authentication(format!("missing DeepSeek API key: set {api_key_env}"))
+        })?;
+        Self::with_options(base_url, api_key, options)
     }
 
     async fn post_chat(
@@ -47,8 +101,14 @@ impl DeepSeekProvider {
         let status = response.status();
         if !status.is_success() {
             let code = status.as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(map_error(code, &body));
+            let retry_after = parse_retry_after(response.headers());
+            let body = read_limited_error_body(
+                response,
+                self.options.max_error_body_bytes,
+                self.options.stream_idle_timeout,
+            )
+            .await?;
+            return Err(map_error_with_retry_after(code, &body, retry_after));
         }
         Ok(response)
     }
@@ -66,20 +126,39 @@ impl ChatProvider for DeepSeekProvider {
             () = request.cancellation.cancelled() => {
                 return Err(ProviderError::Cancelled("DeepSeek request cancelled".to_string()));
             }
-            result = self.post_chat(body) => result?,
+            result = tokio::time::timeout(self.options.first_byte_timeout, self.post_chat(body)) => {
+                result.map_err(|_| ProviderError::Timeout(
+                    "DeepSeek timed out waiting for response headers".to_string()
+                ))??
+            },
         };
-        let mut decoder = SseDecoder::default();
+        let mut decoder = SseDecoder::new(
+            self.options.max_sse_frame_bytes,
+            self.options.max_tool_arguments_bytes,
+        );
         let mut stream = response.bytes_stream();
+        let mut first_chunk = true;
         loop {
+            let timeout = if first_chunk {
+                self.options.first_byte_timeout
+            } else {
+                self.options.stream_idle_timeout
+            };
             let chunk = tokio::select! {
                 () = request.cancellation.cancelled() => {
                     return Err(ProviderError::Cancelled("DeepSeek stream cancelled".to_string()));
                 }
-                chunk = stream.next() => chunk,
+                chunk = tokio::time::timeout(timeout, stream.next()) => {
+                    chunk.map_err(|_| {
+                        let phase = if first_chunk { "first byte" } else { "stream data" };
+                        ProviderError::Timeout(format!("DeepSeek timed out waiting for {phase}"))
+                    })?
+                },
             };
             let Some(chunk) = chunk else {
                 break;
             };
+            first_chunk = false;
             let chunk = chunk.map_err(map_reqwest_error)?;
             let mut decoded = Vec::new();
             decoder.push_bytes(&chunk, &mut |event| decoded.push(event))?;
@@ -111,6 +190,14 @@ pub fn parse_sse_chunks(chunks: &[&[u8]]) -> Result<Vec<ProviderEvent>, DeepSeek
 }
 
 pub fn map_error(status: u16, body: &str) -> ProviderError {
+    map_error_with_retry_after(status, body, None)
+}
+
+fn map_error_with_retry_after(
+    status: u16,
+    body: &str,
+    retry_after: Option<Duration>,
+) -> ProviderError {
     let message = if body.is_empty() {
         format!("DeepSeek request failed with HTTP {status}")
     } else {
@@ -120,10 +207,58 @@ pub fn map_error(status: u16, body: &str) -> ProviderError {
         400 | 422 => ProviderError::InvalidRequest(message),
         401 => ProviderError::Authentication(message),
         402 => ProviderError::Billing(message),
-        429 => ProviderError::RateLimited(message),
-        500..=599 => ProviderError::Server(message),
+        429 => ProviderError::RateLimited {
+            message,
+            retry_after,
+        },
+        500..=599 => ProviderError::Server {
+            message,
+            retry_after,
+        },
         _ => ProviderError::Unrecoverable(message),
     }
+}
+
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let retry_at = httpdate::parse_http_date(value).ok()?;
+    retry_at.duration_since(SystemTime::now()).ok()
+}
+
+async fn read_limited_error_body(
+    response: reqwest::Response,
+    max_bytes: usize,
+    idle_timeout: Duration,
+) -> Result<String, ProviderError> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    loop {
+        let chunk = tokio::time::timeout(idle_timeout, stream.next())
+            .await
+            .map_err(|_| {
+                ProviderError::Timeout(
+                    "DeepSeek timed out while reading HTTP error response".to_string(),
+                )
+            })?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        let chunk = chunk.map_err(map_reqwest_error)?;
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(ProviderError::ResponseTooLarge(format!(
+                "DeepSeek HTTP error body exceeded {max_bytes} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +270,8 @@ pub enum DeepSeekParseError {
     MissingFinishReason,
     PendingToolCalls,
     UnknownFinishReason(String),
+    FrameTooLarge(usize),
+    ToolArgumentsTooLarge(usize),
 }
 
 impl std::fmt::Display for DeepSeekParseError {
@@ -158,6 +295,12 @@ impl std::fmt::Display for DeepSeekParseError {
             Self::UnknownFinishReason(reason) => {
                 write!(formatter, "unknown DeepSeek finish reason `{reason}`")
             }
+            Self::FrameTooLarge(limit) => {
+                write!(formatter, "DeepSeek SSE frame exceeded {limit} bytes")
+            }
+            Self::ToolArgumentsTooLarge(limit) => {
+                write!(formatter, "DeepSeek tool arguments exceeded {limit} bytes")
+            }
         }
     }
 }
@@ -170,27 +313,54 @@ impl From<DeepSeekParseError> for ProviderError {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SseDecoder {
     buffer: Vec<u8>,
     data_lines: Vec<String>,
+    data_bytes: usize,
+    max_frame_bytes: usize,
     parser: SseParser,
 }
 
+impl Default for SseDecoder {
+    fn default() -> Self {
+        let options = DeepSeekOptions::default();
+        Self::new(
+            options.max_sse_frame_bytes,
+            options.max_tool_arguments_bytes,
+        )
+    }
+}
+
 impl SseDecoder {
+    fn new(max_frame_bytes: usize, max_tool_arguments_bytes: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            data_lines: Vec::new(),
+            data_bytes: 0,
+            max_frame_bytes,
+            parser: SseParser::new(max_tool_arguments_bytes),
+        }
+    }
+
     fn push_bytes(
         &mut self,
         bytes: &[u8],
         on_event: &mut dyn FnMut(ProviderEvent),
     ) -> Result<(), DeepSeekParseError> {
-        self.buffer.extend_from_slice(bytes);
-        while let Some(line_end) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let mut line = self.buffer.drain(..=line_end).collect::<Vec<_>>();
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
+        for byte in bytes {
+            if *byte == b'\n' {
+                let mut line = std::mem::take(&mut self.buffer);
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                self.push_line(&line, on_event)?;
+            } else {
+                if self.buffer.len() >= self.max_frame_bytes {
+                    return Err(DeepSeekParseError::FrameTooLarge(self.max_frame_bytes));
+                }
+                self.buffer.push(*byte);
             }
-            self.push_line(&line, on_event)?;
         }
         Ok(())
     }
@@ -226,8 +396,18 @@ impl SseDecoder {
         let Some(value) = line.strip_prefix("data:") else {
             return Ok(());
         };
-        self.data_lines
-            .push(value.strip_prefix(' ').unwrap_or(value).to_string());
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        let separator = usize::from(!self.data_lines.is_empty());
+        if self
+            .data_bytes
+            .saturating_add(separator)
+            .saturating_add(value.len())
+            > self.max_frame_bytes
+        {
+            return Err(DeepSeekParseError::FrameTooLarge(self.max_frame_bytes));
+        }
+        self.data_bytes += separator + value.len();
+        self.data_lines.push(value.to_string());
 
         let data = self.data_lines.join("\n");
         if data == "[DONE]" || serde_json::from_str::<serde_json::Value>(&data).is_ok() {
@@ -243,18 +423,30 @@ impl SseDecoder {
         if self.data_lines.is_empty() {
             return Ok(());
         }
+        self.data_bytes = 0;
         let data = std::mem::take(&mut self.data_lines).join("\n");
         self.parser.push_data(&data, on_event)
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SseParser {
     tool_calls: BTreeMap<u64, ToolCallBuilder>,
     done_emitted: bool,
+    max_tool_arguments_bytes: usize,
+    tool_arguments_bytes: usize,
 }
 
 impl SseParser {
+    fn new(max_tool_arguments_bytes: usize) -> Self {
+        Self {
+            tool_calls: BTreeMap::new(),
+            done_emitted: false,
+            max_tool_arguments_bytes,
+            tool_arguments_bytes: 0,
+        }
+    }
+
     fn push_data(
         &mut self,
         data: &str,
@@ -293,6 +485,14 @@ impl SseParser {
                         builder.name = name;
                     }
                     if let Some(arguments) = function.arguments {
+                        if self.tool_arguments_bytes.saturating_add(arguments.len())
+                            > self.max_tool_arguments_bytes
+                        {
+                            return Err(DeepSeekParseError::ToolArgumentsTooLarge(
+                                self.max_tool_arguments_bytes,
+                            ));
+                        }
+                        self.tool_arguments_bytes += arguments.len();
                         builder.input.push_str(&arguments);
                     }
                 }
@@ -331,6 +531,7 @@ impl SseParser {
                 on_event(ProviderEvent::ToolCallComplete(call));
             }
         }
+        self.tool_arguments_bytes = 0;
         Ok(())
     }
 
@@ -525,8 +726,13 @@ fn convert_tool(tool: &ToolSpec) -> Result<DeepSeekTool, ProviderError> {
 }
 
 fn map_reqwest_error(error: reqwest::Error) -> ProviderError {
-    if error.is_timeout() || error.is_connect() {
-        ProviderError::Server(format!("DeepSeek request failed: {error}"))
+    if error.is_timeout() {
+        ProviderError::Timeout(format!("DeepSeek request timed out: {error}"))
+    } else if error.is_connect() {
+        ProviderError::Server {
+            message: format!("DeepSeek connection failed: {error}"),
+            retry_after: None,
+        }
     } else {
         ProviderError::Unrecoverable(format!("DeepSeek request failed: {error}"))
     }
@@ -536,6 +742,8 @@ fn map_reqwest_error(error: reqwest::Error) -> ProviderError {
 mod tests {
     use super::*;
     use flash_core::{ContentBlock, Message, Role};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn request_body_should_use_typed_streaming_tool_payload() {
@@ -722,6 +930,7 @@ mod tests {
         let error = map_error(429, "rate limited");
 
         assert!(error.is_retryable());
+        assert_eq!(error.retry_after(), None);
     }
 
     #[test]
@@ -740,5 +949,237 @@ mod tests {
             DeepSeekProvider::from_env("https://api.deepseek.com", missing_env).unwrap_err();
 
         assert!(error.to_string().contains(missing_env));
+    }
+
+    #[tokio::test]
+    async fn local_http_stream_should_emit_real_reqwest_events() {
+        let (base_url, server) = serve_http(vec![
+            (
+                Duration::ZERO,
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+            ),
+            (
+                Duration::ZERO,
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n".to_vec(),
+            ),
+            (
+                Duration::from_millis(10),
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\ndata: [DONE]\n"
+                    .to_vec(),
+            ),
+        ])
+        .await;
+        let mut provider = DeepSeekProvider::with_options(
+            base_url,
+            "test-key",
+            test_options(Duration::from_secs(1)),
+        )
+        .unwrap();
+
+        let events = chat_events(&mut provider).await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::TextDelta("hello".to_string()),
+                ProviderEvent::Done(StopReason::EndTurn),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn first_byte_timeout_should_fail_within_bound() {
+        let (base_url, server) = serve_http(vec![(
+            Duration::from_millis(150),
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec(),
+        )])
+        .await;
+        let mut provider = DeepSeekProvider::with_options(
+            base_url,
+            "test-key",
+            test_options(Duration::from_millis(30)),
+        )
+        .unwrap();
+        let started = tokio::time::Instant::now();
+
+        let error = chat_events(&mut provider).await.unwrap_err();
+        let elapsed = started.elapsed();
+        server.await.unwrap();
+
+        assert!(matches!(error, ProviderError::Timeout(_)), "{error}");
+        assert!(elapsed < Duration::from_millis(140));
+    }
+
+    #[tokio::test]
+    async fn connect_timeout_should_bound_unreachable_endpoint() {
+        let mut options = test_options(Duration::from_millis(30));
+        options.first_byte_timeout = Duration::from_millis(200);
+        let mut provider =
+            DeepSeekProvider::with_options("http://192.0.2.1:81", "test-key", options).unwrap();
+        provider.client = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_millis(30))
+            .build()
+            .unwrap();
+        let started = tokio::time::Instant::now();
+
+        let error = tokio::time::timeout(Duration::from_millis(500), chat_events(&mut provider))
+            .await
+            .expect("connect attempt exceeded outer safety bound")
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                ProviderError::Timeout(_) | ProviderError::Server { .. }
+            ),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_should_fail_after_publishing_first_delta() {
+        let (base_url, server) = serve_http(vec![
+            (
+                Duration::ZERO,
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+            ),
+            (
+                Duration::ZERO,
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n".to_vec(),
+            ),
+            (
+                Duration::from_millis(150),
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n".to_vec(),
+            ),
+        ])
+        .await;
+        let mut options = test_options(Duration::from_secs(1));
+        options.stream_idle_timeout = Duration::from_millis(30);
+        let mut provider = DeepSeekProvider::with_options(base_url, "test-key", options).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+
+        let error = provider
+            .chat(test_chat_request(), sender)
+            .await
+            .unwrap_err();
+        let first = receiver.recv().await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(first, ProviderEvent::TextDelta("partial".to_string()));
+        assert!(matches!(error, ProviderError::Timeout(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn retry_after_should_be_parsed_from_http_response() {
+        let (base_url, server) = serve_http(vec![(
+            Duration::ZERO,
+            b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 2\r\nContent-Length: 4\r\nConnection: close\r\n\r\nslow"
+                .to_vec(),
+        )])
+        .await;
+        let mut provider = DeepSeekProvider::with_options(
+            base_url,
+            "test-key",
+            test_options(Duration::from_secs(1)),
+        )
+        .unwrap();
+
+        let error = chat_events(&mut provider).await.unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(error, ProviderError::RateLimited { .. }));
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(2)));
+    }
+
+    #[tokio::test]
+    async fn oversized_http_error_body_should_be_rejected() {
+        let (base_url, server) = serve_http(vec![(
+            Duration::ZERO,
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 16\r\nConnection: close\r\n\r\n0123456789abcdef"
+                .to_vec(),
+        )])
+        .await;
+        let mut options = test_options(Duration::from_secs(1));
+        options.max_error_body_bytes = 8;
+        let mut provider = DeepSeekProvider::with_options(base_url, "test-key", options).unwrap();
+
+        let error = chat_events(&mut provider).await.unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(error, ProviderError::ResponseTooLarge(_)));
+    }
+
+    #[test]
+    fn decoder_should_bound_sse_frames_and_tool_arguments() {
+        let mut frame_decoder = SseDecoder::new(16, 128);
+        let frame_error = frame_decoder
+            .push_bytes(b"data: 01234567890123456", &mut |_| {})
+            .unwrap_err();
+
+        let mut tool_decoder = SseDecoder::new(1024, 4);
+        let tool_error = tool_decoder
+            .push_bytes(
+                b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"Read\",\"arguments\":\"123\"}},{\"index\":1,\"function\":{\"name\":\"Read\",\"arguments\":\"456\"}}]}}]}\n",
+                &mut |_| {},
+            )
+            .unwrap_err();
+
+        assert_eq!(frame_error, DeepSeekParseError::FrameTooLarge(16));
+        assert_eq!(tool_error, DeepSeekParseError::ToolArgumentsTooLarge(4));
+    }
+
+    async fn chat_events(
+        provider: &mut DeepSeekProvider,
+    ) -> Result<Vec<ProviderEvent>, ProviderError> {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        provider.chat(test_chat_request(), sender).await?;
+        let mut events = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    fn test_chat_request() -> ChatRequest {
+        ChatRequest {
+            model: "deepseek-chat".to_string(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            cancellation: flash_core::CancellationToken::new(),
+        }
+    }
+
+    fn test_options(timeout: Duration) -> DeepSeekOptions {
+        DeepSeekOptions {
+            connect_timeout: timeout,
+            first_byte_timeout: timeout,
+            stream_idle_timeout: timeout,
+            max_error_body_bytes: 1024,
+            max_sse_frame_bytes: 1024,
+            max_tool_arguments_bytes: 1024,
+        }
+    }
+
+    async fn serve_http(parts: Vec<(Duration, Vec<u8>)>) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 16 * 1024];
+            let _read = socket.read(&mut request).await.unwrap();
+            for (delay, bytes) in parts {
+                tokio::time::sleep(delay).await;
+                if socket.write_all(&bytes).await.is_err() {
+                    break;
+                }
+                let _result = socket.flush().await;
+            }
+        });
+        (format!("http://{address}"), server)
     }
 }

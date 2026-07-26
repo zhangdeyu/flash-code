@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use flash_core::{CancellationToken, Message};
 use serde_json::Value;
+use std::time::Duration;
 
 #[async_trait(?Send)]
 pub trait ChatProvider {
@@ -76,8 +77,16 @@ pub enum StopReason {
 pub enum ProviderError {
     Authentication(String),
     Billing(String),
-    RateLimited(String),
-    Server(String),
+    RateLimited {
+        message: String,
+        retry_after: Option<Duration>,
+    },
+    Server {
+        message: String,
+        retry_after: Option<Duration>,
+    },
+    Timeout(String),
+    ResponseTooLarge(String),
     InvalidRequest(String),
     Cancelled(String),
     Unrecoverable(String),
@@ -85,11 +94,23 @@ pub enum ProviderError {
 
 impl ProviderError {
     pub const fn is_retryable(&self) -> bool {
-        matches!(self, Self::RateLimited(_) | Self::Server(_))
+        matches!(
+            self,
+            Self::RateLimited { .. } | Self::Server { .. } | Self::Timeout(_)
+        )
     }
 
     pub const fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled(_))
+    }
+
+    pub const fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::RateLimited { retry_after, .. } | Self::Server { retry_after, .. } => {
+                *retry_after
+            }
+            _ => None,
+        }
     }
 }
 
@@ -98,11 +119,14 @@ impl std::fmt::Display for ProviderError {
         match self {
             Self::Authentication(message)
             | Self::Billing(message)
-            | Self::RateLimited(message)
-            | Self::Server(message)
+            | Self::Timeout(message)
+            | Self::ResponseTooLarge(message)
             | Self::InvalidRequest(message)
             | Self::Cancelled(message)
             | Self::Unrecoverable(message) => write!(formatter, "{message}"),
+            Self::RateLimited { message, .. } | Self::Server { message, .. } => {
+                write!(formatter, "{message}")
+            }
         }
     }
 }

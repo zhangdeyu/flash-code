@@ -10,6 +10,12 @@ pub struct Config {
     pub deepseek_base_url: String,
     pub deepseek_api_key_env: String,
     pub deepseek_model: String,
+    pub deepseek_connect_timeout_secs: u64,
+    pub deepseek_first_byte_timeout_secs: u64,
+    pub deepseek_stream_idle_timeout_secs: u64,
+    pub deepseek_max_error_body_bytes: usize,
+    pub deepseek_max_sse_frame_bytes: usize,
+    pub deepseek_max_tool_arguments_bytes: usize,
     pub approval_mode: ApprovalMode,
     pub max_turns: u32,
     pub shell_timeout_secs: u64,
@@ -24,6 +30,12 @@ impl Default for Config {
             deepseek_base_url: "https://api.deepseek.com".to_string(),
             deepseek_api_key_env: "DEEPSEEK_API_KEY".to_string(),
             deepseek_model: "deepseek-v4-flash".to_string(),
+            deepseek_connect_timeout_secs: 10,
+            deepseek_first_byte_timeout_secs: 30,
+            deepseek_stream_idle_timeout_secs: 30,
+            deepseek_max_error_body_bytes: 64 * 1024,
+            deepseek_max_sse_frame_bytes: 1024 * 1024,
+            deepseek_max_tool_arguments_bytes: 1024 * 1024,
             approval_mode: ApprovalMode::Confirm,
             max_turns: 50,
             shell_timeout_secs: 120,
@@ -117,6 +129,27 @@ impl Config {
                 self.deepseek_api_key_env = value.to_string();
             }
             ("providers.deepseek", "default_model") => self.deepseek_model = value.to_string(),
+            ("providers.deepseek", "connect_timeout_secs") => {
+                self.deepseek_connect_timeout_secs = parse_positive(value, "connect_timeout_secs")?;
+            }
+            ("providers.deepseek", "first_byte_timeout_secs") => {
+                self.deepseek_first_byte_timeout_secs =
+                    parse_positive(value, "first_byte_timeout_secs")?;
+            }
+            ("providers.deepseek", "stream_idle_timeout_secs") => {
+                self.deepseek_stream_idle_timeout_secs =
+                    parse_positive(value, "stream_idle_timeout_secs")?;
+            }
+            ("providers.deepseek", "max_error_body_bytes") => {
+                self.deepseek_max_error_body_bytes = parse_positive(value, "max_error_body_bytes")?;
+            }
+            ("providers.deepseek", "max_sse_frame_bytes") => {
+                self.deepseek_max_sse_frame_bytes = parse_positive(value, "max_sse_frame_bytes")?;
+            }
+            ("providers.deepseek", "max_tool_arguments_bytes") => {
+                self.deepseek_max_tool_arguments_bytes =
+                    parse_positive(value, "max_tool_arguments_bytes")?;
+            }
             ("agent", "approval_mode") => {
                 self.approval_mode = parse_approval_mode(value).ok_or_else(|| {
                     ConfigError::Parse(format!("invalid approval_mode `{value}`"))
@@ -198,6 +231,21 @@ fn parse_bool(value: &str) -> Option<bool> {
         "false" => Some(false),
         _ => None,
     }
+}
+
+fn parse_positive<T>(value: &str, key: &str) -> Result<T, ConfigError>
+where
+    T: std::str::FromStr + PartialEq + Default,
+{
+    let parsed = value
+        .parse()
+        .map_err(|_| ConfigError::Parse(format!("invalid {key} `{value}`")))?;
+    if parsed == T::default() {
+        return Err(ConfigError::Parse(format!(
+            "{key} must be greater than zero"
+        )));
+    }
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -335,6 +383,65 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unknown config key `providers.deepseek.reasoning_effort`"));
+    }
+
+    #[test]
+    fn load_should_apply_deepseek_reliability_limits() {
+        let dir = temp_dir("deepseek_reliability");
+        let workspace = dir.join("workspace.toml");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &workspace,
+            concat!(
+                "[providers.deepseek]\n",
+                "connect_timeout_secs = 2\n",
+                "first_byte_timeout_secs = 3\n",
+                "stream_idle_timeout_secs = 4\n",
+                "max_error_body_bytes = 5\n",
+                "max_sse_frame_bytes = 6\n",
+                "max_tool_arguments_bytes = 7\n",
+            ),
+        )
+        .unwrap();
+
+        let config = Config::load(
+            None,
+            Some(&workspace),
+            &BTreeMap::new(),
+            &ConfigOverrides::default(),
+        )
+        .unwrap();
+
+        assert_eq!(config.deepseek_connect_timeout_secs, 2);
+        assert_eq!(config.deepseek_first_byte_timeout_secs, 3);
+        assert_eq!(config.deepseek_stream_idle_timeout_secs, 4);
+        assert_eq!(config.deepseek_max_error_body_bytes, 5);
+        assert_eq!(config.deepseek_max_sse_frame_bytes, 6);
+        assert_eq!(config.deepseek_max_tool_arguments_bytes, 7);
+    }
+
+    #[test]
+    fn load_should_reject_zero_reliability_limit() {
+        let dir = temp_dir("deepseek_zero_limit");
+        let workspace = dir.join("workspace.toml");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &workspace,
+            "[providers.deepseek]\nfirst_byte_timeout_secs = 0\n",
+        )
+        .unwrap();
+
+        let error = Config::load(
+            None,
+            Some(&workspace),
+            &BTreeMap::new(),
+            &ConfigOverrides::default(),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("first_byte_timeout_secs must be greater than zero"));
     }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {

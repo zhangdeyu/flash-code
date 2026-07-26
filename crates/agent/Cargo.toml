@@ -13,7 +13,7 @@ async-trait = "0.1"
 flash-core = { path = "../core" }
 flash-provider = { path = "../provider" }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt", "sync"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 flash-deepseek = { path = "../deepseek" }

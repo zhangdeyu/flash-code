@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use flash_core::{
@@ -705,6 +706,15 @@ where
                     )
                     .await?;
                     if will_retry {
+                        let delay = retry_delay(request_id, attempt, error.retry_after());
+                        tokio::select! {
+                            () = request.cancellation.cancelled() => {
+                                return Err(AgentError::Provider(ProviderError::Cancelled(
+                                    "provider retry cancelled".to_string(),
+                                )));
+                            }
+                            () = tokio::time::sleep(delay) => {}
+                        }
                         continue;
                     }
                     return Err(AgentError::Provider(error));
@@ -1128,6 +1138,20 @@ where
             truncated: true,
         })
     }
+}
+
+fn retry_delay(request_id: &str, attempt: u32, retry_after: Option<Duration>) -> Duration {
+    const BASE_MILLIS: u64 = 100;
+    const MAX_MILLIS: u64 = 2_000;
+    const MAX_SERVER_DELAY: Duration = Duration::from_secs(30);
+    let exponent = attempt.saturating_sub(1).min(4);
+    let exponential = BASE_MILLIS.saturating_mul(1_u64 << exponent);
+    let hash = request_id.bytes().fold(u64::from(attempt), |value, byte| {
+        value.wrapping_mul(1_099_511_628_211) ^ u64::from(byte)
+    });
+    let jitter = hash % (exponential / 2 + 1);
+    let policy = Duration::from_millis((exponential + jitter).min(MAX_MILLIS));
+    retry_after.map_or(policy, |server| server.min(MAX_SERVER_DELAY).max(policy))
 }
 
 struct MaterializedOutput {
@@ -2075,6 +2099,154 @@ mod tests {
         assert_eq!(run.outcome, Outcome::Succeeded);
     }
 
+    #[test]
+    fn retry_delay_should_be_deterministic_exponential_and_respect_server_minimum() {
+        let first = retry_delay("request", 1, None);
+        let repeated = retry_delay("request", 1, None);
+        let second = retry_delay("request", 2, None);
+        let server = retry_delay("request", 1, Some(Duration::from_secs(3)));
+
+        assert_eq!(first, repeated);
+        assert!(first >= Duration::from_millis(100));
+        assert!(second >= Duration::from_millis(200));
+        assert_eq!(server, Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn run_task_should_stop_retrying_server_errors_at_three_attempts() {
+        let root = prepared_workspace("server_retry_limit");
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut runtime = AgentRuntime::new(
+            AlwaysErrorProvider {
+                error: ProviderError::Server {
+                    message: "temporary outage".to_string(),
+                    retry_after: None,
+                },
+                calls: Arc::clone(&calls),
+            },
+            ToolRegistry::new(),
+            AgentOptions {
+                model: "smoke".to_string(),
+                max_turns: 1,
+                permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Yolo),
+                max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
+            },
+        );
+        let started = tokio::time::Instant::now();
+
+        let error = runtime.run_task(&root, "retry server").await.unwrap_err();
+
+        assert!(matches!(error, AgentError::Provider(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        let metadata = fs::read_to_string(only_session_path(&root).join("session.json")).unwrap();
+        assert!(metadata.contains("\"status\":\"failed\""));
+    }
+
+    #[tokio::test]
+    async fn run_task_should_finalize_timeout_errors() {
+        let root = prepared_workspace("timeout_finalize");
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut runtime = AgentRuntime::new(
+            AlwaysErrorProvider {
+                error: ProviderError::Timeout("first byte timed out".to_string()),
+                calls: Arc::clone(&calls),
+            },
+            ToolRegistry::new(),
+            AgentOptions {
+                model: "smoke".to_string(),
+                max_turns: 1,
+                permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Yolo),
+                max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
+            },
+        );
+
+        let result = runtime.run_task(&root, "timeout").await;
+
+        assert!(matches!(result, Err(AgentError::Provider(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let session = only_session_path(&root);
+        assert!(fs::read_to_string(session.join("session.json"))
+            .unwrap()
+            .contains("\"status\":\"failed\""));
+        assert_eq!(
+            fs::read_to_string(session.join("events.jsonl"))
+                .unwrap()
+                .matches("\"type\":\"session_finished\"")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn run_task_should_not_retry_permanent_http_failures() {
+        for (name, error) in [
+            (
+                "authentication",
+                ProviderError::Authentication("bad key".to_string()),
+            ),
+            ("billing", ProviderError::Billing("no credit".to_string())),
+            (
+                "invalid_request",
+                ProviderError::InvalidRequest("bad request".to_string()),
+            ),
+        ] {
+            let root = prepared_workspace(name);
+            let calls = Arc::new(AtomicU32::new(0));
+            let mut runtime = AgentRuntime::new(
+                AlwaysErrorProvider {
+                    error,
+                    calls: Arc::clone(&calls),
+                },
+                ToolRegistry::new(),
+                AgentOptions {
+                    model: "smoke".to_string(),
+                    max_turns: 1,
+                    permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Yolo),
+                    max_output_bytes: 200_000,
+                    max_prompt_bytes: 200_000,
+                },
+            );
+
+            let result = runtime.run_task(&root, "do not retry").await;
+
+            assert!(matches!(result, Err(AgentError::Provider(_))), "{name}");
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_after_should_delay_the_next_attempt() {
+        let root = prepared_workspace("retry_after");
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut runtime = AgentRuntime::new(
+            RetryAfterProvider {
+                calls: Arc::clone(&calls),
+                retry_after: Duration::from_millis(450),
+            },
+            ToolRegistry::new(),
+            AgentOptions {
+                model: "smoke".to_string(),
+                max_turns: 1,
+                permission_policy: PermissionPolicy::new(flash_core::tools::ApprovalMode::Yolo),
+                max_output_bytes: 200_000,
+                max_prompt_bytes: 200_000,
+            },
+        );
+        let started = tokio::time::Instant::now();
+
+        let run = runtime
+            .run_task(&root, "respect retry after")
+            .await
+            .unwrap();
+
+        assert_eq!(run.outcome, Outcome::Succeeded);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(started.elapsed() >= Duration::from_millis(450));
+    }
+
     #[tokio::test]
     async fn run_task_should_not_retry_after_publishing_delta() {
         let root = temp_dir("published_delta_retry");
@@ -2880,6 +3052,16 @@ mod tests {
         calls: Arc<AtomicU32>,
     }
 
+    struct AlwaysErrorProvider {
+        error: ProviderError,
+        calls: Arc<AtomicU32>,
+    }
+
+    struct RetryAfterProvider {
+        calls: Arc<AtomicU32>,
+        retry_after: Duration,
+    }
+
     struct CancellableProvider;
 
     #[async_trait(?Send)]
@@ -2905,7 +3087,42 @@ mod tests {
         ) -> Result<(), ProviderError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             send_event(&events, ProviderEvent::TextDelta("partial".to_string())).await?;
-            Err(ProviderError::Server("stream failed".to_string()))
+            Err(ProviderError::Server {
+                message: "stream failed".to_string(),
+                retry_after: None,
+            })
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl ChatProvider for AlwaysErrorProvider {
+        async fn chat(
+            &mut self,
+            _request: ChatRequest,
+            _events: tokio::sync::mpsc::Sender<ProviderEvent>,
+        ) -> Result<(), ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(self.error.clone())
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl ChatProvider for RetryAfterProvider {
+        async fn chat(
+            &mut self,
+            _request: ChatRequest,
+            events: tokio::sync::mpsc::Sender<ProviderEvent>,
+        ) -> Result<(), ProviderError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Err(ProviderError::RateLimited {
+                    message: "rate limited".to_string(),
+                    retry_after: Some(self.retry_after),
+                });
+            }
+            send_event(&events, ProviderEvent::TextDelta("ok".to_string())).await?;
+            send_event(&events, ProviderEvent::Done(StopReason::EndTurn)).await?;
+            Ok(())
         }
     }
 
@@ -2943,7 +3160,10 @@ mod tests {
         ) -> Result<(), ProviderError> {
             self.calls += 1;
             if self.calls == 1 {
-                return Err(ProviderError::RateLimited("rate limited".to_string()));
+                return Err(ProviderError::RateLimited {
+                    message: "rate limited".to_string(),
+                    retry_after: None,
+                });
             }
             send_event(&events, ProviderEvent::TextDelta("ok".to_string())).await?;
             send_event(&events, ProviderEvent::Done(StopReason::EndTurn)).await?;

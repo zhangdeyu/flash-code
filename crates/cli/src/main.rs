@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use clap::{Args, Parser, Subcommand};
@@ -10,7 +11,7 @@ use flash_core::{
     discover_workspace_root, init_workspace, recover_session, replay_events, Config,
     ConfigOverrides, Event, PermissionPolicy,
 };
-use flash_deepseek::DeepSeekProvider;
+use flash_deepseek::{DeepSeekOptions, DeepSeekProvider};
 use flash_provider::{ChatProvider, ChatRequest, ProviderError, ProviderEvent};
 
 #[tokio::main(flavor = "current_thread")]
@@ -282,10 +283,24 @@ fn configured_runtime(config: Config) -> Result<AgentRuntime<CliProvider>, CliEr
 
 fn provider_from_config(config: &Config) -> Result<CliProvider, CliError> {
     match config.provider_default.as_str() {
-        "deepseek" => Ok(CliProvider::DeepSeek(DeepSeekProvider::from_env(
-            &config.deepseek_base_url,
-            &config.deepseek_api_key_env,
-        )?)),
+        "deepseek" => Ok(CliProvider::DeepSeek(
+            DeepSeekProvider::from_env_with_options(
+                &config.deepseek_base_url,
+                &config.deepseek_api_key_env,
+                DeepSeekOptions {
+                    connect_timeout: Duration::from_secs(config.deepseek_connect_timeout_secs),
+                    first_byte_timeout: Duration::from_secs(
+                        config.deepseek_first_byte_timeout_secs,
+                    ),
+                    stream_idle_timeout: Duration::from_secs(
+                        config.deepseek_stream_idle_timeout_secs,
+                    ),
+                    max_error_body_bytes: config.deepseek_max_error_body_bytes,
+                    max_sse_frame_bytes: config.deepseek_max_sse_frame_bytes,
+                    max_tool_arguments_bytes: config.deepseek_max_tool_arguments_bytes,
+                },
+            )?,
+        )),
         "smoke" => Ok(CliProvider::Smoke(SmokeProvider::new())),
         provider => Err(CliError::Usage(format!(
             "unsupported provider `{provider}`; expected `deepseek` or `smoke`"
