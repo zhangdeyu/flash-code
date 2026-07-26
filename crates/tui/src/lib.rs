@@ -375,6 +375,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn load(workspace_root: &Path) -> Result<Self, TuiError> {
+        flash_core::recover_workspace_sessions(workspace_root)?;
         let mut sessions = load_sessions(workspace_root)?;
         sessions.sort_by(|left, right| {
             right

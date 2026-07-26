@@ -12,7 +12,8 @@ pub use storage::{
     append_tool_result_message_async, append_user_message, append_user_message_async,
     create_continuation_session, create_continuation_session_async, create_session,
     create_session_async, finalize_session, finalize_session_async, init_workspace,
-    load_session_history, load_session_history_async, load_session_messages, replay_events,
+    load_session_history, load_session_history_async, load_session_messages, recover_session,
+    recover_session_async, recover_workspace_sessions, replay_events,
 };
 pub use tools::{
     CancellationToken, PermissionDecision, PermissionPolicy, Tool, ToolContext, ToolDescriptor,

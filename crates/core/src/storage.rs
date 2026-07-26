@@ -1,11 +1,12 @@
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -26,6 +27,7 @@ pub struct Session {
     pub path: PathBuf,
     pub parent_session_id: Option<String>,
     pub status: SessionStatus,
+    pub owner_pid: Option<u32>,
     sequence: Arc<Mutex<u64>>,
     finalizing: Arc<AtomicBool>,
 }
@@ -37,6 +39,7 @@ impl PartialEq for Session {
             && self.path == other.path
             && self.parent_session_id == other.parent_session_id
             && self.status == other.status
+            && self.owner_pid == other.owner_pid
     }
 }
 
@@ -56,9 +59,17 @@ pub enum StorageError {
     Parse(String),
     TaskJoin(String),
     SequenceLock,
-    WorkspaceMismatch { expected: PathBuf, actual: PathBuf },
+    WorkspaceMismatch {
+        expected: PathBuf,
+        actual: PathBuf,
+    },
     SessionStillRunning(String),
     AncestryCycle(String),
+    CorruptJsonl {
+        path: PathBuf,
+        line: usize,
+        message: String,
+    },
 }
 
 impl std::fmt::Display for StorageError {
@@ -83,6 +94,15 @@ impl std::fmt::Display for StorageError {
                     "session ancestry contains a cycle at `{session_id}`"
                 )
             }
+            Self::CorruptJsonl {
+                path,
+                line,
+                message,
+            } => write!(
+                formatter,
+                "corrupt JSONL at {} line {line}: {message}",
+                path.display()
+            ),
         }
     }
 }
@@ -114,10 +134,7 @@ pub fn init_workspace(root: &Path) -> Result<Workspace, StorageError> {
         workspace_id: workspace.id.clone(),
         root: root.display().to_string(),
     })?;
-    fs::write(
-        flash_dir.join("workspace.json"),
-        format!("{workspace_json}\n"),
-    )?;
+    atomic_write(&flash_dir.join("workspace.json"), &workspace_json)?;
     Ok(workspace)
 }
 
@@ -152,6 +169,7 @@ fn create_session_record(
         path: session_dir.clone(),
         parent_session_id: parent_session_id.clone(),
         status: SessionStatus::Running,
+        owner_pid: Some(std::process::id()),
         sequence: Arc::new(Mutex::new(1)),
         finalizing: Arc::new(AtomicBool::new(false)),
     };
@@ -164,13 +182,11 @@ fn create_session_record(
         updated_at: now,
         status: SessionStatus::Running,
         parent_session_id,
+        owner_pid: Some(std::process::id()),
     })?;
-    fs::write(
-        session_dir.join("session.json"),
-        format!("{session_json}\n"),
-    )?;
-    fs::write(session_dir.join("messages.jsonl"), "")?;
-    fs::write(session_dir.join("events.jsonl"), "")?;
+    atomic_write(&session_dir.join("session.json"), &session_json)?;
+    File::create(session_dir.join("messages.jsonl"))?.sync_all()?;
+    File::create(session_dir.join("events.jsonl"))?.sync_all()?;
     append_event(&session, Event::SessionStarted { session_id: id })?;
     Ok(session)
 }
@@ -221,6 +237,8 @@ pub fn load_session(root: &Path, session_id: &str) -> Result<Session, StorageErr
             actual: root.to_path_buf(),
         });
     }
+    repair_jsonl::<MessageRecord>(&session_dir.join("messages.jsonl"))?;
+    repair_jsonl::<EventRecord>(&session_dir.join("events.jsonl"))?;
     let sequence = next_sequence(&session_dir.join("events.jsonl"))?;
     let finalized = record.status != SessionStatus::Running;
     Ok(Session {
@@ -229,13 +247,16 @@ pub fn load_session(root: &Path, session_id: &str) -> Result<Session, StorageErr
         path: session_dir,
         parent_session_id: record.parent_session_id,
         status: record.status,
+        owner_pid: record.owner_pid,
         sequence: Arc::new(Mutex::new(sequence)),
         finalizing: Arc::new(AtomicBool::new(finalized)),
     })
 }
 
 pub fn load_session_messages(session: &Session) -> Result<Vec<Message>, StorageError> {
-    let content = fs::read_to_string(session.path.join("messages.jsonl"))?;
+    let path = session.path.join("messages.jsonl");
+    repair_jsonl::<MessageRecord>(&path)?;
+    let content = fs::read_to_string(path)?;
     content
         .lines()
         .map(|line| {
@@ -420,8 +441,11 @@ pub fn finalize_session(session: &Session, outcome: Outcome) -> Result<(), Stora
         Outcome::Cancelled => SessionStatus::Cancelled,
     };
     record.updated_at = timestamp();
+    record.owner_pid = None;
     let session_json = serde_json::to_string(&record)?;
-    fs::write(path, format!("{session_json}\n"))?;
+    sync_file(&session.path.join("messages.jsonl"))?;
+    sync_file(&session.path.join("events.jsonl"))?;
+    atomic_write(&path, &session_json)?;
     Ok(())
 }
 
@@ -431,7 +455,7 @@ fn touch_session(session: &Session) -> Result<(), StorageError> {
     let mut record: SessionRecord = serde_json::from_str(&content)?;
     record.updated_at = timestamp();
     let session_json = serde_json::to_string(&record)?;
-    fs::write(path, format!("{session_json}\n"))?;
+    atomic_write(&path, &session_json)?;
     Ok(())
 }
 
@@ -443,6 +467,7 @@ pub async fn finalize_session_async(
 }
 
 pub fn replay_events(path: &Path) -> Result<Vec<String>, StorageError> {
+    repair_jsonl::<EventRecord>(path)?;
     let content = fs::read_to_string(path)?;
     content
         .lines()
@@ -457,10 +482,205 @@ pub fn replay_events(path: &Path) -> Result<Vec<String>, StorageError> {
         .collect()
 }
 
+pub fn recover_session(root: &Path, session_id: &str) -> Result<Session, StorageError> {
+    let session = load_session(root, session_id)?;
+    if session.status != SessionStatus::Running {
+        return Ok(session);
+    }
+
+    let records = read_event_records(&session.path.join("events.jsonl"))?;
+    let finished = records
+        .iter()
+        .filter_map(|record| match record.event {
+            Event::SessionFinished { outcome } => Some(outcome),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if finished.len() > 1 {
+        return Err(StorageError::Parse(format!(
+            "session `{session_id}` contains multiple session_finished events"
+        )));
+    }
+    if let Some(outcome) = finished.first() {
+        finalize_session(&session, *outcome)?;
+        return load_session(root, session_id);
+    }
+    if session.owner_pid.is_some_and(process_alive) {
+        return Ok(session);
+    }
+
+    append_event(
+        &session,
+        Event::Error {
+            message: "session recovered after previous process exited unexpectedly".to_string(),
+        },
+    )?;
+    append_event(
+        &session,
+        Event::SessionFinished {
+            outcome: Outcome::Failed,
+        },
+    )?;
+    finalize_session(&session, Outcome::Failed)?;
+    load_session(root, session_id)
+}
+
+pub async fn recover_session_async(
+    root: PathBuf,
+    session_id: String,
+) -> Result<Session, StorageError> {
+    run_blocking_storage(move || recover_session(&root, &session_id)).await
+}
+
+pub fn recover_workspace_sessions(root: &Path) -> Result<Vec<Session>, StorageError> {
+    let sessions_dir = root.join(".flash").join("sessions");
+    if !sessions_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut session_ids = Vec::new();
+    for entry in fs::read_dir(sessions_dir)? {
+        let entry = entry?;
+        if entry.path().join("session.json").is_file() {
+            if let Some(session_id) = entry.file_name().to_str() {
+                session_ids.push(session_id.to_string());
+            }
+        }
+    }
+    session_ids.sort();
+    let mut recovered = Vec::new();
+    for session_id in session_ids {
+        match recover_session(root, &session_id) {
+            Ok(session) => recovered.push(session),
+            Err(StorageError::WorkspaceMismatch { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(recovered)
+}
+
 fn append_line(path: &Path, line: &str) -> Result<(), StorageError> {
     let mut file = OpenOptions::new().append(true).create(true).open(path)?;
     writeln!(file, "{line}")?;
+    file.flush()?;
     Ok(())
+}
+
+fn read_event_records(path: &Path) -> Result<Vec<EventRecord>, StorageError> {
+    repair_jsonl::<EventRecord>(path)?;
+    fs::read_to_string(path)?
+        .lines()
+        .map(|line| serde_json::from_str(line).map_err(StorageError::from))
+        .collect()
+}
+
+fn repair_jsonl<T>(path: &Path) -> Result<bool, StorageError>
+where
+    T: DeserializeOwned,
+{
+    if !path.exists() {
+        return Ok(false);
+    }
+    let bytes = fs::read(path)?;
+    if bytes.is_empty() {
+        return Ok(false);
+    }
+
+    let mut offset = 0;
+    let mut line = 1;
+    while offset < bytes.len() {
+        let relative_end = bytes[offset..].iter().position(|byte| *byte == b'\n');
+        let (end, next_offset) = match relative_end {
+            Some(relative_end) => {
+                let end = offset + relative_end;
+                (end, end + 1)
+            }
+            None => (bytes.len(), bytes.len()),
+        };
+        if let Err(error) = serde_json::from_slice::<T>(&bytes[offset..end]) {
+            if next_offset == bytes.len() {
+                let file = OpenOptions::new().write(true).open(path)?;
+                file.set_len(offset as u64)?;
+                file.sync_all()?;
+                return Ok(true);
+            }
+            return Err(StorageError::CorruptJsonl {
+                path: path.to_path_buf(),
+                line,
+                message: error.to_string(),
+            });
+        }
+        offset = next_offset;
+        line += 1;
+    }
+
+    if !bytes.ends_with(b"\n") {
+        let mut file = OpenOptions::new().append(true).open(path)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        file.sync_all()?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn atomic_write(path: &Path, content: &str) -> Result<(), StorageError> {
+    atomic_write_with(path, content, || Ok(()))
+}
+
+fn atomic_write_with<F>(path: &Path, content: &str, before_rename: F) -> Result<(), StorageError>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    let parent = path.parent().ok_or_else(|| {
+        StorageError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atomic write target has no parent directory",
+        ))
+    })?;
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let temp_path = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        timestamp_nanos()
+    ));
+    let result = (|| -> Result<(), StorageError> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        file.sync_all()?;
+        before_rename()?;
+        fs::rename(&temp_path, path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _result = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn sync_file(path: &Path) -> Result<(), StorageError> {
+    OpenOptions::new().read(true).open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn process_alive(pid: u32) -> bool {
+    pid == std::process::id()
 }
 
 async fn run_blocking_storage<T, F>(operation: F) -> Result<T, StorageError>
@@ -524,6 +744,8 @@ struct SessionRecord {
     status: SessionStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -945,6 +1167,200 @@ mod tests {
         assert!(matches!(error, StorageError::AncestryCycle(id) if id == session.id));
     }
 
+    #[test]
+    fn atomic_write_failure_should_preserve_previous_metadata() {
+        let root = temp_dir("atomic_metadata_failure");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.json");
+        atomic_write(&path, r#"{"status":"running"}"#).unwrap();
+
+        let error = atomic_write_with(&path, r#"{"status":"failed"}"#, || {
+            Err(io::Error::other("injected before rename"))
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, StorageError::Io(_)));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "{\"status\":\"running\"}\n"
+        );
+        let names = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["session.json"]);
+    }
+
+    #[test]
+    fn load_should_repair_only_truncated_jsonl_tails() {
+        let root = temp_dir("repair_truncated_tails");
+        fs::create_dir_all(&root).unwrap();
+        let session = create_session(&root).unwrap();
+        append_user_message(&session, "preserved").unwrap();
+        let messages_path = session.path.join("messages.jsonl");
+        let events_path = session.path.join("events.jsonl");
+        let messages_prefix = fs::read(&messages_path).unwrap();
+        let events_prefix = fs::read(&events_path).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&messages_path)
+            .unwrap()
+            .write_all(br#"{"version":"1","message":"#)
+            .unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&events_path)
+            .unwrap()
+            .write_all(br#"{"version":"1","sequence":"#)
+            .unwrap();
+
+        let loaded = load_session(&root, &session.id).unwrap();
+        let messages = load_session_messages(&loaded).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(fs::read(messages_path).unwrap(), messages_prefix);
+        assert_eq!(fs::read(events_path).unwrap(), events_prefix);
+        assert_eq!(
+            replay_events(&loaded.path.join("events.jsonl")).unwrap(),
+            vec!["1: session_started", "2: user_message_appended"]
+        );
+    }
+
+    #[test]
+    fn load_should_reject_jsonl_corruption_before_last_record() {
+        let root = temp_dir("reject_middle_corruption");
+        fs::create_dir_all(&root).unwrap();
+        let session = create_session(&root).unwrap();
+        let events_path = session.path.join("events.jsonl");
+        let first = fs::read_to_string(&events_path).unwrap();
+        let last = event_to_jsonl(
+            3,
+            &session.id,
+            &Event::Error {
+                message: "after corruption".to_string(),
+            },
+        )
+        .unwrap();
+        let corrupt = format!("{first}{{not-json}}\n{last}\n");
+        fs::write(&events_path, &corrupt).unwrap();
+
+        let error = load_session(&root, &session.id).unwrap_err();
+
+        assert!(
+            matches!(error, StorageError::CorruptJsonl { line: 2, .. }),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(events_path).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn recovery_should_fail_stale_session_once_and_allow_continuation() {
+        let root = temp_dir("recover_stale");
+        fs::create_dir_all(&root).unwrap();
+        let session = create_session(&root).unwrap();
+        append_user_message(&session, "unfinished task").unwrap();
+        set_owner_pid(&session, Some(exited_pid()));
+        OpenOptions::new()
+            .append(true)
+            .open(session.path.join("events.jsonl"))
+            .unwrap()
+            .write_all(br#"{"truncated":"#)
+            .unwrap();
+
+        let recovered = recover_session(&root, &session.id).unwrap();
+        let recovered_again = recover_session(&root, &session.id).unwrap();
+        let records = read_event_records(&session.path.join("events.jsonl")).unwrap();
+        let recovery_errors = records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    &record.event,
+                    Event::Error { message }
+                        if message.contains("previous process exited unexpectedly")
+                )
+            })
+            .count();
+        let finished = records
+            .iter()
+            .filter(|record| matches!(record.event, Event::SessionFinished { .. }))
+            .count();
+
+        assert_eq!(recovered.status, SessionStatus::Failed);
+        assert_eq!(recovered.owner_pid, None);
+        assert_eq!(recovered_again.status, SessionStatus::Failed);
+        assert_eq!(recovery_errors, 1);
+        assert_eq!(finished, 1);
+        assert!(!replay_events(&session.path.join("events.jsonl"))
+            .unwrap()
+            .is_empty());
+        let child = create_continuation_session(&root, &session.id).unwrap();
+        assert_eq!(
+            child.parent_session_id.as_deref(),
+            Some(session.id.as_str())
+        );
+    }
+
+    #[test]
+    fn recovery_should_not_fail_session_owned_by_live_process() {
+        let root = temp_dir("recover_live");
+        fs::create_dir_all(&root).unwrap();
+        let session = create_session(&root).unwrap();
+
+        let recovered = recover_session(&root, &session.id).unwrap();
+        let error = create_continuation_session(&root, &session.id).unwrap_err();
+
+        assert_eq!(recovered.status, SessionStatus::Running);
+        assert_eq!(recovered.owner_pid, Some(std::process::id()));
+        assert!(matches!(error, StorageError::SessionStillRunning(id) if id == session.id));
+    }
+
+    #[test]
+    fn recovery_should_commit_existing_terminal_event_without_duplicate() {
+        let root = temp_dir("recover_terminal_event");
+        fs::create_dir_all(&root).unwrap();
+        let session = create_session(&root).unwrap();
+        append_event(
+            &session,
+            Event::SessionFinished {
+                outcome: Outcome::Succeeded,
+            },
+        )
+        .unwrap();
+        set_owner_pid(&session, Some(exited_pid()));
+
+        let recovered = recover_session(&root, &session.id).unwrap();
+        let records = read_event_records(&session.path.join("events.jsonl")).unwrap();
+
+        assert_eq!(recovered.status, SessionStatus::Succeeded);
+        assert_eq!(recovered.owner_pid, None);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.event, Event::SessionFinished { .. }))
+                .count(),
+            1
+        );
+    }
+
+    fn set_owner_pid(session: &Session, owner_pid: Option<u32>) {
+        let path = session.path.join("session.json");
+        let mut record: SessionRecord =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        record.owner_pid = owner_pid;
+        atomic_write(&path, &serde_json::to_string(&record).unwrap()).unwrap();
+    }
+
+    fn exited_pid() -> u32 {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
     fn test_session(root: &Path, id: &str) -> Session {
         let path = root.join(".flash").join("sessions").join(id);
         fs::create_dir_all(&path).unwrap();
@@ -960,6 +1376,7 @@ mod tests {
                 updated_at: "0".to_string(),
                 status: SessionStatus::Running,
                 parent_session_id: None,
+                owner_pid: Some(std::process::id()),
             })
             .unwrap(),
         )
@@ -970,6 +1387,7 @@ mod tests {
             path,
             parent_session_id: None,
             status: SessionStatus::Running,
+            owner_pid: Some(std::process::id()),
             sequence: Arc::new(Mutex::new(1)),
             finalizing: Arc::new(AtomicBool::new(false)),
         }

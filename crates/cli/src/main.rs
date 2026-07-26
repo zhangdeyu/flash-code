@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use clap::{Args, Parser, Subcommand};
 use flash_agent::{AgentOptions, AgentRuntime, ApprovalController, ApprovalRequest, SmokeProvider};
 use flash_core::{
-    discover_workspace_root, init_workspace, replay_events, Config, ConfigOverrides, Event,
-    PermissionPolicy,
+    discover_workspace_root, init_workspace, recover_session, replay_events, Config,
+    ConfigOverrides, Event, PermissionPolicy,
 };
 use flash_deepseek::DeepSeekProvider;
 use flash_provider::{ChatProvider, ChatRequest, ProviderError, ProviderEvent};
@@ -247,6 +247,7 @@ async fn run_task(task: &str) -> Result<(), CliError> {
 
 async fn continue_task(session_id: &str, instruction: &str) -> Result<(), CliError> {
     let root = discover_workspace_root(None)?;
+    recover_session(&root, session_id)?;
     let config = load_config(&root, &ConfigOverrides::default())?;
     let mut runtime = configured_runtime(config)?;
     let run = runtime
@@ -438,7 +439,7 @@ async fn eval_regression() -> Result<(), CliError> {
 
 fn replay(session_id: &str) -> Result<(), CliError> {
     let root = discover_workspace_root(None)?;
-    let session = flash_core::storage::load_session(&root, session_id)?;
+    let session = recover_session(&root, session_id)?;
     for line in replay_events(&session.path.join("events.jsonl"))? {
         println!("{line}");
     }
