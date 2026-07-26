@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
 
+use clap::{Args, Parser, Subcommand};
 use flash_agent::{AgentOptions, AgentRuntime, ApprovalController, ApprovalRequest, SmokeProvider};
 use flash_core::{
     discover_workspace_root, init_workspace, replay_events, Config, ConfigOverrides, Event,
@@ -10,31 +11,87 @@ use flash_core::{
 };
 
 fn main() {
-    if let Err(error) = run(env::args().skip(1).collect()) {
+    if let Err(error) = run(Cli::parse()) {
         eprintln!("error: {error}");
         std::process::exit(1);
     }
 }
 
-fn run(args: Vec<String>) -> Result<(), CliError> {
-    match args.first().map(String::as_str) {
-        None => tui(),
-        Some("--version" | "-V") => {
-            println!("flash {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
-        Some("init") => init(),
-        Some("doctor") => doctor(),
-        Some("run") => run_task(&args[1..]),
-        Some("eval") => eval(&args[1..]),
-        Some("replay") => replay(&args[1..]),
-        Some("resume") => resume(&args[1..]),
-        Some("tui") => tui(),
-        Some("help" | "--help" | "-h") => {
-            print_help();
-            Ok(())
-        }
-        Some(command) => Err(CliError::Usage(format!("unknown command `{command}`"))),
+#[derive(Debug, Clone, PartialEq, Eq, Parser)]
+#[command(name = "flash", version, about = "Flash Code workspace agent")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+#[command(rename_all = "kebab-case")]
+enum CliCommand {
+    Init,
+    Tui,
+    Doctor,
+    Run(RunArgs),
+    Eval {
+        #[command(subcommand)]
+        command: EvalCommand,
+    },
+    Replay(ReplayArgs),
+    Resume(ResumeArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+struct RunArgs {
+    task: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+#[command(rename_all = "kebab-case")]
+enum EvalCommand {
+    Fixture(EvalFixtureArgs),
+    TerminalBench(EvalTerminalBenchArgs),
+    SweBench(EvalSweBenchArgs),
+    Regression,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+struct EvalFixtureArgs {
+    #[arg(long)]
+    task: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+struct EvalTerminalBenchArgs {
+    #[arg(long)]
+    subset: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+struct EvalSweBenchArgs {
+    #[arg(long)]
+    subset: String,
+    #[arg(long, default_value_t = 1)]
+    limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+struct ReplayArgs {
+    events_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+struct ResumeArgs {
+    session_id: String,
+}
+
+fn run(cli: Cli) -> Result<(), CliError> {
+    match cli.command {
+        None | Some(CliCommand::Tui) => tui(),
+        Some(CliCommand::Init) => init(),
+        Some(CliCommand::Doctor) => doctor(),
+        Some(CliCommand::Run(args)) => run_task(&args.task),
+        Some(CliCommand::Eval { command }) => eval(command),
+        Some(CliCommand::Replay(args)) => replay(&args.events_path),
+        Some(CliCommand::Resume(args)) => resume(&args.session_id),
     }
 }
 
@@ -132,12 +189,7 @@ fn doctor() -> Result<(), CliError> {
     Ok(())
 }
 
-fn run_task(args: &[String]) -> Result<(), CliError> {
-    let Some(task) = args.first() else {
-        return Err(CliError::Usage(
-            "usage: flash run \"fix the failing tests\"".to_string(),
-        ));
-    };
+fn run_task(task: &str) -> Result<(), CliError> {
     let root = discover_workspace_root(None)?;
     let config = load_config(&root, &ConfigOverrides::default())?;
     let registry = flash_tools::builtin_registry().map_err(CliError::ToolRegistry)?;
@@ -158,24 +210,19 @@ fn run_task(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-fn eval(args: &[String]) -> Result<(), CliError> {
-    match args.first().map(String::as_str) {
-        Some("fixture") => eval_fixture(&args[1..]),
-        Some("terminal-bench") => eval_terminal_bench(&args[1..]),
-        Some("swe-bench") => eval_swe_bench(&args[1..]),
-        Some("regression") => eval_regression(&args[1..]),
-        Some(command) => Err(CliError::Usage(format!("unknown eval command `{command}`"))),
-        None => Err(CliError::Usage(
-            "usage: flash eval fixture --task fix-rust".to_string(),
-        )),
+fn eval(command: EvalCommand) -> Result<(), CliError> {
+    match command {
+        EvalCommand::Fixture(args) => eval_fixture(&args.task),
+        EvalCommand::TerminalBench(args) => eval_terminal_bench(&args.subset),
+        EvalCommand::SweBench(args) => eval_swe_bench(&args.subset, args.limit),
+        EvalCommand::Regression => eval_regression(),
     }
 }
 
-fn eval_fixture(args: &[String]) -> Result<(), CliError> {
-    let task_id = parse_task_arg(args)?;
+fn eval_fixture(task_id: &str) -> Result<(), CliError> {
     let root = discover_workspace_root(None)?;
     init_workspace(&root)?;
-    let task = flash_eval::local_fixture_task(&task_id)?;
+    let task = flash_eval::local_fixture_task(task_id)?;
     let result = flash_eval::run_fixture_eval(&root, task)?;
     println!("task: {}", result.task_id);
     println!("passed: {}", result.passed);
@@ -199,8 +246,7 @@ fn eval_fixture(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-fn eval_terminal_bench(args: &[String]) -> Result<(), CliError> {
-    let subset = parse_subset_arg(args)?;
+fn eval_terminal_bench(subset: &str) -> Result<(), CliError> {
     if subset != "smoke" {
         return Err(CliError::Usage(
             "usage: flash eval terminal-bench --subset smoke".to_string(),
@@ -233,13 +279,11 @@ fn eval_terminal_bench(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-fn eval_swe_bench(args: &[String]) -> Result<(), CliError> {
+fn eval_swe_bench(subset: &str, limit: usize) -> Result<(), CliError> {
     let usage = "usage: flash eval swe-bench --subset verified --limit 10";
-    let subset = parse_named_arg(args, "--subset", usage)?;
     if subset != "verified" {
         return Err(CliError::Usage(usage.to_string()));
     }
-    let limit = parse_optional_usize_arg(args, "--limit", 1, usage)?;
     let root = discover_workspace_root(None)?;
     init_workspace(&root)?;
     let run = flash_eval::run_swe_bench_verified(&root, limit)?;
@@ -278,10 +322,7 @@ fn eval_swe_bench(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-fn eval_regression(args: &[String]) -> Result<(), CliError> {
-    if !args.is_empty() {
-        return Err(CliError::Usage("usage: flash eval regression".to_string()));
-    }
+fn eval_regression() -> Result<(), CliError> {
     let root = discover_workspace_root(None)?;
     init_workspace(&root)?;
     let run = flash_eval::run_regression(&root)?;
@@ -313,69 +354,14 @@ fn eval_regression(args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-fn parse_task_arg(args: &[String]) -> Result<String, CliError> {
-    let Some(flag_index) = args.iter().position(|arg| arg == "--task") else {
-        return Err(CliError::Usage(
-            "usage: flash eval fixture --task fix-rust".to_string(),
-        ));
-    };
-    args.get(flag_index + 1)
-        .cloned()
-        .ok_or_else(|| CliError::Usage("usage: flash eval fixture --task fix-rust".to_string()))
-}
-
-fn parse_subset_arg(args: &[String]) -> Result<String, CliError> {
-    parse_named_arg(
-        args,
-        "--subset",
-        "usage: flash eval terminal-bench --subset smoke",
-    )
-}
-
-fn parse_named_arg(args: &[String], flag: &str, usage: &str) -> Result<String, CliError> {
-    let Some(flag_index) = args.iter().position(|arg| arg == flag) else {
-        return Err(CliError::Usage(usage.to_string()));
-    };
-    args.get(flag_index + 1)
-        .cloned()
-        .ok_or_else(|| CliError::Usage(usage.to_string()))
-}
-
-fn parse_optional_usize_arg(
-    args: &[String],
-    flag: &str,
-    default: usize,
-    usage: &str,
-) -> Result<usize, CliError> {
-    let Some(flag_index) = args.iter().position(|arg| arg == flag) else {
-        return Ok(default);
-    };
-    let Some(value) = args.get(flag_index + 1) else {
-        return Err(CliError::Usage(usage.to_string()));
-    };
-    value
-        .parse()
-        .map_err(|_| CliError::Usage(usage.to_string()))
-}
-
-fn replay(args: &[String]) -> Result<(), CliError> {
-    let Some(path) = args.first() else {
-        return Err(CliError::Usage(
-            "usage: flash replay .flash/sessions/session_xxx/events.jsonl".to_string(),
-        ));
-    };
-    for line in replay_events(Path::new(path))? {
+fn replay(path: &Path) -> Result<(), CliError> {
+    for line in replay_events(path)? {
         println!("{line}");
     }
     Ok(())
 }
 
-fn resume(args: &[String]) -> Result<(), CliError> {
-    let Some(session_id) = args.first() else {
-        return Err(CliError::Usage(
-            "usage: flash resume session_xxx".to_string(),
-        ));
-    };
+fn resume(session_id: &str) -> Result<(), CliError> {
     let root = discover_workspace_root(None)?;
     let session = flash_core::storage::load_session(&root, session_id)?;
     println!("resumed {}", session.id);
@@ -405,24 +391,6 @@ fn user_config_path() -> Option<PathBuf> {
 
 fn env_map() -> BTreeMap<String, String> {
     env::vars().collect()
-}
-
-fn print_help() {
-    println!(concat!(
-        "flash 0.1\n\n",
-        "Usage:\n",
-        "  flash init\n",
-        "  flash tui\n",
-        "  flash doctor\n",
-        "  flash run \"<task>\"\n",
-        "  flash eval fixture --task fix-rust\n",
-        "  flash eval terminal-bench --subset smoke\n",
-        "  flash eval swe-bench --subset verified --limit 10\n",
-        "  flash eval regression\n",
-        "  flash replay <events.jsonl>\n",
-        "  flash resume <session_id>\n\n",
-        "Running `flash` without a subcommand enters the TUI.\n"
-    ));
 }
 
 #[derive(Debug)]
@@ -481,5 +449,62 @@ impl From<flash_eval::EvalError> for CliError {
 impl From<flash_core::WorkspaceError> for CliError {
     fn from(error: flash_core::WorkspaceError) -> Self {
         Self::Workspace(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn cli_should_default_to_tui_when_no_subcommand_is_present() {
+        let cli = Cli::try_parse_from(["flash"]).unwrap();
+
+        assert_eq!(cli.command, None);
+    }
+
+    #[test]
+    fn cli_should_parse_run_task() {
+        let cli = Cli::try_parse_from(["flash", "run", "fix tests"]).unwrap();
+
+        assert_eq!(
+            cli.command,
+            Some(CliCommand::Run(RunArgs {
+                task: "fix tests".to_string()
+            }))
+        );
+    }
+
+    #[test]
+    fn cli_should_parse_eval_terminal_bench() {
+        let cli =
+            Cli::try_parse_from(["flash", "eval", "terminal-bench", "--subset", "smoke"]).unwrap();
+
+        assert_eq!(
+            cli.command,
+            Some(CliCommand::Eval {
+                command: EvalCommand::TerminalBench(EvalTerminalBenchArgs {
+                    subset: "smoke".to_string()
+                })
+            })
+        );
+    }
+
+    #[test]
+    fn cli_should_reject_unknown_command_before_runtime() {
+        let error = Cli::try_parse_from(["flash", "unknown"]).unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn cli_should_reject_missing_run_task_before_runtime() {
+        let error = Cli::try_parse_from(["flash", "run"]).unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 }

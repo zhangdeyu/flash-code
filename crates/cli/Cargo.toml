@@ -9,6 +9,7 @@ name = "flash"
 path = "src/main.rs"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 flash-agent = { path = "../agent" }
 flash-core = { path = "../core" }
 flash-eval = { path = "../eval" }
