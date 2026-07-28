@@ -9,7 +9,7 @@ name = "flash_eval"
 path = "src/lib.rs"
 
 [dependencies]
-flash-agent = { path = "../agent" }
+flash-agent = { path = "../agent", features = ["smoke"] }
 flash-core = { path = "../core" }
 flash-tools = { path = "../tools" }
 serde_json = "1"

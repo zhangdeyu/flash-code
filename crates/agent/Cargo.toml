@@ -8,6 +8,13 @@ license.workspace = true
 name = "flash_agent"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Enables the deterministic in-process `SmokeProvider` used by the CLI
+# `--provider smoke` entry point and the eval harness. Gated out of the
+# default build so the production runtime does not carry eval simulation.
+smoke = []
+
 [dependencies]
 async-trait = "0.1"
 flash-core = { path = "../core" }
