@@ -193,7 +193,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(LargeTool)).unwrap();
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             LargeToolProvider,
             registry,
             AgentOptions {
@@ -229,7 +229,7 @@ mod tests {
         let root = prepared_workspace("artifact_file_limit");
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(LargeTool)).unwrap();
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             LargeToolProvider,
             registry,
             AgentOptions {
@@ -269,7 +269,7 @@ mod tests {
         let root = prepared_workspace("artifact_session_limit");
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(DualOutputTool)).unwrap();
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             LargeToolProvider,
             registry,
             AgentOptions {

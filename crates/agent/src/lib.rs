@@ -10,6 +10,7 @@ mod finalize;
 mod hooks;
 mod provider_attempt;
 mod runtime;
+mod service;
 #[cfg(any(test, feature = "smoke"))]
 mod smoke;
 mod tool_scheduler;
@@ -21,6 +22,7 @@ mod test_support;
 pub use crate::error::{AgentError, AgentRun};
 pub use crate::hooks::{ApprovalController, ApprovalRequest, EventObserver};
 pub use crate::runtime::{AgentOptions, AgentRuntime};
+pub use crate::service::{ApprovalDecision, EventEnvelope, RunHandle, RuntimeCommand};
 
 #[cfg(any(test, feature = "smoke"))]
 pub use crate::smoke::SmokeProvider;

@@ -416,7 +416,7 @@ async fn run_task_in_eval_run(run: &EvalRun, task: &EvalTask) -> Result<EvalResu
         return Ok(result);
     }
     init_workspace(&workspace_path)?;
-    let mut runtime = AgentRuntime::new(
+    let runtime = AgentRuntime::new(
         SmokeProvider::new(),
         flash_tools::builtin_registry()?,
         AgentOptions {
@@ -658,7 +658,7 @@ async fn run_swe_bench_task(
     init_workspace(&workspace_path)?;
     let issue_prompt = build_swe_bench_issue_prompt(task);
     fs::write(run.path.join("issue_prompt.md"), &issue_prompt)?;
-    let mut runtime = AgentRuntime::new(
+    let runtime = AgentRuntime::new(
         SmokeProvider::new(),
         flash_tools::builtin_registry()?,
         AgentOptions {

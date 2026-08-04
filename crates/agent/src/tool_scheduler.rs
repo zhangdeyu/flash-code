@@ -372,7 +372,7 @@ mod tests {
     #[tokio::test]
     async fn event_limit_should_finalize_session_as_failed() {
         let root = prepared_workspace("event_limit");
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             HugeDeltaProvider,
             ToolRegistry::new(),
             AgentOptions {
@@ -410,7 +410,7 @@ mod tests {
     async fn run_task_should_write_error_tool_result_for_unknown_tool() {
         let root = temp_dir("unknown_tool");
         fs::create_dir_all(&root).unwrap();
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             crate::test_support::UnknownToolProvider,
             ToolRegistry::new(),
             AgentOptions {
@@ -433,7 +433,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(ErrorTool)).unwrap();
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             ErrorToolProvider,
             registry,
             AgentOptions {
@@ -463,7 +463,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(ExecuteTool)).unwrap();
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             ExecuteToolProvider,
             registry,
             AgentOptions {
@@ -528,7 +528,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(DestructiveTool)).unwrap();
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             DestructiveToolProvider,
             registry,
             AgentOptions {
@@ -558,7 +558,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(CancelTool)).unwrap();
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             CancelToolProvider,
             registry,
             AgentOptions {

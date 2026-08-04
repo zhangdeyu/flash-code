@@ -179,7 +179,7 @@ mod tests {
     async fn run_task_should_retry_retryable_provider_errors() {
         let root = temp_dir("retry");
         fs::create_dir_all(&root).unwrap();
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             RetryProvider { calls: 0 },
             ToolRegistry::new(),
             AgentOptions {
@@ -200,7 +200,7 @@ mod tests {
     async fn run_task_should_stop_retrying_server_errors_at_three_attempts() {
         let root = prepared_workspace("server_retry_limit");
         let calls = Arc::new(AtomicU32::new(0));
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             AlwaysErrorProvider {
                 error: ProviderError::Server {
                     message: "temporary outage".to_string(),
@@ -232,7 +232,7 @@ mod tests {
     async fn run_task_should_finalize_timeout_errors() {
         let root = prepared_workspace("timeout_finalize");
         let calls = Arc::new(AtomicU32::new(0));
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             AlwaysErrorProvider {
                 error: ProviderError::Timeout("first byte timed out".to_string()),
                 calls: Arc::clone(&calls),
@@ -279,7 +279,7 @@ mod tests {
         ] {
             let root = prepared_workspace(name);
             let calls = Arc::new(AtomicU32::new(0));
-            let mut runtime = AgentRuntime::new(
+            let runtime = AgentRuntime::new(
                 AlwaysErrorProvider {
                     error,
                     calls: Arc::clone(&calls),
@@ -305,7 +305,7 @@ mod tests {
     async fn retry_after_should_delay_the_next_attempt() {
         let root = prepared_workspace("retry_after");
         let calls = Arc::new(AtomicU32::new(0));
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             RetryAfterProvider {
                 calls: Arc::clone(&calls),
                 retry_after: Duration::from_millis(450),
@@ -336,7 +336,7 @@ mod tests {
         let root = temp_dir("published_delta_retry");
         fs::create_dir_all(&root).unwrap();
         let calls = Arc::new(AtomicU32::new(0));
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             PartialRetryProvider {
                 calls: Arc::clone(&calls),
             },
@@ -411,7 +411,7 @@ mod tests {
     async fn run_task_should_not_commit_partial_assistant_without_done() {
         let root = temp_dir("partial");
         fs::create_dir_all(&root).unwrap();
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             PartialProvider,
             ToolRegistry::new(),
             AgentOptions {
@@ -432,7 +432,7 @@ mod tests {
     async fn run_task_should_fail_when_provider_stops_at_max_tokens() {
         let root = temp_dir("max_tokens");
         fs::create_dir_all(&root).unwrap();
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             MaxTokensProvider,
             ToolRegistry::new(),
             AgentOptions {

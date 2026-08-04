@@ -198,7 +198,7 @@ mod tests {
             ),
         ] {
             let root = prepared_workspace(name);
-            let mut runtime = AgentRuntime::new(
+            let runtime = AgentRuntime::new(
                 provider,
                 ToolRegistry::new(),
                 AgentOptions {
@@ -229,7 +229,7 @@ mod tests {
     async fn run_task_should_stop_at_max_turns() {
         let root = crate::test_support::temp_dir("max_turns");
         fs::create_dir_all(&root).unwrap();
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             LoopProvider,
             flash_tools_for_tests(),
             AgentOptions {

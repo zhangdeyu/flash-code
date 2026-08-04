@@ -3,7 +3,7 @@ use std::path::Path;
 use flash_core::{
     append_assistant_message_async, append_system_message_async, append_user_message_async,
     create_continuation_session_with_limits_async, create_session_with_limits_async,
-    load_session_history_async, ArtifactLimits, CancellationToken, Event, Outcome,
+    load_session_history_async, ArtifactLimits, CancellationToken, Event, Message, Outcome,
     PermissionPolicy, StorageLimits, ToolContext, ToolRegistry,
 };
 use flash_provider::{ChatProvider, ChatRequest, ToolSpec};
@@ -54,15 +54,6 @@ where
         self.storage_limits = storage_limits;
         self.artifact_limits = artifact_limits;
         self
-    }
-
-    pub async fn run_task(
-        &mut self,
-        workspace_root: &Path,
-        task: &str,
-    ) -> Result<crate::error::AgentRun, AgentError> {
-        self.run_task_with_observer(workspace_root, task, NoopObserver)
-            .await
     }
 
     pub async fn continue_task(
@@ -251,7 +242,7 @@ where
         A: ApprovalController,
     {
         let cancellation = controls.cancellation;
-        let mut should_cancel = controls.should_cancel;
+        let should_cancel = controls.should_cancel;
         let approval = controls.approval;
         let (session, inherited_history) = match start {
             SessionStart::New => (
@@ -276,6 +267,36 @@ where
                 (session, Some(history))
             }
         };
+        self.run_turns(
+            &session,
+            inherited_history,
+            workspace_root,
+            task,
+            observer,
+            cancellation,
+            should_cancel,
+            approval,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_turns<O, C, A>(
+        &mut self,
+        session: &flash_core::storage::Session,
+        inherited_history: Option<Vec<Message>>,
+        workspace_root: &Path,
+        task: &str,
+        observer: &mut O,
+        cancellation: CancellationToken,
+        mut should_cancel: C,
+        approval: &mut A,
+    ) -> Result<crate::error::AgentRun, AgentError>
+    where
+        O: EventObserver,
+        C: FnMut() -> bool,
+        A: ApprovalController,
+    {
         let result = async {
             let mut history = if let Some(history) = inherited_history {
                 history
@@ -302,14 +323,14 @@ where
                 if should_cancel() {
                     cancellation.cancel();
                     emit_event(
-                        &session,
+                        session,
                         Event::Error {
                             message: "run cancelled".to_string(),
                         },
                         observer,
                     )
                     .await?;
-                    return finish_session(&session, Outcome::Cancelled, observer).await;
+                    return finish_session(session, Outcome::Cancelled, observer).await;
                 }
 
                 let request_id = format!("request_{turn}");
@@ -318,14 +339,14 @@ where
                         Ok(history) => history,
                         Err(error) => {
                             emit_event(
-                                &session,
+                                session,
                                 Event::Error {
                                     message: error.to_string(),
                                 },
                                 observer,
                             )
                             .await?;
-                            return finish_session(&session, Outcome::Failed, observer).await;
+                            return finish_session(session, Outcome::Failed, observer).await;
                         }
                     };
                 let request = ChatRequest {
@@ -343,38 +364,38 @@ where
                     cancellation: cancellation.clone(),
                 };
                 let (provider_events, attempt) = match self
-                    .chat_with_retry_streaming(&session, &request_id, request, observer)
+                    .chat_with_retry_streaming(session, &request_id, request, observer)
                     .await
                 {
                     Ok(result) => result,
                     Err(AgentError::Provider(error)) => {
                         if error.is_cancelled() {
                             emit_event(
-                                &session,
+                                session,
                                 Event::Error {
                                     message: "run cancelled".to_string(),
                                 },
                                 observer,
                             )
                             .await?;
-                            return finish_session(&session, Outcome::Cancelled, observer).await;
+                            return finish_session(session, Outcome::Cancelled, observer).await;
                         }
                         emit_event(
-                            &session,
+                            session,
                             Event::Error {
                                 message: error.to_string(),
                             },
                             observer,
                         )
                         .await?;
-                        finish_session(&session, Outcome::Failed, observer).await?;
+                        finish_session(session, Outcome::Failed, observer).await?;
                         return Err(AgentError::Provider(error));
                     }
                     Err(error) => return Err(error),
                 };
                 let turn_result = self
                     .handle_provider_events(
-                        &session,
+                        session,
                         &request_id,
                         attempt,
                         provider_events,
@@ -384,24 +405,24 @@ where
                 match turn_result.completion {
                     TurnCompletion::EndTurn | TurnCompletion::ToolUse => {}
                     TurnCompletion::Cancelled => {
-                        return finish_session(&session, Outcome::Cancelled, observer).await;
+                        return finish_session(session, Outcome::Cancelled, observer).await;
                     }
                     TurnCompletion::Failed => {
-                        return finish_session(&session, Outcome::Failed, observer).await;
+                        return finish_session(session, Outcome::Failed, observer).await;
                     }
                 }
 
                 if should_cancel() {
                     cancellation.cancel();
                     emit_event(
-                        &session,
+                        session,
                         Event::Error {
                             message: "run cancelled".to_string(),
                         },
                         observer,
                     )
                     .await?;
-                    return finish_session(&session, Outcome::Cancelled, observer).await;
+                    return finish_session(session, Outcome::Cancelled, observer).await;
                 }
 
                 let assistant = append_assistant_message_async(
@@ -418,14 +439,14 @@ where
                 history.push(assistant);
 
                 if matches!(turn_result.completion, TurnCompletion::EndTurn) {
-                    return finish_session(&session, Outcome::Succeeded, observer).await;
+                    return finish_session(session, Outcome::Succeeded, observer).await;
                 }
 
                 for (index, call) in turn_result.tool_calls.iter().enumerate() {
                     if should_cancel() {
                         cancellation.cancel();
                         emit_event(
-                            &session,
+                            session,
                             Event::Error {
                                 message: "run cancelled".to_string(),
                             },
@@ -433,32 +454,32 @@ where
                         )
                         .await?;
                         let cancelled = self
-                            .cancel_tool_calls(&session, &turn_result.tool_calls[index..], observer)
+                            .cancel_tool_calls(session, &turn_result.tool_calls[index..], observer)
                             .await?;
                         history.extend(cancelled);
-                        return finish_session(&session, Outcome::Cancelled, observer).await;
+                        return finish_session(session, Outcome::Cancelled, observer).await;
                     }
                     let message = self
-                        .execute_tool_call(&session, &context, call, observer, approval)
+                        .execute_tool_call(session, &context, call, observer, approval)
                         .await?;
                     history.push(message);
                 }
             }
 
             emit_event(
-                &session,
+                session,
                 Event::Error {
                     message: "max_turns exceeded".to_string(),
                 },
                 observer,
             )
             .await?;
-            finish_session(&session, Outcome::Failed, observer).await
+            finish_session(session, Outcome::Failed, observer).await
         }
         .await;
         match result {
             Ok(run) => Ok(run),
-            Err(primary) => match finish_session(&session, Outcome::Failed, observer).await {
+            Err(primary) => match finish_session(session, Outcome::Failed, observer).await {
                 Ok(_) => Err(primary),
                 Err(finalize) => Err(AgentError::Finalization {
                     primary: primary.to_string(),
@@ -669,7 +690,7 @@ mod tests {
         let root = temp_dir("search_loop");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "").unwrap();
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             SmokeProvider::new(),
             flash_tools_for_tests(),
             AgentOptions {
@@ -691,7 +712,7 @@ mod tests {
         let root = temp_dir("deepseek_read_e2e");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("README.md"), "hello from tool").unwrap();
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             DeepSeekSseProvider { turn: 0 },
             flash_tools::builtin_registry().unwrap(),
             AgentOptions {
@@ -721,7 +742,7 @@ mod tests {
         let root = temp_dir("session_success_status");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "").unwrap();
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             SmokeProvider::new(),
             flash_tools_for_tests(),
             AgentOptions {
@@ -944,7 +965,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(git_commit.status.success());
-        let mut runtime = AgentRuntime::new(
+        let runtime = AgentRuntime::new(
             SmokeProvider::new(),
             flash_tools::builtin_registry().unwrap(),
             AgentOptions {

@@ -256,7 +256,7 @@ fn doctor() -> Result<(), CliError> {
 async fn run_task(task: &str) -> Result<(), CliError> {
     let root = discover_workspace_root(None)?;
     let config = load_config(&root, &ConfigOverrides::default())?;
-    let mut runtime = configured_runtime(config)?;
+    let runtime = configured_runtime(config)?;
     let run = runtime.run_task(&root, task).await?;
     println!("session: {}", run.session_id);
     println!("outcome: {}", run.outcome.as_str());
