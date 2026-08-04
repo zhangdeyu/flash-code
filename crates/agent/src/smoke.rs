@@ -24,7 +24,7 @@ impl Default for SmokeProvider {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for SmokeProvider {
     async fn chat(
         &mut self,

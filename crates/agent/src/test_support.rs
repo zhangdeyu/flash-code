@@ -21,7 +21,7 @@ pub(crate) struct RecordingProvider {
     pub(crate) requests: Arc<Mutex<Vec<ChatRequest>>>,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for RecordingProvider {
     async fn chat(
         &mut self,
@@ -41,7 +41,7 @@ pub(crate) struct DeepSeekSseProvider {
     pub(crate) turn: u32,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for DeepSeekSseProvider {
     async fn chat(
         &mut self,
@@ -68,7 +68,7 @@ impl ChatProvider for DeepSeekSseProvider {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for UnknownToolProvider {
     async fn chat(
         &mut self,
@@ -91,7 +91,7 @@ impl ChatProvider for UnknownToolProvider {
 
 pub(crate) struct PartialProvider;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for PartialProvider {
     async fn chat(
         &mut self,
@@ -105,7 +105,7 @@ impl ChatProvider for PartialProvider {
 
 pub(crate) struct LoopProvider;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for LoopProvider {
     async fn chat(
         &mut self,
@@ -128,7 +128,7 @@ impl ChatProvider for LoopProvider {
 
 pub(crate) struct MaxTokensProvider;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for MaxTokensProvider {
     async fn chat(
         &mut self,
@@ -146,7 +146,7 @@ pub(crate) struct InvalidCompletionProvider {
     pub(crate) include_tool_call: bool,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for InvalidCompletionProvider {
     async fn chat(
         &mut self,
@@ -189,7 +189,7 @@ pub(crate) struct RetryAfterProvider {
 
 pub(crate) struct CancellableProvider;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for CancellableProvider {
     async fn chat(
         &mut self,
@@ -203,7 +203,7 @@ impl ChatProvider for CancellableProvider {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for PartialRetryProvider {
     async fn chat(
         &mut self,
@@ -219,7 +219,7 @@ impl ChatProvider for PartialRetryProvider {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for AlwaysErrorProvider {
     async fn chat(
         &mut self,
@@ -231,7 +231,7 @@ impl ChatProvider for AlwaysErrorProvider {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for RetryAfterProvider {
     async fn chat(
         &mut self,
@@ -253,7 +253,7 @@ impl ChatProvider for RetryAfterProvider {
 
 pub(crate) struct MultipleToolProvider;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for MultipleToolProvider {
     async fn chat(
         &mut self,
@@ -276,7 +276,7 @@ impl ChatProvider for MultipleToolProvider {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for RetryProvider {
     async fn chat(
         &mut self,
@@ -300,7 +300,7 @@ pub(crate) struct LargeToolProvider;
 
 pub(crate) struct HugeDeltaProvider;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for HugeDeltaProvider {
     async fn chat(
         &mut self,
@@ -313,7 +313,7 @@ impl ChatProvider for HugeDeltaProvider {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for LargeToolProvider {
     async fn chat(
         &mut self,
@@ -336,7 +336,7 @@ impl ChatProvider for LargeToolProvider {
 
 pub(crate) struct ErrorToolProvider;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for ErrorToolProvider {
     async fn chat(
         &mut self,
@@ -359,7 +359,7 @@ impl ChatProvider for ErrorToolProvider {
 
 pub(crate) struct ExecuteToolProvider;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for ExecuteToolProvider {
     async fn chat(
         &mut self,
@@ -382,7 +382,7 @@ impl ChatProvider for ExecuteToolProvider {
 
 pub(crate) struct CancelToolProvider;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for CancelToolProvider {
     async fn chat(
         &mut self,
@@ -405,7 +405,7 @@ impl ChatProvider for CancelToolProvider {
 
 pub(crate) struct DestructiveToolProvider;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for DestructiveToolProvider {
     async fn chat(
         &mut self,

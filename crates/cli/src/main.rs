@@ -117,7 +117,7 @@ enum CliProvider {
     Smoke(SmokeProvider),
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for CliProvider {
     async fn chat(
         &mut self,

@@ -114,7 +114,7 @@ impl DeepSeekProvider {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ChatProvider for DeepSeekProvider {
     async fn chat(
         &mut self,

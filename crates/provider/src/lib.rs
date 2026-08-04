@@ -3,7 +3,7 @@ use flash_core::{CancellationToken, Message};
 use serde_json::Value;
 use std::time::Duration;
 
-#[async_trait(?Send)]
+#[async_trait]
 pub trait ChatProvider {
     /// Send a chat request and emit events through the bounded channel in streaming order.
     async fn chat(
@@ -23,7 +23,7 @@ pub async fn send_event(
         .map_err(|_| ProviderError::Cancelled("provider event consumer closed".to_string()))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChatRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
@@ -139,7 +139,7 @@ mod tests {
 
     struct EchoProvider;
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl ChatProvider for EchoProvider {
         async fn chat(
             &mut self,

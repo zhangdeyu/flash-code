@@ -23,3 +23,6 @@ nonstandard-style = "deny"
 [workspace.lints.clippy]
 all = { level = "deny", priority = 10 }
 redundant-clone = { level = "deny", priority = 9 }
+
+[workspace.dependencies]
+tokio-util = "0.7"
